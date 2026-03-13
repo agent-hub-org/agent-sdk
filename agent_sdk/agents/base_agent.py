@@ -3,11 +3,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from .graph import create_graph
 from .state import AgentState
-
-try:  # Local import; ignore if llm package is not present at type-check time
-    from ..llm.factory import create_llm, create_summarizer  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - defensive fallback
-    create_llm = create_summarizer = None  # type: ignore[assignment]
+from ..llm_services.agent_llm import initialize_llm as initialize_agent_llm
+from ..llm_services.summarizer_llm import initialize_llm as initialize_summarizer_llm
 
 
 class BaseAgent:
@@ -22,8 +19,8 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None):
         tools = tools or []
 
-        self.llm = create_llm()
-        self.summarizer = create_summarizer()
+        self.llm = initialize_agent_llm()
+        self.summarizer = initialize_summarizer_llm()
 
         self.tools = tools
         self.tools_by_name = {tool.name: tool for tool in tools}
