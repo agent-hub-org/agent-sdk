@@ -19,7 +19,7 @@ class BaseAgent:
       across multiple `run` calls for the same session.
     """
 
-    def __init__(self, tools=None):
+    def __init__(self, tools=None, system_prompt=None):
         tools = tools or []
 
         self.llm = create_llm()
@@ -30,30 +30,23 @@ class BaseAgent:
 
         # Persistent, per-thread conversational memory
         self.memory = InMemorySaver()
+        system_prompt = system_prompt or (
+            "You are an autonomous assistant. "
+            "You may call tools to achieve the user's goal, "
+            "or respond directly when tools are not needed."
+        )
 
         # Autonomous LangGraph agent with persistence
-        self.graph = create_graph(checkpointer=self.memory)
+        self.graph = create_graph(agent=self, checkpointer=self.memory)
 
     async def arun(self, query: str, session_id: str = "default") -> str:
-        """
-        Async entrypoint for low-latency execution.
-
-        Uses the graph's `ainvoke` method so that async LLMs/tools
-        (e.g. Groq-backed models) can be awaited end-to-end.
-        """
-
-        state = AgentState(
-            messages=[HumanMessage(content=query)],
-            tools_by_name=self.tools_by_name,
-            llm=self.llm,
-            summarizer_llm=self.summarizer,
-        )
-
         result = await self.graph.ainvoke(
-            state,
+            {
+                "messages": [HumanMessage(content=query)],
+                "system_prompt": self.system_prompt,
+            },
             config={"configurable": {"thread_id": session_id}},
         )
-
         return result["messages"][-1].content
 
     def run(self, query: str, session_id: str = "default") -> str:
