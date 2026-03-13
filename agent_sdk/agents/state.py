@@ -1,23 +1,19 @@
-from typing import Annotated, Sequence, Literal, TypedDict
+from typing import Annotated, Sequence, Optional
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
-from langchain_core.messages import AnyMessage, BaseMessage
+from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
 
 class AgentState(BaseModel):
 
-    # LLM (bound or unbound model)
-    llm: Any = Field(description="The LLM to use for the agent")
-
-    # conversation messages
+    # conversation messages (reducer handles append + dedup)
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
     # summarized history (for long-running autonomous behavior)
     summary: Optional[str] = None
 
-    # tool registry available to the agent
-    tools_by_name: Dict[str, Any] = Field(default_factory=dict, description="A dictionary of tools by name")
+    # system prompt defined once by the agent repository
+    system_prompt: Optional[str] = None
 
     # maximum allowed tokens before summarization
     max_context_tokens: int = 12000
@@ -27,9 +23,6 @@ class AgentState(BaseModel):
 
     # number of recent messages to keep
     keep_last_n_messages: int = 6
-
-    # summarization model
-    summarizer_llm: Optional[Any] = None
 
     # autonomous agent configuration
     max_iterations: int = Field(
