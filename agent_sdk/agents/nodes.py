@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent_sdk.agents.state import AgentState
+
+logger = logging.getLogger("agent_sdk.nodes")
 
 
 async def initialize(state: AgentState) -> dict:
@@ -19,6 +22,7 @@ async def initialize(state: AgentState) -> dict:
     """
     # Only inject if no SystemMessage is already present
     if state.messages and isinstance(state.messages[0], SystemMessage):
+        logger.debug("System prompt already present, skipping initialization")
         return {}
 
     content = state.system_prompt or (
@@ -26,6 +30,7 @@ async def initialize(state: AgentState) -> dict:
         "You may call tools to achieve the user's goal, "
         "or respond directly when tools are not needed."
     )
+    logger.info("Initialized agent with system prompt (%d chars)", len(content))
     return {"messages": [SystemMessage(content=content)]}
 
 
@@ -39,6 +44,9 @@ async def llm_call(agent, state: AgentState) -> dict:
 
     `agent` is bound via functools.partial at graph build time.
     """
+
+    logger.info("LLM call — iteration %d/%d, message count: %d",
+                state.iteration + 1, state.max_iterations, len(state.messages))
 
     tools = list(agent.tools_by_name.values())
     llm_with_tools = agent.llm.bind_tools(tools) if tools else agent.llm
@@ -62,6 +70,13 @@ async def llm_call(agent, state: AgentState) -> dict:
     else:
         response = llm_with_tools.invoke(prompt)
 
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        logger.info("LLM requested %d tool call(s): %s",
+                    len(tool_calls), [tc["name"] for tc in tool_calls])
+    else:
+        logger.info("LLM returned final response (%d chars)", len(response.content))
+
     return {
         "messages": [response],
         "iteration": state.iteration + 1,
@@ -76,6 +91,9 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
 
     `agent` is bound via functools.partial at graph build time.
     """
+
+    logger.info("Summarizing conversation — %d messages, existing summary: %s",
+                len(state.messages), "yes" if state.summary else "no")
 
     existing_summary = state.summary or ""
     if existing_summary:
@@ -99,6 +117,9 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     keep_n = max(state.keep_last_n_messages, 1)
     delete_messages = [RemoveMessage(id=m.id) for m in state.messages[:-keep_n]]
 
+    logger.info("Summarization complete — pruned %d messages, keeping last %d",
+                len(delete_messages), keep_n)
+
     return {"summary": response.content, "messages": delete_messages}
 
 
@@ -115,16 +136,25 @@ async def tool_node(agent, state: AgentState) -> dict:
 
     results = []
     for tool_call in tool_calls:
-        tool = agent.tools_by_name[tool_call["name"]]
+        name = tool_call["name"]
         args = tool_call.get("args", {})
+        logger.info("Executing tool '%s' with args: %s", name, args)
 
-        # Prefer async tool invocation when available
-        if hasattr(tool, "ainvoke"):
-            observation = await tool.ainvoke(args)
-        elif hasattr(tool, "arun"):
-            observation = await tool.arun(args)
-        else:
-            observation = tool.invoke(args) if hasattr(tool, "invoke") else tool.run(args)
+        tool = agent.tools_by_name[name]
+
+        try:
+            # Prefer async tool invocation when available
+            if hasattr(tool, "ainvoke"):
+                observation = await tool.ainvoke(args)
+            elif hasattr(tool, "arun"):
+                observation = await tool.arun(args)
+            else:
+                observation = tool.invoke(args) if hasattr(tool, "invoke") else tool.run(args)
+
+            logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
+        except Exception:
+            logger.exception("Tool '%s' failed", name)
+            raise
 
         results.append(
             ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
@@ -145,12 +175,14 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
 
     # Stop if we've reached the configured iteration limit
     if state.iteration >= state.max_iterations:
+        logger.warning("Iteration limit reached (%d), stopping agent", state.max_iterations)
         return END
 
     last_message = state.messages[-1]
 
     # If the LLM makes a tool call, perform the action before summarizing
     if getattr(last_message, "tool_calls", None):
+        logger.debug("Routing → tool_node")
         return "tool_node"
 
     # Summarize if conversation has grown beyond the retention window
@@ -158,6 +190,9 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
         state.enable_summarization
         and len(state.messages) > state.keep_last_n_messages
     ):
+        logger.debug("Routing → summarize_conversation (%d messages > %d limit)",
+                     len(state.messages), state.keep_last_n_messages)
         return "summarize_conversation"
 
+    logger.debug("Routing → END")
     return END

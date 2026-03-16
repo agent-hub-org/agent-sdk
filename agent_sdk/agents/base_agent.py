@@ -1,3 +1,5 @@
+import logging
+
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -5,6 +7,8 @@ from .graph import create_graph
 from .state import AgentState
 from ..llm_services.agent_llm import initialize_llm as initialize_agent_llm
 from ..llm_services.summarizer_llm import initialize_llm as initialize_summarizer_llm
+
+logger = logging.getLogger("agent_sdk.agent")
 
 
 class BaseAgent:
@@ -35,8 +39,12 @@ class BaseAgent:
 
         # Autonomous LangGraph agent with persistence
         self.graph = create_graph(agent=self, checkpointer=self.memory)
+        logger.info("BaseAgent initialized with %d tool(s): %s",
+                    len(self.tools), list(self.tools_by_name.keys()))
 
     async def arun(self, query: str, session_id: str = "default") -> str:
+        logger.info("Agent run started — session='%s', query='%s'", session_id, query[:100])
+
         result = await self.graph.ainvoke(
             {
                 "messages": [HumanMessage(content=query)],
@@ -44,7 +52,11 @@ class BaseAgent:
             },
             config={"configurable": {"thread_id": session_id}},
         )
-        return result["messages"][-1].content
+
+        response = result["messages"][-1].content
+        logger.info("Agent run completed — session='%s', response length: %d chars",
+                    session_id, len(response))
+        return response
 
     def run(self, query: str, session_id: str = "default") -> str:
         """
