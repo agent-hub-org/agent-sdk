@@ -1,14 +1,49 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Literal
+import re
+import uuid
+from typing import Literal, Sequence
 
-from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent_sdk.agents.state import AgentState
 
 logger = logging.getLogger("agent_sdk.nodes")
+
+
+def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
+    """
+    Parse a malformed tool call string like:
+      <function=get_ticker_data{"ticker": "RELIANCE.NS"}</function>
+    into a list of structured tool call dicts.
+    Returns None if parsing fails.
+    """
+    pattern = r'<function=(\w+)(.*?)</function>'
+    matches = re.findall(pattern, failed_generation, re.DOTALL)
+
+    if not matches:
+        return None
+
+    tool_calls = []
+    for func_name, raw_args in matches:
+        raw_args = raw_args.strip()
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            logger.warning("Could not parse args for tool '%s': %s", func_name, raw_args)
+            return None
+
+        tool_calls.append({
+            "name": func_name,
+            "args": args,
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+        })
+
+    return tool_calls if tool_calls else None
 
 
 async def initialize(state: AgentState) -> dict:
@@ -65,10 +100,45 @@ async def llm_call(agent, state: AgentState) -> dict:
     else:
         prompt = list(state.messages)
 
-    if hasattr(llm_with_tools, "ainvoke"):
-        response = await llm_with_tools.ainvoke(prompt)
-    else:
-        response = llm_with_tools.invoke(prompt)
+    try:
+        if hasattr(llm_with_tools, "ainvoke"):
+            response = await llm_with_tools.ainvoke(prompt)
+        else:
+            response = llm_with_tools.invoke(prompt)
+    except Exception as e:
+        # Handle malformed tool calls from Groq (and similar providers)
+        # The model generates text like <function=name{...}</function> instead of
+        # structured tool calls, causing a 400 error server-side. We parse the
+        # failed generation and construct a proper AIMessage with tool_calls.
+        error_body = getattr(e, "body", None) or {}
+        if isinstance(error_body, dict):
+            # failed_generation can be top-level or nested under "error"
+            failed_gen = error_body.get("failed_generation") or error_body.get("error", {}).get("failed_generation")
+        else:
+            failed_gen = None
+
+        if failed_gen:
+            logger.warning("LLM produced malformed tool call, attempting to parse: %s", failed_gen.strip())
+            parsed_calls = _parse_malformed_tool_call(failed_gen)
+
+            if parsed_calls:
+                # Validate that all parsed tool names actually exist
+                valid_calls = [tc for tc in parsed_calls if tc["name"] in agent.tools_by_name]
+                if valid_calls:
+                    logger.info("Recovered %d tool call(s) from malformed generation: %s",
+                                len(valid_calls), [tc["name"] for tc in valid_calls])
+                    response = AIMessage(
+                        content="",
+                        tool_calls=valid_calls,
+                    )
+                    return {
+                        "messages": [response],
+                        "iteration": state.iteration + 1,
+                    }
+
+            logger.error("Could not recover tool calls from failed generation")
+
+        raise
 
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
@@ -95,29 +165,46 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     logger.info("Summarizing conversation — %d messages, existing summary: %s",
                 len(state.messages), "yes" if state.summary else "no")
 
+    keep_n = max(state.keep_last_n_messages, 1)
+    all_messages = list(state.messages)
+
+    # Separate the SystemMessage (always at index 0) — it must never be pruned
+    has_system = all_messages and isinstance(all_messages[0], SystemMessage)
+    system_msg = all_messages[0] if has_system else None
+    conversation = all_messages[1:] if has_system else all_messages
+
+    # Split into messages to prune vs. messages to keep
+    messages_to_prune = conversation[:-keep_n] if len(conversation) > keep_n else []
+    if not messages_to_prune:
+        logger.info("Not enough messages to prune, skipping summarization")
+        return {}
+
+    # Build summarization prompt from ONLY the messages being pruned
     existing_summary = state.summary or ""
     if existing_summary:
         summary_message = (
             f"This is a summary of the conversation to date: {existing_summary}\n\n"
-            "Extend the summary by taking into account the new messages above:"
+            "Extend the summary by taking into account the new messages below:"
         )
     else:
-        summary_message = "Create a summary of the conversation above:"
+        summary_message = "Create a concise summary of the conversation below:"
 
-    # Pass full message history + instruction to the summarizer
-    messages = list(state.messages) + [HumanMessage(content=summary_message)]
+    summarizer_input = (
+        [HumanMessage(content=summary_message)]
+        + messages_to_prune
+        + [HumanMessage(content="Provide a concise summary capturing the key facts, decisions, and results. Omit raw data dumps.")]
+    )
 
     summarizer = agent.summarizer or agent.llm
     if hasattr(summarizer, "ainvoke"):
-        response = await summarizer.ainvoke(messages)
+        response = await summarizer.ainvoke(summarizer_input)
     else:
-        response = summarizer.invoke(messages)
+        response = summarizer.invoke(summarizer_input)
 
-    # Prune old messages from state — keep only the most recent N
-    keep_n = max(state.keep_last_n_messages, 1)
-    delete_messages = [RemoveMessage(id=m.id) for m in state.messages[:-keep_n]]
+    # Delete only the pruned messages — never the SystemMessage or kept messages
+    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_prune]
 
-    logger.info("Summarization complete — pruned %d messages, keeping last %d",
+    logger.info("Summarization complete — pruned %d messages, keeping SystemMessage + last %d",
                 len(delete_messages), keep_n)
 
     return {"summary": response.content, "messages": delete_messages}
@@ -134,8 +221,7 @@ async def tool_node(agent, state: AgentState) -> dict:
     last_message = state.messages[-1]
     tool_calls = getattr(last_message, "tool_calls", None) or []
 
-    results = []
-    for tool_call in tool_calls:
+    async def _execute(tool_call: dict) -> ToolMessage:
         name = tool_call["name"]
         args = tool_call.get("args", {})
         logger.info("Executing tool '%s' with args: %s", name, args)
@@ -143,31 +229,38 @@ async def tool_node(agent, state: AgentState) -> dict:
         tool = agent.tools_by_name[name]
 
         try:
-            # Prefer async tool invocation when available
             if hasattr(tool, "ainvoke"):
                 observation = await tool.ainvoke(args)
             elif hasattr(tool, "arun"):
                 observation = await tool.arun(args)
             else:
-                observation = tool.invoke(args) if hasattr(tool, "invoke") else tool.run(args)
-
+                observation = await asyncio.to_thread(
+                    tool.invoke if hasattr(tool, "invoke") else tool.run, args
+                )
             logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
         except Exception:
             logger.exception("Tool '%s' failed", name)
             raise
 
-        results.append(
-            ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
-        )
+        return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
-    return {"messages": results}
+    results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+
+    return {"messages": list(results)}
+
+
+def _estimate_token_count(messages: Sequence) -> int:
+    """Rough token estimate: ~4 chars per token for English text."""
+    return sum(len(getattr(m, "content", "") or "") for m in messages) // 4
 
 
 def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conversation", "__end__"]:
     """
     Decide whether the autonomous agent should keep going:
-    - If the last assistant message requested tools, route to the tool node.
-    - If the conversation is too long and summarization is enabled, summarize.
+    - If the last assistant message requested tools, route to the tool node
+      (but force summarization first if context is dangerously large).
+    - If the conversation is too long (by message count OR token estimate)
+      and summarization is enabled, summarize.
     - If we've hit the iteration limit or there are no tool calls, stop.
 
     Does not require agent dependencies — stays a plain function.
@@ -179,20 +272,25 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
         return END
 
     last_message = state.messages[-1]
+    has_tool_calls = bool(getattr(last_message, "tool_calls", None))
 
-    # If the LLM makes a tool call, perform the action before summarizing
-    if getattr(last_message, "tool_calls", None):
+    needs_summarization = (
+        state.enable_summarization
+        and (
+            len(state.messages) > state.keep_last_n_messages
+            or _estimate_token_count(state.messages) > state.max_context_tokens
+        )
+    )
+
+    # Force mid-loop summarization if context is overflowing, even during tool loops
+    if needs_summarization:
+        logger.debug("Routing → summarize_conversation (messages=%d, est_tokens=%d)",
+                     len(state.messages), _estimate_token_count(state.messages))
+        return "summarize_conversation"
+
+    if has_tool_calls:
         logger.debug("Routing → tool_node")
         return "tool_node"
-
-    # Summarize if conversation has grown beyond the retention window
-    if (
-        state.enable_summarization
-        and len(state.messages) > state.keep_last_n_messages
-    ):
-        logger.debug("Routing → summarize_conversation (%d messages > %d limit)",
-                     len(state.messages), state.keep_last_n_messages)
-        return "summarize_conversation"
 
     logger.debug("Routing → END")
     return END

@@ -13,10 +13,11 @@ def initialize_gemini(model: str = "gemini-2.5-flash", temperature: float = 0.7)
     )
 
 
-def initialize_groq(model: str = "llama-3.3-70b-versatile", temperature: float = 0.7) -> ChatGroq:
-    """Initialize and return a Groq-hosted Llama LLM for use as the agent's primary model."""
+def initialize_groq(model: str = "openai/gpt-oss-120b", temperature: float = 0.7) -> ChatGroq:
+    """Initialize and return a Groq-hosted LLM for use as the agent's primary model."""
     return ChatGroq(
         model=model,
         temperature=temperature,
         api_key=os.environ.get("GROQ_API_KEY"),
+        model_kwargs={"parallel_tool_calls": True}
     )

@@ -37,7 +37,7 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
     Graph flow
     ----------
     START → initialize → llm_call → should_continue → tool_node → llm_call (loop)
-                                                     → summarize_conversation → END
+                                                     → summarize_conversation → llm_call (resume)
                                                      → END
     """
 
@@ -53,6 +53,6 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_edge("initialize", "llm_call")
     graph.add_conditional_edges("llm_call", should_continue)
     graph.add_edge("tool_node", "llm_call")
-    graph.add_edge("summarize_conversation", END)
+    graph.add_edge("summarize_conversation", "llm_call")
 
     return graph.compile(checkpointer=checkpointer)

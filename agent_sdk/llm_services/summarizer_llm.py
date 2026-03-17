@@ -13,7 +13,7 @@ def initialize_gemini(model: str = "gemini-2.5-flash", temperature: float = 0.3)
     )
 
 
-def initialize_groq(model: str = "llama-3.3-70b-versatile", temperature: float = 0.3) -> ChatGroq:
+def initialize_groq(model: str = "openai/gpt-oss-20b", temperature: float = 0.3) -> ChatGroq:
     """Initialize and return a Groq-hosted Llama LLM tuned for summarization tasks."""
     return ChatGroq(
         model=model,

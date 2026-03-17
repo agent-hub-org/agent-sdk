@@ -48,13 +48,13 @@ class BaseAgent:
         logger.info("BaseAgent initialized with %d tool(s): %s",
                     len(self.tools), list(self.tools_by_name.keys()))
 
-    async def arun(self, query: str, session_id: str = "default") -> dict:
+    async def arun(self, query: str, session_id: str = "default", system_prompt: str | None = None) -> dict:
         logger.info("Agent run started — session='%s', query='%s'", session_id, query[:100])
 
         result = await self.graph.ainvoke(
             {
                 "messages": [HumanMessage(content=query)],
-                "system_prompt": self.system_prompt,
+                "system_prompt": system_prompt or self.system_prompt,
             },
             config={"configurable": {"thread_id": session_id}},
         )
