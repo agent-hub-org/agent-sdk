@@ -184,15 +184,19 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     if existing_summary:
         summary_message = (
             f"This is a summary of the conversation to date: {existing_summary}\n\n"
-            "Extend the summary by taking into account the new messages below:"
+            "Extend the summary by taking into account the new messages below. "
+            "IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize."
         )
     else:
-        summary_message = "Create a concise summary of the conversation below:"
+        summary_message = (
+            "Create a concise summary of the facts and context from the conversation below. "
+            "IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize."
+        )
 
     summarizer_input = (
-        [HumanMessage(content=summary_message)]
+        [SystemMessage(content=summary_message)]
         + messages_to_prune
-        + [HumanMessage(content="Provide a concise summary capturing the key facts, decisions, and results. Omit raw data dumps.")]
+        + [SystemMessage(content="Provide a concise summary capturing the key facts, decisions, and results. Omit raw data dumps. IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize.")]
     )
 
     summarizer = agent.summarizer or agent.llm
@@ -249,6 +253,26 @@ async def tool_node(agent, state: AgentState) -> dict:
     return {"messages": list(results)}
 
 
+def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
+    """
+    After tool execution, check if context needs summarization before
+    handing back to the LLM. This enables mid-loop summarization without
+    ever skipping pending tool calls.
+    """
+    needs_summarization = (
+        state.enable_summarization
+        and (
+            len(state.messages) > state.keep_last_n_messages
+            or _estimate_token_count(state.messages) > state.max_context_tokens
+        )
+    )
+    if needs_summarization:
+        logger.debug("Post-tool routing → summarize_conversation (messages=%d, est_tokens=%d)",
+                     len(state.messages), _estimate_token_count(state.messages))
+        return "summarize_conversation"
+    return "llm_call"
+
+
 def _estimate_token_count(messages: Sequence) -> int:
     """Rough token estimate: ~4 chars per token for English text."""
     return sum(len(getattr(m, "content", "") or "") for m in messages) // 4
@@ -257,10 +281,9 @@ def _estimate_token_count(messages: Sequence) -> int:
 def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conversation", "__end__"]:
     """
     Decide whether the autonomous agent should keep going:
-    - If the last assistant message requested tools, route to the tool node
-      (but force summarization first if context is dangerously large).
-    - If the conversation is too long (by message count OR token estimate)
-      and summarization is enabled, summarize.
+    - Pending tool calls MUST always be executed first (skipping them leaves
+      orphaned tool_calls in the message history which crashes the LLM API).
+    - After tool execution (no pending calls), summarize if context is large.
     - If we've hit the iteration limit or there are no tool calls, stop.
 
     Does not require agent dependencies — stays a plain function.
@@ -274,23 +297,15 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
     last_message = state.messages[-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
 
-    needs_summarization = (
-        state.enable_summarization
-        and (
-            len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages) > state.max_context_tokens
-        )
-    )
-
-    # Force mid-loop summarization if context is overflowing, even during tool loops
-    if needs_summarization:
-        logger.debug("Routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), _estimate_token_count(state.messages))
-        return "summarize_conversation"
-
+    # Tool calls MUST be executed before anything else — orphaned tool_calls
+    # without matching ToolMessages will cause a 400 from the LLM API.
     if has_tool_calls:
         logger.debug("Routing → tool_node")
         return "tool_node"
 
+    # No tool calls means the LLM produced a final response — always stop.
+    # Summarization after the final response is unnecessary (the conversation
+    # is over) and would create an infinite loop: summarize → llm_call →
+    # final response → summarize → llm_call → ...
     logger.debug("Routing → END")
     return END

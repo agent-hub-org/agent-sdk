@@ -7,8 +7,10 @@ from .graph import create_graph
 from .state import AgentState
 from ..llm_services.agent_llm import initialize_gemini as initialize_agent_gemini
 from ..llm_services.agent_llm import initialize_groq as initialize_agent_groq
+from ..llm_services.agent_llm import initialize_nvidia as initialize_agent_nvidia
 from ..llm_services.summarizer_llm import initialize_gemini as initialize_summarizer_gemini
 from ..llm_services.summarizer_llm import initialize_groq as initialize_summarizer_groq
+from ..llm_services.summarizer_llm import initialize_nvidia as initialize_summarizer_nvidia
 
 logger = logging.getLogger("agent_sdk.agent")
 
@@ -25,7 +27,10 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None, provider: str = "groq"):
         tools = tools or []
 
-        if provider == "gemini":
+        if provider == "nvidia":
+            self.llm = initialize_agent_nvidia()
+            self.summarizer = initialize_summarizer_nvidia()
+        elif provider == "gemini":
             self.llm = initialize_agent_gemini()
             self.summarizer = initialize_summarizer_gemini()
         else:

@@ -16,13 +16,13 @@ class AgentState(BaseModel):
     system_prompt: Optional[str] = None
 
     # maximum allowed tokens before summarization
-    max_context_tokens: int = 12000
+    max_context_tokens: int = 32768
 
     # enable automatic summarization
     enable_summarization: bool = True
 
     # number of recent messages to keep
-    keep_last_n_messages: int = 6
+    keep_last_n_messages: int = 15
 
     # autonomous agent configuration
     max_iterations: int = Field(
