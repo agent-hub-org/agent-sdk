@@ -22,9 +22,11 @@ class BaseAgent:
     - Uses a LangGraph checkpointer (`InMemorySaver`) for persistence.
     - Relies on `thread_id` to provide short-term conversational memory
       across multiple `run` calls for the same session.
+    - Optionally connects to MCP servers to discover remote tools.
     """
 
-    def __init__(self, tools=None, system_prompt=None, provider: str = "groq"):
+    def __init__(self, tools=None, system_prompt=None, provider: str = "groq",
+                 mcp_servers: dict | None = None):
         tools = tools or []
 
         if provider == "nvidia":
@@ -37,8 +39,8 @@ class BaseAgent:
             self.llm = initialize_agent_groq()
             self.summarizer = initialize_summarizer_groq()
 
-        self.tools = tools
-        self.tools_by_name = {tool.name: tool for tool in tools}
+        self.tools = list(tools)
+        self.tools_by_name = {tool.name: tool for tool in self.tools}
 
         # Persistent, per-thread conversational memory
         self.memory = InMemorySaver()
@@ -48,12 +50,52 @@ class BaseAgent:
             "or respond directly when tools are not needed."
         )
 
-        # Autonomous LangGraph agent with persistence
+        self._mcp_servers = mcp_servers
+        self._mcp_manager = None
+        self._initialized = False
+
+        if mcp_servers:
+            # Defer graph creation until MCP tools are discovered
+            self.graph = None
+            logger.info("BaseAgent created with %d local tool(s) + %d MCP server(s) — graph deferred",
+                        len(self.tools), len(mcp_servers))
+        else:
+            # No MCP — build graph immediately (backward compatible)
+            self.graph = create_graph(agent=self, checkpointer=self.memory)
+            self._initialized = True
+            logger.info("BaseAgent initialized with %d tool(s): %s",
+                        len(self.tools), list(self.tools_by_name.keys()))
+
+    async def _ensure_initialized(self):
+        """Connect to MCP servers (if configured) and build the graph on first use."""
+        if self._initialized:
+            return
+
+        if self._mcp_servers:
+            from ..mcp.client import MCPConnectionManager
+            self._mcp_manager = MCPConnectionManager()
+            mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
+
+            # Merge MCP tools with any local tools
+            self.tools.extend(mcp_tools)
+            for t in mcp_tools:
+                self.tools_by_name[t.name] = t
+
+            logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
+
         self.graph = create_graph(agent=self, checkpointer=self.memory)
-        logger.info("BaseAgent initialized with %d tool(s): %s",
-                    len(self.tools), list(self.tools_by_name.keys()))
+        self._initialized = True
+        logger.info("BaseAgent graph built with %d tool(s)", len(self.tools))
+
+    async def _disconnect_mcp(self):
+        """Cleanly shut down MCP connections."""
+        if self._mcp_manager is not None:
+            await self._mcp_manager.disconnect()
+            self._mcp_manager = None
 
     async def arun(self, query: str, session_id: str = "default", system_prompt: str | None = None) -> dict:
+        await self._ensure_initialized()
+
         logger.info("Agent run started — session='%s', query='%s'", session_id, query[:100])
 
         result = await self.graph.ainvoke(
