@@ -1,4 +1,4 @@
-name: Notify Agents on SDK Release
+name: Notify Agents
 
 on:
   push:
