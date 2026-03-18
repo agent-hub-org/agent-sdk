@@ -19,14 +19,15 @@ class BaseAgent:
     """
     High-level autonomous agent wrapper.
 
-    - Uses a LangGraph checkpointer (`InMemorySaver`) for persistence.
+    - Uses a LangGraph checkpointer for persistence (defaults to InMemorySaver,
+      but accepts any LangGraph-compatible checkpointer such as AsyncMongoDBSaver).
     - Relies on `thread_id` to provide short-term conversational memory
       across multiple `run` calls for the same session.
     - Optionally connects to MCP servers to discover remote tools.
     """
 
     def __init__(self, tools=None, system_prompt=None, provider: str = "groq",
-                 mcp_servers: dict | None = None):
+                 mcp_servers: dict | None = None, checkpointer=None):
         tools = tools or []
 
         if provider == "nvidia":
@@ -42,8 +43,9 @@ class BaseAgent:
         self.tools = list(tools)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
 
-        # Persistent, per-thread conversational memory
-        self.memory = InMemorySaver()
+        # Persistent checkpointer — callers can pass a MongoDB/Redis/Postgres
+        # checkpointer for durability; defaults to in-memory for dev/test.
+        self.memory = checkpointer or InMemorySaver()
         self.system_prompt = system_prompt or (
             "You are an autonomous assistant. "
             "You may call tools to achieve the user's goal, "
@@ -138,6 +140,34 @@ class BaseAgent:
         logger.info("Agent run completed — session='%s', response length: %d chars, steps: %d",
                     session_id, len(response), len(steps))
         return {"response": response, "steps": steps}
+
+    async def astream(self, query: str, session_id: str = "default", system_prompt: str | None = None):
+        """Async generator that yields text chunks as they stream from the LLM.
+
+        Useful for SSE endpoints — each yielded string is a token or small
+        chunk of the agent's response (including intermediate reasoning).
+        """
+        await self._ensure_initialized()
+
+        logger.info("Agent stream started — session='%s', query='%s'", session_id, query[:100])
+
+        async for event in self.graph.astream_events(
+            {
+                "messages": [HumanMessage(content=query)],
+                "system_prompt": system_prompt or self.system_prompt,
+            },
+            config={"configurable": {"thread_id": session_id}},
+            version="v2",
+        ):
+            if event["event"] == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    yield content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                            yield block["text"]
 
     def run(self, query: str, session_id: str = "default") -> dict:
         """
