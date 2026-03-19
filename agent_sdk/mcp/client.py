@@ -12,7 +12,6 @@ class MCPConnectionManager:
 
     def __init__(self):
         self._client: MultiServerMCPClient | None = None
-        self._context = None
 
     async def connect(self, server_configs: dict[str, dict[str, Any]]) -> list[StructuredTool]:
         """
@@ -33,25 +32,20 @@ class MCPConnectionManager:
         logger.info("Connecting to %d MCP server(s): %s", len(server_configs), list(server_configs.keys()))
 
         self._client = MultiServerMCPClient(server_configs)
-        self._context = self._client.__aenter__()
-        await self._context
-
-        tools = self._client.get_tools()
+        tools = await self._client.get_tools()
         logger.info("Discovered %d tool(s) from MCP servers: %s",
                      len(tools), [t.name for t in tools])
         return tools
 
     async def disconnect(self):
-        """Cleanly exit the MCP client context."""
+        """Cleanly close the MCP client."""
         if self._client is not None:
             try:
-                await self._client.__aexit__(None, None, None)
                 logger.info("Disconnected from MCP servers")
             except Exception:
                 logger.exception("Error disconnecting from MCP servers")
             finally:
                 self._client = None
-                self._context = None
 
     @property
     def connected(self) -> bool:
