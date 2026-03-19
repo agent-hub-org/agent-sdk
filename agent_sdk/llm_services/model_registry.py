@@ -76,6 +76,7 @@ def get_llm(model_id: str, temperature: float = 0.7):
             model=model,
             temperature=temperature,
             api_key=os.environ.get("NVIDIA_API_KEY"),
+            max_completion_tokens=32768,
         )
     else:
         raise ValueError(f"Unknown provider '{provider}' for model_id '{model_id}'")
