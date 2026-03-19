@@ -1,9 +1,11 @@
 import asyncio
 import logging
+from contextlib import AsyncExitStack
 from typing import Any
 
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 logger = logging.getLogger("agent_sdk.mcp")
 
@@ -12,14 +14,18 @@ RETRY_DELAY = 3  # seconds
 
 
 class MCPConnectionManager:
-    """Thin wrapper around MultiServerMCPClient that manages lifecycle and returns LangChain tools."""
+    """Manages persistent MCP sessions so tools reuse connections instead of creating new ones per call."""
 
     def __init__(self):
         self._client: MultiServerMCPClient | None = None
+        self._exit_stack: AsyncExitStack | None = None
 
-    async def connect(self, server_configs: dict[str, dict[str, Any]]) -> list[StructuredTool]:
+    async def connect(self, server_configs: dict[str, dict[str, Any]]) -> list[BaseTool]:
         """
-        Connect to MCP servers and return their tools as LangChain StructuredTool objects.
+        Connect to MCP servers with persistent sessions and return LangChain tools.
+
+        Unlike get_tools() which creates a new session per tool call, this opens
+        long-lived sessions via client.session() and binds tools to them.
         Retries on connection failure to handle service startup ordering.
 
         Args:
@@ -38,12 +44,24 @@ class MCPConnectionManager:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self._client = MultiServerMCPClient(server_configs)
-                tools = await self._client.get_tools()
-                logger.info("Discovered %d tool(s) from MCP servers: %s",
-                             len(tools), [t.name for t in tools])
-                return tools
+                self._exit_stack = AsyncExitStack()
+                await self._exit_stack.__aenter__()
+
+                all_tools: list[BaseTool] = []
+                for server_name in server_configs:
+                    session = await self._exit_stack.enter_async_context(
+                        self._client.session(server_name)
+                    )
+                    tools = await load_mcp_tools(session=session)
+                    all_tools.extend(tools)
+                    logger.info("Opened persistent session for '%s' — %d tool(s)",
+                                server_name, len(tools))
+
+                logger.info("Discovered %d tool(s) with persistent sessions: %s",
+                             len(all_tools), [t.name for t in all_tools])
+                return all_tools
             except Exception as e:
-                self._client = None
+                await self._cleanup()
                 if attempt < MAX_RETRIES:
                     logger.warning("MCP connection attempt %d/%d failed: %s — retrying in %ds",
                                    attempt, MAX_RETRIES, e, RETRY_DELAY)
@@ -52,15 +70,20 @@ class MCPConnectionManager:
                     logger.error("MCP connection failed after %d attempts: %s", MAX_RETRIES, e)
                     raise
 
-    async def disconnect(self):
-        """Cleanly close the MCP client."""
-        if self._client is not None:
+    async def _cleanup(self):
+        """Close all persistent sessions and reset state."""
+        if self._exit_stack is not None:
             try:
-                logger.info("Disconnected from MCP servers")
+                await self._exit_stack.__aexit__(None, None, None)
             except Exception:
-                logger.exception("Error disconnecting from MCP servers")
-            finally:
-                self._client = None
+                logger.exception("Error closing MCP sessions")
+            self._exit_stack = None
+        self._client = None
+
+    async def disconnect(self):
+        """Cleanly close all persistent MCP sessions."""
+        await self._cleanup()
+        logger.info("Disconnected from MCP servers")
 
     @property
     def connected(self) -> bool:
