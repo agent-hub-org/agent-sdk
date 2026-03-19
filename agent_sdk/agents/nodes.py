@@ -80,11 +80,19 @@ async def llm_call(agent, state: AgentState) -> dict:
     `agent` is bound via functools.partial at graph build time.
     """
 
-    logger.info("LLM call — iteration %d/%d, message count: %d",
-                state.iteration + 1, state.max_iterations, len(state.messages))
+    logger.info("LLM call — iteration %d/%d, message count: %d, model_id: %s",
+                state.iteration + 1, state.max_iterations, len(state.messages),
+                state.model_id or "default")
+
+    # Use dynamic model if model_id is set, otherwise fall back to agent.llm
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        llm = get_llm(state.model_id)
+    else:
+        llm = agent.llm
 
     tools = list(agent.tools_by_name.values())
-    llm_with_tools = agent.llm.bind_tools(tools) if tools else agent.llm
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     # Merge summary into the existing system message to avoid dual SystemMessages
     if state.summary:
