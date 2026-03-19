@@ -141,33 +141,97 @@ class BaseAgent:
                     session_id, len(response), len(steps))
         return {"response": response, "steps": steps}
 
-    async def astream(self, query: str, session_id: str = "default", system_prompt: str | None = None):
-        """Async generator that yields text chunks as they stream from the LLM.
+    def astream(self, query: str, session_id: str = "default", system_prompt: str | None = None):
+        """Return a StreamResult that yields text chunks and tracks tool calls.
 
-        Useful for SSE endpoints — each yielded string is a token or small
-        chunk of the agent's response (including intermediate reasoning).
+        Usage:
+            stream = agent.astream(query, session_id=session_id)
+            async for chunk in stream:
+                # send chunk to client
+            steps = stream.steps  # available after iteration completes
         """
-        await self._ensure_initialized()
+        return StreamResult(self, query, session_id, system_prompt or self.system_prompt)
 
-        logger.info("Agent stream started — session='%s', query='%s'", session_id, query[:100])
 
-        async for event in self.graph.astream_events(
+class StreamResult:
+    """Async iterator that streams text chunks and collects execution steps."""
+
+    def __init__(self, agent: "BaseAgent", query: str, session_id: str, system_prompt: str):
+        self._agent = agent
+        self._query = query
+        self._session_id = session_id
+        self._system_prompt = system_prompt
+        self.steps: list[dict] = []
+
+    def __aiter__(self):
+        return self._stream()
+
+    async def _stream(self):
+        await self._agent._ensure_initialized()
+
+        logger.info("Agent stream started — session='%s', query='%s'", self._session_id, self._query[:100])
+
+        chunks_yielded = False
+        last_full_response = ""
+
+        async for event in self._agent.graph.astream_events(
             {
-                "messages": [HumanMessage(content=query)],
-                "system_prompt": system_prompt or self.system_prompt,
+                "messages": [HumanMessage(content=self._query)],
+                "system_prompt": self._system_prompt,
             },
-            config={"configurable": {"thread_id": session_id}},
+            config={"configurable": {"thread_id": self._session_id}},
             version="v2",
         ):
             if event["event"] == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
                 content = chunk.content
                 if isinstance(content, str) and content:
+                    chunks_yielded = True
                     yield content
                 elif isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                            chunks_yielded = True
                             yield block["text"]
+            elif event["event"] == "on_chat_model_end":
+                # Track tool calls from LLM responses
+                output = event["data"].get("output")
+                if output:
+                    tool_calls = getattr(output, "tool_calls", None) or []
+                    for tc in tool_calls:
+                        self.steps.append({
+                            "action": "tool_call",
+                            "tool": tc["name"],
+                            "args": tc.get("args", {}),
+                        })
+                    # Capture full response as fallback
+                    content = getattr(output, "content", None)
+                    if isinstance(content, str) and content:
+                        last_full_response = content
+                    elif isinstance(content, list):
+                        parts = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                                parts.append(block["text"])
+                        if parts:
+                            last_full_response = "".join(parts)
+            elif event["event"] == "on_tool_end":
+                # Track tool results
+                output = event["data"].get("output")
+                if output:
+                    content = getattr(output, "content", "") or str(output)
+                    self.steps.append({
+                        "action": "tool_result",
+                        "tool": event.get("name", "unknown"),
+                        "result_length": len(content),
+                        "result_preview": content[:500] if len(content) > 500 else content,
+                    })
+
+        # Fallback: if no streaming chunks were yielded, emit the full response
+        if not chunks_yielded and last_full_response:
+            logger.warning("No streaming chunks received — falling back to full response (%d chars)",
+                          len(last_full_response))
+            yield last_full_response
 
     def run(self, query: str, session_id: str = "default") -> dict:
         """
