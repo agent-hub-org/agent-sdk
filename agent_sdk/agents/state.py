@@ -24,6 +24,9 @@ class AgentState(BaseModel):
     # number of recent messages to keep
     keep_last_n_messages: int = 15
 
+    # dynamic model override — if set, llm_call uses this model instead of agent.llm
+    model_id: Optional[str] = None
+
     # autonomous agent configuration
     max_iterations: int = Field(
         default=20,

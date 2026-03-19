@@ -95,16 +95,22 @@ class BaseAgent:
             await self._mcp_manager.disconnect()
             self._mcp_manager = None
 
-    async def arun(self, query: str, session_id: str = "default", system_prompt: str | None = None) -> dict:
+    async def arun(self, query: str, session_id: str = "default",
+                   system_prompt: str | None = None, model_id: str | None = None) -> dict:
         await self._ensure_initialized()
 
-        logger.info("Agent run started — session='%s', query='%s'", session_id, query[:100])
+        logger.info("Agent run started — session='%s', query='%s', model_id='%s'",
+                    session_id, query[:100], model_id or "default")
+
+        invoke_input = {
+            "messages": [HumanMessage(content=query)],
+            "system_prompt": system_prompt or self.system_prompt,
+        }
+        if model_id:
+            invoke_input["model_id"] = model_id
 
         result = await self.graph.ainvoke(
-            {
-                "messages": [HumanMessage(content=query)],
-                "system_prompt": system_prompt or self.system_prompt,
-            },
+            invoke_input,
             config={"configurable": {"thread_id": session_id}},
         )
 
@@ -141,7 +147,8 @@ class BaseAgent:
                     session_id, len(response), len(steps))
         return {"response": response, "steps": steps}
 
-    def astream(self, query: str, session_id: str = "default", system_prompt: str | None = None):
+    def astream(self, query: str, session_id: str = "default",
+                system_prompt: str | None = None, model_id: str | None = None):
         """Return a StreamResult that yields text chunks and tracks tool calls.
 
         Usage:
@@ -150,17 +157,19 @@ class BaseAgent:
                 # send chunk to client
             steps = stream.steps  # available after iteration completes
         """
-        return StreamResult(self, query, session_id, system_prompt or self.system_prompt)
+        return StreamResult(self, query, session_id, system_prompt or self.system_prompt, model_id)
 
 
 class StreamResult:
     """Async iterator that streams text chunks and collects execution steps."""
 
-    def __init__(self, agent: "BaseAgent", query: str, session_id: str, system_prompt: str):
+    def __init__(self, agent: "BaseAgent", query: str, session_id: str,
+                 system_prompt: str, model_id: str | None = None):
         self._agent = agent
         self._query = query
         self._session_id = session_id
         self._system_prompt = system_prompt
+        self._model_id = model_id
         self.steps: list[dict] = []
 
     def __aiter__(self):
@@ -174,11 +183,15 @@ class StreamResult:
         chunks_yielded = False
         last_full_response = ""
 
+        stream_input = {
+            "messages": [HumanMessage(content=self._query)],
+            "system_prompt": self._system_prompt,
+        }
+        if self._model_id:
+            stream_input["model_id"] = self._model_id
+
         async for event in self._agent.graph.astream_events(
-            {
-                "messages": [HumanMessage(content=self._query)],
-                "system_prompt": self._system_prompt,
-            },
+            stream_input,
             config={"configurable": {"thread_id": self._session_id}},
             version="v2",
         ):
