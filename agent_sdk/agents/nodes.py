@@ -227,6 +227,9 @@ async def tool_node(agent, state: AgentState) -> dict:
     Execute any tool calls from the last assistant message and
     return the resulting tool messages.
 
+    If an MCP session has dropped (McpError: Session terminated),
+    reconnects and retries the failed tool calls once.
+
     `agent` is bound via functools.partial at graph build time.
     """
 
@@ -256,7 +259,25 @@ async def tool_node(agent, state: AgentState) -> dict:
 
         return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
-    results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+    try:
+        results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+    except Exception as e:
+        # Check if this is an MCP session termination error
+        error_msg = str(e).lower()
+        if "session terminated" in error_msg or "session" in error_msg and "closed" in error_msg:
+            logger.warning("MCP session dropped — attempting reconnect and retry")
+            if agent._mcp_manager is not None:
+                new_tools = await agent._mcp_manager.reconnect()
+                # Update the agent's tool registry with fresh tool instances
+                agent.tools = list(agent.tools)  # keep non-MCP tools
+                for t in new_tools:
+                    agent.tools_by_name[t.name] = t
+                logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
+                results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+            else:
+                raise
+        else:
+            raise
 
     return {"messages": list(results)}
 
