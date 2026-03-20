@@ -105,6 +105,7 @@ class BaseAgent:
         invoke_input = {
             "messages": [HumanMessage(content=query)],
             "system_prompt": system_prompt or self.system_prompt,
+            "iteration": 0,
         }
         if model_id:
             invoke_input["model_id"] = model_id
@@ -186,6 +187,7 @@ class StreamResult:
         stream_input = {
             "messages": [HumanMessage(content=self._query)],
             "system_prompt": self._system_prompt,
+            "iteration": 0,
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id

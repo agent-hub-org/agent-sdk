@@ -55,8 +55,12 @@ async def initialize(state: AgentState) -> dict:
 
     Does not require agent dependencies — stays a plain function.
     """
-    # Only inject if no SystemMessage is already present
+    # If a SystemMessage already exists, check whether it needs updating
     if state.messages and isinstance(state.messages[0], SystemMessage):
+        if state.system_prompt and state.messages[0].content != state.system_prompt:
+            logger.info("Updating system prompt (%d chars)", len(state.system_prompt))
+            return {"messages": [RemoveMessage(id=state.messages[0].id),
+                                 SystemMessage(content=state.system_prompt)]}
         logger.debug("System prompt already present, skipping initialization")
         return {}
 
