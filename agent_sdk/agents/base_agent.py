@@ -198,6 +198,10 @@ class StreamResult:
             version="v2",
         ):
             if event["event"] == "on_chat_model_stream":
+                # Only stream from the main LLM, not the summarizer
+                node = event.get("metadata", {}).get("langgraph_node")
+                if node != "llm_call":
+                    continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
                 if isinstance(content, str) and content:
@@ -209,6 +213,10 @@ class StreamResult:
                             chunks_yielded = True
                             yield block["text"]
             elif event["event"] == "on_chat_model_end":
+                # Only track from the main LLM, not the summarizer
+                node = event.get("metadata", {}).get("langgraph_node")
+                if node != "llm_call":
+                    continue
                 # Track tool calls from LLM responses
                 output = event["data"].get("output")
                 if output:

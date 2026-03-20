@@ -100,7 +100,11 @@ async def llm_call(agent, state: AgentState) -> dict:
 
     # Merge summary into the existing system message to avoid dual SystemMessages
     if state.summary:
-        summary_text = f"Conversation summary:\n{state.summary}"
+        summary_text = (
+            "INTERNAL CONTEXT (for your reference only — do NOT include, repeat, "
+            "or paraphrase any of this in your response to the user):\n"
+            f"Previous conversation summary: {state.summary}"
+        )
         messages = list(state.messages)
         if messages and isinstance(messages[0], SystemMessage):
             messages[0] = SystemMessage(
