@@ -3,14 +3,19 @@ import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
+import httpx
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
 logger = logging.getLogger("agent_sdk.mcp")
 
 MAX_RETRIES = 5
 RETRY_DELAY = 3  # seconds
+
+_STREAMABLE_HTTP_TRANSPORTS = frozenset({"streamable_http", "streamable-http", "http"})
 
 
 class MCPConnectionManager:
@@ -48,10 +53,20 @@ class MCPConnectionManager:
                 await self._exit_stack.__aenter__()
 
                 all_tools: list[BaseTool] = []
-                for server_name in server_configs:
-                    session = await self._exit_stack.enter_async_context(
-                        self._client.session(server_name)
-                    )
+                for server_name, config in server_configs.items():
+                    transport = config.get("transport", "")
+
+                    if transport in _STREAMABLE_HTTP_TRANSPORTS:
+                        # Use the new streamable_http_client API directly
+                        # to avoid the deprecated streamablehttp_client in
+                        # langchain-mcp-adapters.
+                        session = await self._create_streamable_http_session(config)
+                    else:
+                        # Use langchain-mcp-adapters for stdio/sse/websocket
+                        session = await self._exit_stack.enter_async_context(
+                            self._client.session(server_name)
+                        )
+
                     tools = await load_mcp_tools(session=session)
                     all_tools.extend(tools)
                     logger.info("Opened persistent session for '%s' — %d tool(s)",
@@ -70,6 +85,31 @@ class MCPConnectionManager:
                 else:
                     logger.error("MCP connection failed after %d attempts: %s", MAX_RETRIES, e)
                     raise
+
+    async def _create_streamable_http_session(self, config: dict[str, Any]) -> ClientSession:
+        """Create a session using the non-deprecated streamable_http_client API."""
+        http_client = await self._exit_stack.enter_async_context(
+            httpx.AsyncClient(
+                headers=config.get("headers"),
+                auth=config.get("auth"),
+                timeout=httpx.Timeout(
+                    config.get("timeout", 30),
+                    read=config.get("sse_read_timeout", 300),
+                ),
+            )
+        )
+        read, write, _ = await self._exit_stack.enter_async_context(
+            streamable_http_client(
+                config["url"],
+                http_client=http_client,
+                terminate_on_close=config.get("terminate_on_close", True),
+            )
+        )
+        session = await self._exit_stack.enter_async_context(
+            ClientSession(read, write)
+        )
+        await session.initialize()
+        return session
 
     async def reconnect(self) -> list[BaseTool]:
         """Re-establish MCP sessions after a failure. Thread-safe via lock."""

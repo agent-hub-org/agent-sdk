@@ -27,7 +27,17 @@ Rules:
 - comparative activates company analysis for each entity + synthesis
 - thematic activates regime + sector + company phases
 
-Output your classification as a JSON object matching the QueryClassification schema.
+Output ONLY a JSON object with exactly these fields:
+{
+  "query_type": "<one of: data_retrieval, company_analysis, sector_analysis, macro_impact, comparative, thematic>",
+  "entities": ["<tickers, sectors, or macro indicators mentioned>"],
+  "requires_regime_assessment": true/false,
+  "requires_causal_analysis": true/false,
+  "requires_sector_analysis": true/false,
+  "requires_company_analysis": true/false,
+  "requires_risk_assessment": true/false,
+  "reasoning": "<brief explanation of your classification>"
+}
 """
 
 REGIME_ASSESSMENT_PROMPT = """\
