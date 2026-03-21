@@ -25,3 +25,11 @@ jobs:
           -H "Accept: application/vnd.github+json" \
           https://api.github.com/repos/pranjalv23/agent-research/dispatches \
           -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
+
+      - name: Notify agent-interview-prep
+        run: |
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/pranjalv23/agent-interview-prep/dispatches \
+          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
