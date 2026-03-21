@@ -396,7 +396,7 @@ async def classify_query_node(agent, state) -> dict:
         # Extract JSON from response
         classification = _extract_json(content)
         if classification:
-            qc = QueryClassification(**classification)
+            qc = QueryClassification(**_normalize_classification(classification))
         else:
             # Default to macro_impact (full pipeline) if parsing fails
             logger.warning("Could not parse query classification, defaulting to macro_impact")
@@ -815,6 +815,46 @@ def _extract_json(text: str) -> dict | None:
                     start = None
 
     return None
+
+
+def _normalize_classification(raw: dict) -> dict:
+    """Remap common LLM field-name variations to QueryClassification fields."""
+    normalized = dict(raw)
+
+    # Remap query_type aliases
+    for alias in ("type", "classification", "category"):
+        if alias in normalized and "query_type" not in normalized:
+            normalized["query_type"] = normalized.pop(alias)
+
+    # Remap reasoning aliases
+    for alias in ("reason", "explanation"):
+        if alias in normalized and "reasoning" not in normalized:
+            normalized["reasoning"] = normalized.pop(alias)
+
+    # Convert reasoning_phases / phases list to individual booleans
+    phases_list = normalized.pop("reasoning_phases", None) or normalized.pop("phases", None)
+    if phases_list and isinstance(phases_list, list):
+        phase_mapping = {
+            "regime_assessment": "requires_regime_assessment",
+            "causal_analysis": "requires_causal_analysis",
+            "sector_analysis": "requires_sector_analysis",
+            "company_analysis": "requires_company_analysis",
+            "risk_assessment": "requires_risk_assessment",
+        }
+        for field in phase_mapping.values():
+            normalized.setdefault(field, False)
+        for phase in phases_list:
+            if phase in phase_mapping:
+                normalized[phase_mapping[phase]] = True
+
+    # Strip unknown keys to avoid Pydantic extra-field errors
+    valid_keys = {
+        "query_type", "entities",
+        "requires_regime_assessment", "requires_causal_analysis",
+        "requires_sector_analysis", "requires_company_analysis",
+        "requires_risk_assessment", "reasoning",
+    }
+    return {k: v for k, v in normalized.items() if k in valid_keys}
 
 
 def _run_phase_validation(state) -> list[str]:
