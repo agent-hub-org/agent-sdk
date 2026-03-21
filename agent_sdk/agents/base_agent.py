@@ -134,7 +134,17 @@ class BaseAgent:
             config={"configurable": {"thread_id": session_id}},
         )
 
-        raw = result["messages"][-1].content
+        # For financial_analyst mode, prefer the structured synthesis report
+        if self.mode == "financial_analyst":
+            synthesis = result.get("synthesis_report") or {}
+            raw = synthesis.get("full_report", "")
+        else:
+            raw = ""
+
+        # Fallback to last message content
+        if not raw:
+            raw = result["messages"][-1].content
+
         if isinstance(raw, list):
             response = "".join(
                 block["text"] for block in raw if block.get("type") == "text"
