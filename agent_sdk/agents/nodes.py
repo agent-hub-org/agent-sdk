@@ -423,9 +423,9 @@ async def classify_query_node(agent, state) -> dict:
     # Determine phases to run based on classification
     phases = []
     if qc.query_type == QueryType.DATA_RETRIEVAL:
-        # Simple data retrieval — skip to standard agent loop
-        # Return empty phases so phase_router goes to END
-        phases = []
+        # Simple data retrieval — still needs tool access for fetching
+        # and synthesis to produce a user-facing response
+        phases = ["company_analysis", "synthesis"]
     else:
         if qc.requires_regime_assessment:
             phases.append("regime_assessment")
@@ -637,9 +637,20 @@ async def synthesis_node(agent, state) -> dict:
     response = await llm.ainvoke(prompt)
 
     synthesis_data = _extract_json(response.content) or {}
+
+    # Ensure the message added to state contains a user-facing narrative,
+    # not raw JSON.  If the LLM returned structured JSON with a full_report
+    # field, use that as the message content.
+    if synthesis_data and "full_report" in synthesis_data:
+        report_msg = AIMessage(content=synthesis_data["full_report"])
+    else:
+        report_msg = response
+        if not synthesis_data:
+            synthesis_data = {"full_report": response.content}
+
     return {
-        "messages": [response],
-        "synthesis_report": synthesis_data if synthesis_data else {"full_report": response.content},
+        "messages": [report_msg],
+        "synthesis_report": synthesis_data,
         "iteration": state.iteration + 1,
     }
 
