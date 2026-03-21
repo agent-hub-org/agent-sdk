@@ -43,6 +43,20 @@ MODEL_CATALOG = {
         "model": "nvidia/nemotron-3-super-120b-a12b",
         "label": "Nemotron 120B (NVIDIA)",
     },
+
+    # Fine-tuned models for financial reasoning pipeline phases.
+    # These slots are ready for fine-tuned model weights once training is complete.
+    # The cognitive pipeline can use model_id override per-phase via state.model_id.
+    "groq/financial-synthesis": {
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",  # placeholder — swap with fine-tuned model
+        "label": "Financial Synthesis (Fine-tuned)",
+    },
+    "groq/financial-risk": {
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",  # placeholder — swap with fine-tuned model
+        "label": "Financial Risk Assessment (Fine-tuned)",
+    },
 }
 
 

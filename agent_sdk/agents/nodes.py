@@ -346,3 +346,508 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
     # final response → summarize → llm_call → ...
     logger.debug("Routing → END")
     return END
+
+
+# ============================================================================
+# FINANCIAL REASONING PIPELINE — Phase Nodes
+# ============================================================================
+# These nodes are only used by create_financial_reasoning_graph().
+# They implement the multi-step cognitive pipeline for structured financial
+# analysis. Each node represents one analytical phase with its own system
+# prompt, tool set, and structured output schema.
+# ============================================================================
+
+async def financial_initialize(state) -> dict:
+    """Initialize the financial reasoning pipeline."""
+    # Reuse standard initialize for system message setup
+    result = await initialize(state)
+    return result
+
+
+async def classify_query_node(agent, state) -> dict:
+    """
+    Classify the user's query to determine which pipeline phases to activate.
+    Uses the LLM with a classification-specific prompt.
+    """
+    from agent_sdk.financial.prompts import QUERY_CLASSIFIER_PROMPT
+    from agent_sdk.financial.schemas import QueryClassification, QueryType
+
+    logger.info("Classifying query for financial reasoning pipeline")
+
+    llm = _get_phase_llm(agent, state)
+
+    # Build classification prompt
+    user_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_query = msg.content
+            break
+
+    classification_prompt = [
+        SystemMessage(content=QUERY_CLASSIFIER_PROMPT),
+        HumanMessage(content=f"Classify this query:\n\n{user_query}"),
+    ]
+
+    try:
+        response = await llm.ainvoke(classification_prompt)
+        # Try to parse structured classification from response
+        import json
+        content = response.content
+        # Extract JSON from response
+        classification = _extract_json(content)
+        if classification:
+            qc = QueryClassification(**classification)
+        else:
+            # Default to macro_impact (full pipeline) if parsing fails
+            logger.warning("Could not parse query classification, defaulting to macro_impact")
+            qc = QueryClassification(
+                query_type=QueryType.MACRO_IMPACT,
+                requires_regime_assessment=True,
+                requires_causal_analysis=True,
+                requires_sector_analysis=True,
+                requires_company_analysis=True,
+                requires_risk_assessment=True,
+                reasoning="Classification parsing failed — activating full pipeline",
+            )
+    except Exception:
+        logger.exception("Query classification failed, using full pipeline")
+        qc = QueryClassification(
+            query_type=QueryType.MACRO_IMPACT,
+            requires_regime_assessment=True,
+            requires_causal_analysis=True,
+            requires_sector_analysis=True,
+            requires_company_analysis=True,
+            requires_risk_assessment=True,
+        )
+
+    # Determine phases to run based on classification
+    phases = []
+    if qc.query_type == QueryType.DATA_RETRIEVAL:
+        # Simple data retrieval — skip to standard agent loop
+        # Return empty phases so phase_router goes to END
+        phases = []
+    else:
+        if qc.requires_regime_assessment:
+            phases.append("regime_assessment")
+        if qc.requires_causal_analysis:
+            phases.append("causal_analysis")
+        if qc.requires_sector_analysis:
+            phases.append("sector_analysis")
+        if qc.requires_company_analysis:
+            phases.append("company_analysis")
+        if qc.requires_risk_assessment:
+            phases.append("risk_assessment")
+        # Always add synthesis if we have any analysis phases
+        if phases:
+            phases.append("synthesis")
+
+    logger.info("Query classified as %s — phases: %s", qc.query_type.value, phases)
+
+    return {
+        "query_classification": qc.model_dump(),
+        "phases_to_run": phases,
+        "current_phase": phases[0] if phases else "done",
+        "iteration": state.iteration + 1,
+    }
+
+
+async def regime_assessment_node(agent, state) -> dict:
+    """
+    Regime assessment phase — assess macro/market/monetary regime.
+    Uses regime-specific tools (detect_market_regime) and system prompt.
+    """
+    from agent_sdk.financial.prompts import REGIME_ASSESSMENT_PROMPT
+
+    logger.info("Running regime assessment phase")
+
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "regime_assessment")
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    prompt = _build_phase_prompt(state, REGIME_ASSESSMENT_PROMPT)
+    response = await llm_with_tools.ainvoke(prompt)
+
+    # Check if LLM wants to call tools
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        return {"messages": [response], "iteration": state.iteration + 1}
+
+    # Phase complete — extract structured regime context from response
+    regime_data = _extract_json(response.content) or {}
+    logger.info("Regime assessment complete: %s", regime_data.get("market_regime", "unknown"))
+
+    return {
+        "messages": [response],
+        "regime_context": regime_data if regime_data else {"raw_assessment": response.content},
+        "iteration": state.iteration + 1,
+    }
+
+
+async def causal_analysis_node(agent, state) -> dict:
+    """
+    Causal analysis phase — trace causal chains from trigger events.
+    Uses causal graph tools and references regime context from prior phase.
+    """
+    from agent_sdk.financial.prompts import CAUSAL_ANALYSIS_PROMPT
+
+    logger.info("Running causal analysis phase")
+
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "causal_analysis")
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    # Inject prior phase context into prompt
+    prompt_template = CAUSAL_ANALYSIS_PROMPT.format(
+        regime_context=_format_context(state.regime_context),
+    )
+    prompt = _build_phase_prompt(state, prompt_template)
+    response = await llm_with_tools.ainvoke(prompt)
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        return {"messages": [response], "iteration": state.iteration + 1}
+
+    causal_data = _extract_json(response.content) or {}
+    return {
+        "messages": [response],
+        "causal_analysis": causal_data if causal_data else {"raw_analysis": response.content},
+        "iteration": state.iteration + 1,
+    }
+
+
+async def sector_analysis_node(agent, state) -> dict:
+    """Sector analysis phase — analyze relevant sectors."""
+    from agent_sdk.financial.prompts import SECTOR_ANALYSIS_PROMPT
+
+    logger.info("Running sector analysis phase")
+
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "sector_analysis")
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    prompt_template = SECTOR_ANALYSIS_PROMPT.format(
+        regime_context=_format_context(state.regime_context),
+        causal_analysis=_format_context(state.causal_analysis),
+    )
+    prompt = _build_phase_prompt(state, prompt_template)
+    response = await llm_with_tools.ainvoke(prompt)
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        return {"messages": [response], "iteration": state.iteration + 1}
+
+    sector_data = _extract_json(response.content) or {}
+    return {
+        "messages": [response],
+        "sector_findings": sector_data if sector_data else {"raw_analysis": response.content},
+        "iteration": state.iteration + 1,
+    }
+
+
+async def company_analysis_node(agent, state) -> dict:
+    """Company analysis phase — deep fundamental analysis."""
+    from agent_sdk.financial.prompts import COMPANY_ANALYSIS_PROMPT
+
+    logger.info("Running company analysis phase")
+
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "company_analysis")
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    prompt_template = COMPANY_ANALYSIS_PROMPT.format(
+        regime_context=_format_context(state.regime_context),
+        causal_analysis=_format_context(state.causal_analysis),
+        sector_analysis=_format_context(state.sector_findings),
+    )
+    prompt = _build_phase_prompt(state, prompt_template)
+    response = await llm_with_tools.ainvoke(prompt)
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        return {"messages": [response], "iteration": state.iteration + 1}
+
+    company_data = _extract_json(response.content) or {}
+    return {
+        "messages": [response],
+        "company_analysis": company_data if company_data else {"raw_analysis": response.content},
+        "iteration": state.iteration + 1,
+    }
+
+
+async def risk_assessment_node(agent, state) -> dict:
+    """Risk assessment phase — stress-test the thesis."""
+    from agent_sdk.financial.prompts import RISK_ASSESSMENT_PROMPT
+
+    logger.info("Running risk assessment phase")
+
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "risk_assessment")
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    prompt_template = RISK_ASSESSMENT_PROMPT.format(
+        regime_context=_format_context(state.regime_context),
+        causal_analysis=_format_context(state.causal_analysis),
+        sector_analysis=_format_context(state.sector_findings),
+        company_analysis=_format_context(state.company_analysis),
+    )
+    prompt = _build_phase_prompt(state, prompt_template)
+    response = await llm_with_tools.ainvoke(prompt)
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
+        return {"messages": [response], "iteration": state.iteration + 1}
+
+    # Run symbolic validation on the accumulated analysis
+    validation_warnings = _run_phase_validation(state)
+
+    risk_data = _extract_json(response.content) or {}
+    return {
+        "messages": [response],
+        "risk_assessment": risk_data if risk_data else {"raw_analysis": response.content},
+        "validation_warnings": state.validation_warnings + validation_warnings,
+        "iteration": state.iteration + 1,
+    }
+
+
+async def synthesis_node(agent, state) -> dict:
+    """Synthesis phase — combine all phases into final report."""
+    from agent_sdk.financial.prompts import SYNTHESIS_PROMPT
+
+    logger.info("Running synthesis phase")
+
+    llm = _get_phase_llm(agent, state)
+
+    prompt_template = SYNTHESIS_PROMPT.format(
+        regime_context=_format_context(state.regime_context),
+        causal_analysis=_format_context(state.causal_analysis),
+        sector_analysis=_format_context(state.sector_findings),
+        company_analysis=_format_context(state.company_analysis),
+        risk_assessment=_format_context(state.risk_assessment),
+    )
+
+    # Add validation warnings to synthesis
+    if state.validation_warnings:
+        prompt_template += "\n\nVALIDATION WARNINGS (must address in your synthesis):\n"
+        for w in state.validation_warnings:
+            prompt_template += f"- {w}\n"
+
+    prompt = _build_phase_prompt(state, prompt_template)
+
+    # Synthesis doesn't use tools — it's a pure reasoning step
+    response = await llm.ainvoke(prompt)
+
+    synthesis_data = _extract_json(response.content) or {}
+    return {
+        "messages": [response],
+        "synthesis_report": synthesis_data if synthesis_data else {"full_report": response.content},
+        "iteration": state.iteration + 1,
+    }
+
+
+def phase_advance(state) -> dict:
+    """
+    Advance to the next phase in the pipeline.
+    Removes the current phase from phases_to_run and sets current_phase.
+    """
+    remaining = list(state.phases_to_run)
+    if remaining:
+        remaining.pop(0)  # Remove completed phase
+
+    next_phase = remaining[0] if remaining else "done"
+    logger.info("Phase advance: %s → %s (remaining: %s)", state.current_phase, next_phase, remaining)
+
+    return {
+        "phases_to_run": remaining,
+        "current_phase": next_phase,
+    }
+
+
+async def financial_tool_node(agent, state) -> dict:
+    """
+    Execute tool calls within the financial reasoning pipeline.
+    Reuses the standard tool_node logic.
+    """
+    return await tool_node(agent, state)
+
+
+def financial_should_continue(phase_name: str, state) -> str:
+    """
+    Routing function for financial phase nodes.
+    If the LLM requested tools, route to financial_tool_node.
+    Otherwise, phase is complete — route to phase_advance.
+    """
+    if state.iteration >= state.max_iterations:
+        logger.warning("Iteration limit reached in phase %s", phase_name)
+        return "phase_advance"
+
+    last_message = state.messages[-1]
+    has_tool_calls = bool(getattr(last_message, "tool_calls", None))
+
+    if has_tool_calls:
+        return "financial_tool_node"
+
+    return "phase_advance"
+
+
+# ---------------------------------------------------------------------------
+# Financial Pipeline Helpers
+# ---------------------------------------------------------------------------
+
+def _get_phase_llm(agent, state):
+    """Get the LLM for the current phase, supporting model_id override."""
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        return get_llm(state.model_id)
+    return agent.llm
+
+
+def _get_phase_tools(agent, phase: str) -> list:
+    """
+    Get tools appropriate for a specific reasoning phase.
+    Returns a filtered subset of agent tools plus phase-specific financial tools.
+    """
+    from agent_sdk.financial.causal_graph import get_causal_graph_tools
+    from agent_sdk.financial.ontology import get_ontology_tools
+    from agent_sdk.financial.quant_tools import get_quant_tools
+
+    # Financial tools organized by phase
+    phase_financial_tools = {
+        "regime_assessment": [
+            t for t in get_quant_tools() if t.name == "detect_market_regime"
+        ],
+        "causal_analysis": get_causal_graph_tools() + [
+            t for t in get_quant_tools() if t.name == "run_scenario_simulation"
+        ],
+        "sector_analysis": get_ontology_tools(),
+        "company_analysis": (
+            get_ontology_tools()
+            + [t for t in get_quant_tools() if t.name in ("run_dcf", "run_comparable_valuation", "calculate_technical_signals")]
+        ),
+        "risk_assessment": [
+            t for t in get_quant_tools() if t.name == "run_scenario_simulation"
+        ] + get_causal_graph_tools(),
+    }
+
+    financial_tools = phase_financial_tools.get(phase, [])
+
+    # Also include agent's own tools (e.g., MCP data-fetching tools)
+    # so phases can retrieve live data
+    agent_tools = list(agent.tools_by_name.values())
+
+    # Combine, deduplicating by name
+    seen = set()
+    combined = []
+    for t in financial_tools + agent_tools:
+        if t.name not in seen:
+            combined.append(t)
+            seen.add(t.name)
+
+    return combined
+
+
+def _build_phase_prompt(state, phase_system_prompt: str) -> list:
+    """Build the message list for a phase LLM call, injecting the phase system prompt."""
+    messages = []
+    messages.append(SystemMessage(content=phase_system_prompt))
+
+    # Include the user's original query and any recent messages
+    for msg in state.messages:
+        if isinstance(msg, SystemMessage):
+            continue  # Skip — we're using the phase-specific prompt
+        messages.append(msg)
+
+    return messages
+
+
+def _format_context(data: dict | None) -> str:
+    """Format a dict as readable context for injection into prompts."""
+    if not data:
+        return "(not yet assessed)"
+    import json
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
+
+
+def _extract_json(text: str) -> dict | None:
+    """Try to extract a JSON object from LLM text output."""
+    import json
+
+    # Try the whole text as JSON
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try to find JSON block in markdown code fences
+    import re
+    json_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    matches = re.findall(json_pattern, text, re.DOTALL)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try to find a JSON object in the text
+    brace_depth = 0
+    start = None
+    for i, char in enumerate(text):
+        if char == '{':
+            if brace_depth == 0:
+                start = i
+            brace_depth += 1
+        elif char == '}':
+            brace_depth -= 1
+            if brace_depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    start = None
+
+    return None
+
+
+def _run_phase_validation(state) -> list[str]:
+    """
+    Run symbolic validators on accumulated analysis state.
+    Returns list of warning messages.
+    """
+    from agent_sdk.financial.validators import validate_logical_consistency, validate_confidence
+
+    warnings = []
+
+    # Validate company analysis if available
+    if state.company_analysis and isinstance(state.company_analysis, dict):
+        ca = state.company_analysis
+
+        # Extract metrics for validation
+        val = ca.get("valuation", {})
+        fund = ca.get("fundamentals", {})
+
+        results = validate_logical_consistency(
+            valuation_assessment=ca.get("valuation_assessment"),
+            recommendation=ca.get("recommendation"),
+            pe=val.get("pe_trailing"),
+            roe=fund.get("roe"),
+            debt_to_equity=fund.get("debt_to_equity"),
+            interest_coverage=fund.get("interest_coverage"),
+        )
+
+        for r in results:
+            if not r.passed:
+                warnings.append(r.message)
+
+    # Validate confidence calibration
+    if state.regime_context and isinstance(state.regime_context, dict):
+        conf = state.regime_context.get("confidence", 0.5)
+        data_points = len([v for v in state.regime_context.values() if v is not None and v != ""])
+        result = validate_confidence(
+            stated_confidence=conf,
+            data_points_available=data_points,
+        )
+        if not result.passed:
+            warnings.append(result.message)
+
+    return warnings
