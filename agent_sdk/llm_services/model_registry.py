@@ -53,10 +53,10 @@ def get_llm(model_id: str, temperature: float = 0.7):
         )
         config = MODEL_CATALOG[_DEFAULT_MODEL_ID]
 
-    from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
-    return AzureAIOpenAIApiChatModel(
-        endpoint=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
-        credential=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+        api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
         model=config["model"],
         temperature=temperature,
     )
