@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from langgraph.graph import StateGraph, START, END
 
-from agent_sdk.agents.state import AgentState
+from agent_sdk.agents.state import AgentState, FinancialAnalysisState
 from agent_sdk.agents.nodes import (
     initialize,
     llm_call,
@@ -58,3 +58,120 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_edge("summarize_conversation", "llm_call")
 
     return graph.compile(checkpointer=checkpointer)
+
+
+def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
+    """
+    Build the financial reasoning cognitive pipeline.
+
+    This is a hierarchical reasoning graph that replaces the flat
+    llm_call → tools → llm_call loop with structured analytical phases:
+
+        query_classifier → regime_assessment → causal_analysis →
+        sector_analysis → company_analysis → risk_assessment → synthesis
+
+    Each phase:
+    - Has a specific analytical lens (system prompt)
+    - Has access to only the tools relevant to that phase
+    - Writes structured findings to typed state fields
+    - Can read structured findings from prior phases
+
+    The query classifier at the front determines which phases to activate,
+    so simple queries skip unnecessary phases.
+
+    Graph flow
+    ----------
+    START → initialize → classify_query → phase_router
+        → regime_assessment_phase → phase_advance → phase_router
+        → causal_analysis_phase   → phase_advance → phase_router
+        → sector_analysis_phase   → phase_advance → phase_router
+        → company_analysis_phase  → phase_advance → phase_router
+        → risk_assessment_phase   → phase_advance → phase_router
+        → synthesis_phase         → END
+
+    Each *_phase node is itself a sub-loop:
+        phase_llm_call → phase_should_continue → phase_tool_node → phase_llm_call
+                                               → phase_complete (write structured output)
+    """
+    from agent_sdk.agents.nodes import (
+        financial_initialize,
+        classify_query_node,
+        phase_router,
+        regime_assessment_node,
+        causal_analysis_node,
+        sector_analysis_node,
+        company_analysis_node,
+        risk_assessment_node,
+        synthesis_node,
+        phase_advance,
+        financial_tool_node,
+        financial_should_continue,
+        summarize_conversation,
+    )
+
+    graph = StateGraph(FinancialAnalysisState)
+
+    # --- Core nodes ---
+    graph.add_node("initialize", financial_initialize)
+    graph.add_node("classify_query", partial(classify_query_node, agent))
+    graph.add_node("phase_router", phase_router)
+
+    # --- Phase nodes (each runs the LLM with phase-specific prompt + tools) ---
+    graph.add_node("regime_assessment", partial(regime_assessment_node, agent))
+    graph.add_node("causal_analysis", partial(causal_analysis_node, agent))
+    graph.add_node("sector_analysis", partial(sector_analysis_node, agent))
+    graph.add_node("company_analysis", partial(company_analysis_node, agent))
+    graph.add_node("risk_assessment", partial(risk_assessment_node, agent))
+    graph.add_node("synthesis", partial(synthesis_node, agent))
+
+    # --- Shared utility nodes ---
+    graph.add_node("phase_advance", phase_advance)
+    graph.add_node("financial_tool_node", partial(financial_tool_node, agent))
+    graph.add_node("summarize_conversation", partial(summarize_conversation, agent))
+
+    # --- Edges ---
+    graph.add_edge(START, "initialize")
+    graph.add_edge("initialize", "classify_query")
+    graph.add_edge("classify_query", "phase_router")
+
+    # Phase router dispatches to the next phase or END
+    graph.add_conditional_edges("phase_router", _route_phase)
+
+    # Each phase node → check if tools needed or phase complete
+    for phase_name in ["regime_assessment", "causal_analysis", "sector_analysis",
+                       "company_analysis", "risk_assessment", "synthesis"]:
+        graph.add_conditional_edges(phase_name, partial(financial_should_continue, phase_name))
+
+    # Tool node → back to current phase
+    graph.add_conditional_edges("financial_tool_node", _route_back_to_phase)
+
+    # Phase advance → back to router for next phase
+    graph.add_edge("phase_advance", "phase_router")
+
+    # Summarize → back to current phase
+    graph.add_conditional_edges("summarize_conversation", _route_back_to_phase)
+
+    return graph.compile(checkpointer=checkpointer)
+
+
+def _route_phase(state: FinancialAnalysisState) -> str:
+    """Route to the next phase in the pipeline, or END if all phases done."""
+    if not state.phases_to_run:
+        return END
+
+    next_phase = state.phases_to_run[0]
+    # Map phase names to node names
+    phase_to_node = {
+        "regime_assessment": "regime_assessment",
+        "causal_analysis": "causal_analysis",
+        "sector_analysis": "sector_analysis",
+        "company_analysis": "company_analysis",
+        "risk_assessment": "risk_assessment",
+        "synthesis": "synthesis",
+    }
+    return phase_to_node.get(next_phase, END)
+
+
+def _route_back_to_phase(state: FinancialAnalysisState) -> str:
+    """Route back to the current active phase after tool execution."""
+    return state.current_phase

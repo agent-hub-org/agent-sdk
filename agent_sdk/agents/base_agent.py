@@ -24,11 +24,23 @@ class BaseAgent:
     - Relies on `thread_id` to provide short-term conversational memory
       across multiple `run` calls for the same session.
     - Optionally connects to MCP servers to discover remote tools.
+    - `mode` parameter selects the graph topology:
+        - "standard" (default): flat autonomous loop — works for any agent.
+        - "financial_analyst": multi-step cognitive pipeline for structured
+          financial reasoning (regime → causal → sector → company → risk → synthesis).
     """
 
+    VALID_MODES = ("standard", "financial_analyst")
+
     def __init__(self, tools=None, system_prompt=None, provider: str = "groq",
-                 mcp_servers: dict | None = None, checkpointer=None):
+                 mcp_servers: dict | None = None, checkpointer=None,
+                 mode: str = "standard"):
+
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
+
         tools = tools or []
+        self.mode = mode
 
         if provider == "nvidia":
             self.llm = initialize_agent_nvidia()
@@ -59,14 +71,21 @@ class BaseAgent:
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered
             self.graph = None
-            logger.info("BaseAgent created with %d local tool(s) + %d MCP server(s) — graph deferred",
-                        len(self.tools), len(mcp_servers))
+            logger.info("BaseAgent created with %d local tool(s) + %d MCP server(s) — graph deferred (mode=%s)",
+                        len(self.tools), len(mcp_servers), mode)
         else:
             # No MCP — build graph immediately (backward compatible)
-            self.graph = create_graph(agent=self, checkpointer=self.memory)
+            self.graph = self._build_graph()
             self._initialized = True
-            logger.info("BaseAgent initialized with %d tool(s): %s",
-                        len(self.tools), list(self.tools_by_name.keys()))
+            logger.info("BaseAgent initialized with %d tool(s) (mode=%s): %s",
+                        len(self.tools), mode, list(self.tools_by_name.keys()))
+
+    def _build_graph(self):
+        """Build the appropriate graph based on mode."""
+        if self.mode == "financial_analyst":
+            from .graph import create_financial_reasoning_graph
+            return create_financial_reasoning_graph(agent=self, checkpointer=self.memory)
+        return create_graph(agent=self, checkpointer=self.memory)
 
     async def _ensure_initialized(self):
         """Connect to MCP servers (if configured) and build the graph on first use."""
@@ -85,9 +104,9 @@ class BaseAgent:
 
             logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
 
-        self.graph = create_graph(agent=self, checkpointer=self.memory)
+        self.graph = self._build_graph()
         self._initialized = True
-        logger.info("BaseAgent graph built with %d tool(s)", len(self.tools))
+        logger.info("BaseAgent graph built with %d tool(s) (mode=%s)", len(self.tools), self.mode)
 
     async def _disconnect_mcp(self):
         """Cleanly shut down MCP connections."""
