@@ -152,7 +152,16 @@ async def llm_call(agent, state: AgentState) -> dict:
                         "iteration": state.iteration + 1,
                     }
 
-            logger.error("Could not recover tool calls from failed generation")
+            # No tool calls found — the model produced a plain-text response but
+            # triggered a 400 (common with some Groq models when tools are bound).
+            # Treat the failed_generation as the model's intended text response.
+            logger.warning("No tool calls in failed generation — recovering as plain text response (%d chars)",
+                           len(failed_gen))
+            response = AIMessage(content=failed_gen)
+            return {
+                "messages": [response],
+                "iteration": state.iteration + 1,
+            }
 
         raise
 
