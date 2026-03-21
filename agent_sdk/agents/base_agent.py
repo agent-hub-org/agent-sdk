@@ -5,12 +5,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from .graph import create_graph
 from .state import AgentState
-from ..llm_services.agent_llm import initialize_gemini as initialize_agent_gemini
-from ..llm_services.agent_llm import initialize_groq as initialize_agent_groq
-from ..llm_services.agent_llm import initialize_nvidia as initialize_agent_nvidia
-from ..llm_services.summarizer_llm import initialize_gemini as initialize_summarizer_gemini
-from ..llm_services.summarizer_llm import initialize_groq as initialize_summarizer_groq
-from ..llm_services.summarizer_llm import initialize_nvidia as initialize_summarizer_nvidia
+from ..llm_services.agent_llm import initialize_azure as initialize_agent_azure
+from ..llm_services.summarizer_llm import initialize_azure as initialize_summarizer_azure
 
 logger = logging.getLogger("agent_sdk.agent")
 
@@ -41,7 +37,7 @@ class BaseAgent:
 
     VALID_MODES = ("standard", "financial_analyst")
 
-    def __init__(self, tools=None, system_prompt=None, provider: str = "groq",
+    def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
                  mode: str = "standard"):
 
@@ -51,15 +47,8 @@ class BaseAgent:
         tools = tools or []
         self.mode = mode
 
-        if provider == "nvidia":
-            self.llm = initialize_agent_nvidia()
-            self.summarizer = initialize_summarizer_nvidia()
-        elif provider == "gemini":
-            self.llm = initialize_agent_gemini()
-            self.summarizer = initialize_summarizer_gemini()
-        else:
-            self.llm = initialize_agent_groq()
-            self.summarizer = initialize_summarizer_groq()
+        self.llm = initialize_agent_azure()
+        self.summarizer = initialize_summarizer_azure()
 
         self.tools = list(tools)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
