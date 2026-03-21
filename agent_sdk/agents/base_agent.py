@@ -217,9 +217,9 @@ class StreamResult:
             version="v2",
         ):
             if event["event"] == "on_chat_model_stream":
-                # Only stream from the main LLM, not the summarizer
+                # Only stream user-facing nodes: llm_call (standard) and synthesis (financial)
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node == "summarize_conversation":
+                if node not in ("llm_call", "synthesis"):
                     continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
