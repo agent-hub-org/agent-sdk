@@ -644,6 +644,14 @@ async def synthesis_node(agent, state) -> dict:
     }
 
 
+def phase_router(state) -> dict:
+    """
+    Pass-through routing node for the financial reasoning pipeline.
+    Actual routing logic is handled by _route_phase conditional edges.
+    """
+    return {}
+
+
 def phase_advance(state) -> dict:
     """
     Advance to the next phase in the pipeline.
