@@ -462,6 +462,7 @@ async def regime_assessment_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "regime_assessment")
+    logger.info("regime_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     prompt = _build_phase_prompt(state, REGIME_ASSESSMENT_PROMPT)
@@ -494,6 +495,7 @@ async def causal_analysis_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "causal_analysis")
+    logger.info("causal_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     # Inject prior phase context into prompt
@@ -523,6 +525,7 @@ async def sector_analysis_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "sector_analysis")
+    logger.info("sector_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     prompt_template = SECTOR_ANALYSIS_PROMPT.format(
@@ -552,6 +555,7 @@ async def company_analysis_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
+    logger.info("company_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     prompt_template = COMPANY_ANALYSIS_PROMPT.format(
@@ -582,6 +586,7 @@ async def risk_assessment_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "risk_assessment")
+    logger.info("risk_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     prompt_template = RISK_ASSESSMENT_PROMPT.format(
@@ -788,11 +793,15 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
     messages = []
     messages.append(SystemMessage(content=phase_system_prompt + date_context))
 
-    # Include the user's original query and any recent messages
+    # Only include the user's original query — prior phase context is already
+    # injected into the system prompt via {regime_context}, {causal_analysis}, etc.
+    # Forwarding accumulated AIMessages from prior phases causes "opinion
+    # contamination" (e.g., regime_assessment's "do not analyze companies"
+    # leaking into company_analysis).
     for msg in state.messages:
-        if isinstance(msg, SystemMessage):
-            continue  # Skip — we're using the phase-specific prompt
-        messages.append(msg)
+        if isinstance(msg, HumanMessage):
+            messages.append(msg)
+            break
 
     return messages
 
