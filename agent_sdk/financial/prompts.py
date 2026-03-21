@@ -66,8 +66,12 @@ Key indicators to assess:
 Produce a structured RegimeContext with your assessment. Be specific with numbers.
 State your confidence level honestly — if data is stale or contradictory, say so.
 
-IMPORTANT: Focus ONLY on regime assessment. Do not analyze specific companies or make
-stock recommendations. Your output feeds into downstream analysis phases.
+IMPORTANT: Focus on the macro-regime assessment. Company-specific analysis will happen
+in downstream phases — your job is to set the macro context they will use.
+
+TOOL USAGE: You MUST use your available tools to fetch real, current data before forming
+conclusions. Do not rely on your training data for specific numbers — always call tools first.
+If a tool call fails, note it and proceed with what you have.
 """
 
 CAUSAL_ANALYSIS_PROMPT = """\
@@ -94,6 +98,10 @@ For each causal chain you identify:
 IMPORTANT: You are building on the regime assessment from the previous phase.
 Reference the regime context when evaluating which causal paths are active.
 Do NOT make final investment recommendations — your output feeds downstream phases.
+
+TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
+Do not rely on your training data for specific numbers — always call tools first.
+If a tool call fails, note it and proceed with what you have.
 
 REGIME CONTEXT FROM PRIOR PHASE:
 {regime_context}
@@ -123,6 +131,10 @@ Use the financial ontology tools to interpret sector-level metrics correctly.
 IMPORTANT: Reference the regime context and causal analysis in your assessment.
 A sector that looks "cheap" in a tightening regime with negative causal flows is different
 from one that's cheap in an easing regime with positive flows.
+
+TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
+Do not rely on your training data for specific numbers — always call tools first.
+If a tool call fails, note it and proceed with what you have.
 
 REGIME CONTEXT:
 {regime_context}
@@ -156,6 +168,10 @@ For each company:
 IMPORTANT: Your analysis must be grounded in the regime, causal, and sector context.
 A company doesn't exist in isolation — its prospects depend on the macro and sector environment.
 
+TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
+Do not rely on your training data for specific numbers — always call tools first.
+If a tool call fails, note it and proceed with what you have.
+
 REGIME CONTEXT:
 {regime_context}
 
@@ -188,6 +204,10 @@ Use the scenario simulator tool to model macro variable changes through the caus
 
 IMPORTANT: Be adversarial. Your job is to find holes in the analysis, not confirm it.
 If the prior phases built a bullish case, stress-test it hard. And vice versa.
+
+TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
+Do not rely on your training data for specific numbers — always call tools first.
+If a tool call fails, note it and proceed with what you have.
 
 REGIME CONTEXT:
 {regime_context}
