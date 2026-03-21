@@ -14,6 +14,13 @@ from agent_sdk.agents.state import AgentState
 
 logger = logging.getLogger("agent_sdk.nodes")
 
+# Tools that belong to the research agent and must never appear in financial analyst phases
+_RESEARCH_ONLY_TOOLS = frozenset({
+    "check_papers_in_db",
+    "retrieve_papers",
+    "download_and_store_arxiv_papers",
+})
+
 
 def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
     """
@@ -774,8 +781,8 @@ def _get_phase_tools(agent, phase: str) -> list:
     financial_tools = phase_financial_tools.get(phase, [])
 
     # Also include agent's own tools (e.g., MCP data-fetching tools)
-    # so phases can retrieve live data
-    agent_tools = list(agent.tools_by_name.values())
+    # so phases can retrieve live data — exclude research-only tools
+    agent_tools = [t for t in agent.tools_by_name.values() if t.name not in _RESEARCH_ONLY_TOOLS]
 
     # Combine, deduplicating by name
     seen = set()
