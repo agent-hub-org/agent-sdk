@@ -14,6 +14,15 @@ from ..llm_services.summarizer_llm import initialize_nvidia as initialize_summar
 
 logger = logging.getLogger("agent_sdk.agent")
 
+# Nodes that produce user-facing LLM output and should be streamed to the client.
+# Covers both the standard graph ("llm_call") and the financial reasoning graph.
+_STREAMING_NODES = {
+    "llm_call",
+    "regime_assessment", "causal_analysis",
+    "sector_analysis", "company_analysis",
+    "risk_assessment", "synthesis",
+}
+
 
 class BaseAgent:
     """
@@ -131,7 +140,7 @@ class BaseAgent:
 
         result = await self.graph.ainvoke(
             invoke_input,
-            config={"configurable": {"thread_id": session_id}},
+            config={"recursion_limit": 100, "configurable": {"thread_id": session_id}},
         )
 
         # For financial_analyst mode, prefer the structured synthesis report
@@ -223,13 +232,13 @@ class StreamResult:
 
         async for event in self._agent.graph.astream_events(
             stream_input,
-            config={"configurable": {"thread_id": self._session_id}},
+            config={"recursion_limit": 100, "configurable": {"thread_id": self._session_id}},
             version="v2",
         ):
             if event["event"] == "on_chat_model_stream":
-                # Only stream user-facing nodes: llm_call (standard) and synthesis (financial)
+                # Only stream user-facing LLM nodes, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node not in ("llm_call", "synthesis"):
+                if node not in _STREAMING_NODES:
                     continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
