@@ -755,8 +755,17 @@ def _get_phase_tools(agent, phase: str) -> list:
 
 def _build_phase_prompt(state, phase_system_prompt: str) -> list:
     """Build the message list for a phase LLM call, injecting the phase system prompt."""
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    year = datetime.now(timezone.utc).year
+    date_context = (
+        f"\n\nTODAY'S DATE: {today}\n"
+        f"Always include the current year ({year}) in search queries to get up-to-date results."
+    )
+
     messages = []
-    messages.append(SystemMessage(content=phase_system_prompt))
+    messages.append(SystemMessage(content=phase_system_prompt + date_context))
 
     # Include the user's original query and any recent messages
     for msg in state.messages:
