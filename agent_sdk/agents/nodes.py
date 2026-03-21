@@ -673,9 +673,19 @@ def phase_advance(state) -> dict:
 async def financial_tool_node(agent, state) -> dict:
     """
     Execute tool calls within the financial reasoning pipeline.
-    Reuses the standard tool_node logic.
+    Temporarily registers phase-specific financial tools so tool_node can find them.
     """
-    return await tool_node(agent, state)
+    phase_tools = _get_phase_tools(agent, state.current_phase)
+    original_tools_by_name = dict(agent.tools_by_name)
+
+    for t in phase_tools:
+        if t.name not in agent.tools_by_name:
+            agent.tools_by_name[t.name] = t
+
+    try:
+        return await tool_node(agent, state)
+    finally:
+        agent.tools_by_name = original_tools_by_name
 
 
 def financial_should_continue(phase_name: str, state) -> str:
