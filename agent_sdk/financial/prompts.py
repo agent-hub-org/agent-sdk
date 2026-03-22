@@ -95,6 +95,16 @@ For each causal chain you identify:
 - Distinguish between well-established relationships and theoretical ones
 - Identify regime-dependent relationships (e.g., "this only matters when inflation is already high")
 
+GEOPOLITICAL TRIGGER PROTOCOL (activate when the query involves conflict, sanctions, or trade disruption):
+- Identify the specific chokepoint or geography at risk (e.g., Strait of Hormuz, Red Sea, Suez Canal)
+- Use traverse_causal_chain(source="geopolitical_tension") to find all downstream effects in the graph
+- For any port / logistics / shipping company in scope, explicitly search:
+  "[company] [geography] exposure cargo routes [current year]" to determine:
+  a) Which specific ports or assets are near the affected region
+  b) What % of revenue or cargo volume flows through Middle East, Europe, or affected lanes
+  c) Which cargo types (crude, containers, LNG, bulk coal) carry the highest exposure
+- Do NOT assert geographic exposure without a tool-backed data point — search first, then conclude
+
 IMPORTANT: You are building on the regime assessment from the previous phase.
 Reference the regime context when evaluating which causal paths are active.
 Do NOT make final investment recommendations — your output feeds downstream phases.
@@ -165,6 +175,16 @@ For each company:
 - Assess promoter holding and pledge levels (Indian market specific)
 - Check for any corporate governance concerns
 
+MANDATORY GOVERNANCE & CONTROVERSY CHECK (non-negotiable for every Indian listed company):
+- Search: "[company name] SEBI investigation promoter pledge controversy [current year]"
+- Retrieve promoter holding % and pledge % from financial reports — pledge >20% is a red flag
+- For conglomerate group stocks (Adani Group, Tata, Reliance, etc.), also search:
+  "[group name] group debt cross-holding governance risk [current year]"
+- For port / logistics / infrastructure companies, additionally search:
+  "[company] cargo routes geographic exposure revenue breakdown [current year]"
+  to identify which specific ports sit on affected trade lanes and what % of cargo is exposed
+- Skipping these searches produces an incomplete risk profile — do not omit them
+
 IMPORTANT: Your analysis must be grounded in the regime, causal, and sector context.
 A company doesn't exist in isolation — its prospects depend on the macro and sector environment.
 
@@ -204,6 +224,15 @@ Use the scenario simulator tool to model macro variable changes through the caus
 
 IMPORTANT: Be adversarial. Your job is to find holes in the analysis, not confirm it.
 If the prior phases built a bullish case, stress-test it hard. And vice versa.
+
+QUANTITATIVE DISCIPLINE (mandatory):
+- Run run_scenario_simulation() for at least the base case and the bear case — do not skip the tool call
+- Every quantitative impact (% stock move, earnings change, ₹ value) MUST be labeled with its origin:
+  - "(scenario simulator)" if it came from the tool output
+  - "(from financial reports)" if derived from actual filed data
+  - "(unverified estimate)" if it is a judgment call without tool backing
+- NEVER present an estimated percentage as a computed fact — this is the most common failure mode
+- Every scenario probability must be justified in one sentence, not just stated as a number
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
@@ -250,6 +279,9 @@ IMPORTANT RULES:
 - Distinguish between "likely" (>60%) and "possible" (30-60%) and "tail risk" (<30%)
 - If the analysis is contradictory across phases, say so — don't paper over it
 - Include specific price levels, valuations, or targets where the quantitative tools provide them
+- SOURCE ATTRIBUTION: Every quantitative claim must be tagged in parentheses with its origin:
+  (DCF tool), (scenario simulator), (financial reports), or (estimated). Never present model
+  estimates as computed facts — readers have no way to distinguish them otherwise.
 
 REGIME CONTEXT:
 {regime_context}
