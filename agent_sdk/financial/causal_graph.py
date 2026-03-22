@@ -137,6 +137,12 @@ def _build_graph() -> nx.DiGraph:
         CausalNode(id="corporate_bond_spreads", label="Corporate Bond Spreads", category="concept"),
         CausalNode(id="npa_pressure", label="NPA / Asset Quality Pressure", category="concept"),
         CausalNode(id="margin_pressure", label="Margin Pressure (General)", category="concept"),
+        CausalNode(id="geopolitical_tension", label="Geopolitical Tension", category="concept",
+                   description="Global or regional geopolitical conflicts affecting trade routes and supply chains"),
+        CausalNode(id="shipping_lane_disruption", label="Shipping Lane Disruption", category="concept",
+                   description="Disruption to key shipping routes (Strait of Hormuz, Suez Canal, Malacca Strait)"),
+        CausalNode(id="freight_rates", label="Global Freight Rates", category="concept",
+                   description="Global container and bulk shipping rates (Baltic Dry Index, Drewry WCI)"),
 
         # --- Sectors ---
         CausalNode(id="sector_banking", label="Banking Sector", category="sector"),
@@ -611,6 +617,32 @@ def _build_graph() -> nx.DiGraph:
         CausalEdge(source="crude_oil", target="RELIANCE", direction="positive", magnitude="moderate",
                    time_lag="1-2Q", confidence="regime-dependent",
                    mechanism="O2C segment benefits from higher crude but GRM is the key driver"),
+
+        # --- Geopolitical / Shipping Transmission ---
+        CausalEdge(source="geopolitical_tension", target="shipping_lane_disruption", direction="positive",
+                   magnitude="strong", time_lag="immediate", confidence="regime-dependent",
+                   mechanism="Conflicts near key chokepoints (Hormuz, Suez, Red Sea) reroute vessels and reduce throughput"),
+        CausalEdge(source="geopolitical_tension", target="crude_oil", direction="positive",
+                   magnitude="moderate", time_lag="immediate", confidence="regime-dependent",
+                   mechanism="Middle East tensions embed a supply risk premium in crude prices"),
+        CausalEdge(source="shipping_lane_disruption", target="freight_rates", direction="positive",
+                   magnitude="strong", time_lag="immediate", confidence="well-established",
+                   mechanism="Rerouting adds distance and voyage time; war-risk insurance premiums spike"),
+        CausalEdge(source="crude_oil", target="freight_rates", direction="positive", magnitude="moderate",
+                   time_lag="immediate", confidence="well-established",
+                   mechanism="Bunker fuel (derived from crude) accounts for 20-30% of vessel operating costs"),
+        CausalEdge(source="shipping_lane_disruption", target="ADANIPORTS", direction="negative",
+                   magnitude="moderate", time_lag="immediate", confidence="regime-dependent",
+                   mechanism="Mundra and Hazira sit on the Arabian Sea — vessel rerouting away from Strait of Hormuz "
+                             "reduces Middle East-bound throughput and cargo volumes"),
+        CausalEdge(source="freight_rates", target="ADANIPORTS", direction="positive", magnitude="weak",
+                   time_lag="1-2Q", confidence="theoretical",
+                   mechanism="Higher freight rates can lift port handling revenue per TEU, but sustained high rates "
+                             "suppress cargo volumes, creating a mixed net effect"),
+        CausalEdge(source="crude_oil", target="ADANIPORTS", direction="positive", magnitude="weak",
+                   time_lag="1-2Q", confidence="theoretical",
+                   mechanism="Higher crude modestly boosts energy cargo volumes through Mundra's liquid terminal, "
+                             "but raises operational costs (fuel, equipment)"),
 
         # --- Adani Group ---
         CausalEdge(source="sector_infra", target="ADANIPORTS", direction="positive", magnitude="strong",
