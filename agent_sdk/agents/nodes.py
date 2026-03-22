@@ -326,6 +326,30 @@ def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "ll
     return "llm_call"
 
 
+def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
+    """
+    At the start of each conversation turn, check whether the context is already
+    large enough to warrant summarization before calling the LLM.
+
+    Uses a looser threshold (80% of max_context_tokens) to act preventively.
+    This catches long conversational sessions that never trigger tool calls
+    and therefore never hit post_tool_router.
+    """
+    needs_summarization = (
+        state.enable_summarization
+        and (
+            len(state.messages) > state.keep_last_n_messages
+            or _estimate_token_count(state.messages) > state.max_context_tokens * 0.8
+        )
+    )
+    if needs_summarization:
+        logger.debug("Pre-LLM routing → summarize_conversation (messages=%d, est_tokens=%d)",
+                     len(state.messages), _estimate_token_count(state.messages))
+        return "summarize_conversation"
+    logger.debug("Pre-LLM routing → llm_call")
+    return "llm_call"
+
+
 def _estimate_token_count(messages: Sequence) -> int:
     """Rough token estimate: ~4 chars per token for English text."""
     return sum(len(getattr(m, "content", "") or "") for m in messages) // 4
