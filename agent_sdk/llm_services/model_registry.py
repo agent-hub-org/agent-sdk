@@ -18,6 +18,29 @@ MODEL_CATALOG = {
         "label": "Llama 4 Maverick",
     },
 
+    # Azure AI Foundry — GPT-4o mini (tool calling + prompt caching)
+    "azure/gpt-4o-mini": {
+        "provider": "Azure AI Foundry",
+        "model": "gpt-4o-mini",
+        "label": "GPT-4o mini",
+    },
+
+    # Azure AI Foundry — GPT-4.1 mini (latest GPT-4.1 series, strong reasoning + tool calling)
+    "azure/gpt-4.1-mini": {
+        "provider": "Azure AI Foundry",
+        "model": "gpt-4.1-mini",
+        "label": "GPT-4.1 mini",
+    },
+
+    # Azure AI Foundry — GPT-OSS-120B (Apache 2.0, o4-mini-level claims)
+    # NOTE: Tool calling may 400 due to Harmony format incompatibility with LangChain
+    # (GitHub issues #32425, #32885, #34751). Works for non-tool conversational turns.
+    "azure/gpt-oss-120b": {
+        "provider": "Azure AI Foundry",
+        "model": "gpt-oss-120b",
+        "label": "GPT-OSS 120B",
+    },
+
     # Fine-tuned model slots for financial reasoning pipeline phases.
     # These slots are ready for fine-tuned model weights once training is complete.
     # The cognitive pipeline can use model_id override per-phase via state.model_id.
@@ -36,7 +59,7 @@ MODEL_CATALOG = {
     },
 }
 
-_DEFAULT_MODEL_ID = "azure/llama-4-maverick"
+_DEFAULT_MODEL_ID = "azure/gpt-4o-mini"
 
 
 def get_llm(model_id: str, temperature: float = 0.7):
@@ -44,6 +67,7 @@ def get_llm(model_id: str, temperature: float = 0.7):
 
     Falls back to the default model with a warning if model_id is unknown,
     so stale client-side model IDs never crash the stream.
+    All models share the same Azure AI Foundry endpoint.
     """
     config = MODEL_CATALOG.get(model_id)
     if not config:
