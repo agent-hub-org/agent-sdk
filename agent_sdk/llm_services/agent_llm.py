@@ -10,4 +10,6 @@ def initialize_azure(temperature: float = 0.7) -> ChatOpenAI:
         api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
         model="Llama-4-Maverick-17B-128E-Instruct-FP8",
         temperature=temperature,
+        timeout=120,
+        max_retries=3,
     )

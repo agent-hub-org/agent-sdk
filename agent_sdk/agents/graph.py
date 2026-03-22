@@ -16,6 +16,7 @@ from agent_sdk.agents.nodes import (
     summarize_conversation,
     should_continue,
     post_tool_router,
+    pre_llm_router,
 )
 
 
@@ -55,7 +56,7 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_node("summarize_conversation", partial(summarize_conversation, agent))
 
     graph.add_edge(START, "initialize")
-    graph.add_edge("initialize", "llm_call")
+    graph.add_conditional_edges("initialize", pre_llm_router)
     graph.add_conditional_edges("llm_call", should_continue)
     graph.add_conditional_edges("tool_node", post_tool_router)
     graph.add_edge("summarize_conversation", "llm_call")

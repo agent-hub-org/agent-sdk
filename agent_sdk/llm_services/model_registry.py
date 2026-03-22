@@ -59,6 +59,8 @@ def get_llm(model_id: str, temperature: float = 0.7):
         api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
         model=config["model"],
         temperature=temperature,
+        timeout=120,
+        max_retries=3,
     )
 
 
