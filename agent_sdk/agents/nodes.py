@@ -438,26 +438,27 @@ async def classify_query_node(agent, state) -> dict:
         if classification:
             qc = QueryClassification(**_normalize_classification(classification))
         else:
-            # Default to macro_impact (full pipeline) if parsing fails
-            logger.warning("Could not parse query classification, defaulting to macro_impact")
+            # Default to data_retrieval (minimal pipeline) if parsing fails
+            logger.warning("Could not parse query classification, defaulting to data_retrieval")
             qc = QueryClassification(
-                query_type=QueryType.MACRO_IMPACT,
-                requires_regime_assessment=True,
-                requires_causal_analysis=True,
-                requires_sector_analysis=True,
+                query_type=QueryType.DATA_RETRIEVAL,
+                requires_regime_assessment=False,
+                requires_causal_analysis=False,
+                requires_sector_analysis=False,
                 requires_company_analysis=True,
-                requires_risk_assessment=True,
-                reasoning="Classification parsing failed — activating full pipeline",
+                requires_risk_assessment=False,
+                reasoning="Classification parsing failed — running minimal pipeline",
             )
     except Exception:
-        logger.exception("Query classification failed, using full pipeline")
+        logger.exception("Query classification failed, defaulting to data_retrieval")
         qc = QueryClassification(
-            query_type=QueryType.MACRO_IMPACT,
-            requires_regime_assessment=True,
-            requires_causal_analysis=True,
-            requires_sector_analysis=True,
+            query_type=QueryType.DATA_RETRIEVAL,
+            requires_regime_assessment=False,
+            requires_causal_analysis=False,
+            requires_sector_analysis=False,
             requires_company_analysis=True,
-            requires_risk_assessment=True,
+            requires_risk_assessment=False,
+            reasoning="Classification exception — running minimal pipeline",
         )
 
     # Determine phases to run based on classification
@@ -830,18 +831,22 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
         f"Always include the current year ({year}) in search queries to get up-to-date results."
     )
 
-    messages = []
-    messages.append(SystemMessage(content=phase_system_prompt + date_context))
+    messages = [SystemMessage(content=phase_system_prompt + date_context)]
 
-    # Only include the user's original query — prior phase context is already
-    # injected into the system prompt via {regime_context}, {causal_analysis}, etc.
-    # Forwarding accumulated AIMessages from prior phases causes "opinion
-    # contamination" (e.g., regime_assessment's "do not analyze companies"
-    # leaking into company_analysis).
+    # Include the user's original query, then any tool call / tool result messages
+    # that accumulated within the current phase.  Regular AIMessages (prior-phase
+    # narrative outputs) are still excluded to prevent "opinion contamination"
+    # (e.g., regime_assessment's instructions leaking into company_analysis).
+    found_human = False
     for msg in state.messages:
-        if isinstance(msg, HumanMessage):
+        if isinstance(msg, HumanMessage) and not found_human:
             messages.append(msg)
-            break
+            found_human = True
+        elif found_human:
+            if isinstance(msg, ToolMessage):
+                messages.append(msg)
+            elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                messages.append(msg)
 
     return messages
 

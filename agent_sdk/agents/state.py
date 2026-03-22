@@ -29,7 +29,7 @@ class AgentState(BaseModel):
 
     # autonomous agent configuration
     max_iterations: int = Field(
-        default=20,
+        default=10,
         description="Maximum number of reasoning/tool-use iterations before forcing a stop.",
     )
     iteration: int = Field(
