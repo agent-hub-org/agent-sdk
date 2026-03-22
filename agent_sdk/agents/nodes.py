@@ -731,6 +731,8 @@ async def financial_tool_node(agent, state) -> dict:
     """
     Execute tool calls within the financial reasoning pipeline.
     Temporarily registers phase-specific financial tools so tool_node can find them.
+    Always emits a ToolMessage for every pending tool_call_id — even on failure —
+    so state.messages never contains an orphaned AIMessage(tool_calls).
     """
     phase_tools = _get_phase_tools(agent, state.current_phase)
     original_tools_by_name = dict(agent.tools_by_name)
@@ -741,6 +743,25 @@ async def financial_tool_node(agent, state) -> dict:
 
     try:
         return await tool_node(agent, state)
+    except Exception as e:
+        # tool_node raised — build error ToolMessages for every pending tool_call_id
+        # so the message history stays valid for the next LLM call.
+        last_message = state.messages[-1]
+        tool_calls = getattr(last_message, "tool_calls", None) or []
+        error_messages = [
+            ToolMessage(
+                content=f"Tool execution failed: {e}",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+        if error_messages:
+            logger.warning(
+                "financial_tool_node: tool_node raised %s — emitting %d error ToolMessage(s) to keep history valid",
+                e, len(error_messages),
+            )
+            return {"messages": error_messages}
+        raise  # no tool_calls to recover from — propagate
     finally:
         agent.tools_by_name = original_tools_by_name
 
@@ -751,12 +772,21 @@ def financial_should_continue(phase_name: str, state) -> str:
     If the LLM requested tools, route to financial_tool_node.
     Otherwise, phase is complete — route to phase_advance.
     """
-    if state.iteration >= state.max_iterations:
-        logger.warning("Iteration limit reached in phase %s", phase_name)
-        return "phase_advance"
-
     last_message = state.messages[-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
+
+    if state.iteration >= state.max_iterations:
+        logger.warning("Iteration limit reached in phase %s", phase_name)
+        if has_tool_calls:
+            # Route through financial_tool_node so it can emit error ToolMessages
+            # for the pending tool_call_ids before we advance — prevents orphaned
+            # AIMessage(tool_calls) from polluting subsequent phase prompts.
+            logger.warning(
+                "Phase %s hit iteration limit with pending tool_calls — routing to tool_node to clear them",
+                phase_name,
+            )
+            return "financial_tool_node"
+        return "phase_advance"
 
     if has_tool_calls:
         return "financial_tool_node"
@@ -837,6 +867,15 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
     # that accumulated within the current phase.  Regular AIMessages (prior-phase
     # narrative outputs) are still excluded to prevent "opinion contamination"
     # (e.g., regime_assessment's instructions leaking into company_analysis).
+    #
+    # Safety: strip any AIMessage(tool_calls) that has no matching ToolMessage —
+    # orphaned tool_calls cause OpenAI to return a 400 error.
+    responded_ids = {
+        msg.tool_call_id
+        for msg in state.messages
+        if isinstance(msg, ToolMessage) and msg.tool_call_id
+    }
+
     found_human = False
     for msg in state.messages:
         if isinstance(msg, HumanMessage) and not found_human:
@@ -846,7 +885,15 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
             if isinstance(msg, ToolMessage):
                 messages.append(msg)
             elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
-                messages.append(msg)
+                pending = [tc["id"] for tc in msg.tool_calls if tc["id"] not in responded_ids]
+                if pending:
+                    logger.warning(
+                        "_build_phase_prompt: dropping AIMessage with %d unmatched tool_call_id(s) %s "
+                        "to prevent OpenAI 400",
+                        len(pending), pending,
+                    )
+                else:
+                    messages.append(msg)
 
     return messages
 
