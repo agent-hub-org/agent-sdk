@@ -83,8 +83,8 @@ def get_llm(model_id: str, temperature: float = 0.7):
         api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
         model=config["model"],
         temperature=temperature,
-        timeout=120,
-        max_retries=3,
+        timeout=float(os.getenv("AGENT_LLM_TIMEOUT", "120.0")),
+        max_retries=int(os.getenv("AGENT_LLM_MAX_RETRIES", "3")),
     )
 
 
