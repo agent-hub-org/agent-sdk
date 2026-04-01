@@ -274,6 +274,17 @@ async def tool_node(agent, state: AgentState) -> dict:
         logger.info("Executing tool '%s' with args: %s", name, args)
 
         tool = agent.tools_by_name[name]
+        breaker = agent._get_breaker(name)
+
+        if breaker.is_open:
+            logger.warning("Circuit breaker OPEN for '%s' — returning error message", name)
+            return ToolMessage(
+                content=(
+                    f"Tool '{name}' is temporarily unavailable (circuit breaker open). "
+                    "Please try again later or rephrase your query."
+                ),
+                tool_call_id=tool_call["id"],
+            )
 
         try:
             if hasattr(tool, "ainvoke"):
@@ -284,8 +295,10 @@ async def tool_node(agent, state: AgentState) -> dict:
                 observation = await asyncio.to_thread(
                     tool.invoke if hasattr(tool, "invoke") else tool.run, args
                 )
+            breaker.record_success()
             logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
         except Exception:
+            breaker.record_failure(name)
             logger.exception("Tool '%s' failed", name)
             raise
 
