@@ -7,6 +7,7 @@ from .graph import create_graph
 from .state import AgentState
 from ..llm_services.agent_llm import initialize_azure as initialize_agent_azure
 from ..llm_services.summarizer_llm import initialize_azure as initialize_summarizer_azure
+from ..mcp.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger("agent_sdk.agent")
 
@@ -65,6 +66,7 @@ class BaseAgent:
         self._mcp_servers = mcp_servers
         self._mcp_manager = None
         self._initialized = False
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
 
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered
@@ -77,6 +79,12 @@ class BaseAgent:
             self._initialized = True
             logger.info("BaseAgent initialized with %d tool(s) (mode=%s): %s",
                         len(self.tools), mode, list(self.tools_by_name.keys()))
+
+    def _get_breaker(self, name: str) -> CircuitBreaker:
+        """Return the per-tool circuit breaker, creating one on first access."""
+        if name not in self._circuit_breakers:
+            self._circuit_breakers[name] = CircuitBreaker()
+        return self._circuit_breakers[name]
 
     def _build_graph(self):
         """Build the appropriate graph based on mode."""
