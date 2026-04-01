@@ -53,6 +53,14 @@ def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
     return tool_calls if tool_calls else None
 
 
+def _strip_context_block(text: str) -> str:
+    """Strip the [CONTEXT]...[/CONTEXT] wrapper prepended by _build_dynamic_context."""
+    marker = "[/CONTEXT]"
+    if marker in text:
+        return text[text.find(marker) + len(marker):].strip()
+    return text.strip()
+
+
 async def initialize(state: AgentState) -> dict:
     """
     Runs once at START before the agent loop.
@@ -423,9 +431,33 @@ async def classify_query_node(agent, state) -> dict:
             user_query = msg.content
             break
 
+    # Strip [CONTEXT] wrapper so the classifier sees the raw user text
+    clean_query = _strip_context_block(user_query)
+
+    # Include recent conversational context (last 4 turns before current query)
+    # so the classifier can resolve follow-ups like "Yes" or "Go ahead".
+    recent_context: list[str] = []
+    for msg in state.messages[:-1]:  # All messages except the current HumanMessage
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None) and msg.content:
+            recent_context.append(f"Assistant: {msg.content}")
+        elif isinstance(msg, HumanMessage):
+            content = _strip_context_block(msg.content)
+            if content:
+                recent_context.append(f"User: {content}")
+    recent_context = recent_context[-4:]  # Keep last 4 conversational turns
+
+    if recent_context:
+        context_str = "\n".join(recent_context)
+        classify_content = (
+            f"Recent conversation:\n{context_str}\n\n"
+            f"Classify this query (in context of the conversation above):\n\n{clean_query}"
+        )
+    else:
+        classify_content = f"Classify this query:\n\n{clean_query}"
+
     classification_prompt = [
         SystemMessage(content=QUERY_CLASSIFIER_PROMPT),
-        HumanMessage(content=f"Classify this query:\n\n{user_query}"),
+        HumanMessage(content=classify_content),
     ]
 
     try:
@@ -863,10 +895,13 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
 
     messages = [SystemMessage(content=phase_system_prompt + date_context)]
 
-    # Include the user's original query, then any tool call / tool result messages
-    # that accumulated within the current phase.  Regular AIMessages (prior-phase
-    # narrative outputs) are still excluded to prevent "opinion contamination"
-    # (e.g., regime_assessment's instructions leaking into company_analysis).
+    # Include all HumanMessages and tool call/result pairs.
+    #
+    # For AIMessages: prior-turn conversational responses (those appearing BEFORE the last
+    # HumanMessage) are included so the LLM can resolve follow-ups like "Yes" back to the
+    # question it just asked. Same-turn phase pipeline outputs (those appearing AFTER the
+    # last HumanMessage) are still excluded to prevent "opinion contamination"
+    # (e.g., regime_assessment's narrative leaking into company_analysis).
     #
     # Safety: strip any AIMessage(tool_calls) that has no matching ToolMessage —
     # orphaned tool_calls cause OpenAI to return a 400 error.
@@ -876,15 +911,19 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
         if isinstance(msg, ToolMessage) and msg.tool_call_id
     }
 
-    found_human = False
-    for msg in state.messages:
-        if isinstance(msg, HumanMessage) and not found_human:
+    # Index of the last HumanMessage — discriminates prior-turn vs same-turn AIMessages.
+    last_human_idx = max(
+        (i for i, m in enumerate(state.messages) if isinstance(m, HumanMessage)),
+        default=-1,
+    )
+
+    for i, msg in enumerate(state.messages):
+        if isinstance(msg, HumanMessage):
+            messages.append(msg)  # Include ALL HumanMessages (not just the first)
+        elif isinstance(msg, ToolMessage):
             messages.append(msg)
-            found_human = True
-        elif found_human:
-            if isinstance(msg, ToolMessage):
-                messages.append(msg)
-            elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+        elif isinstance(msg, AIMessage):
+            if getattr(msg, "tool_calls", None):
                 pending = [tc["id"] for tc in msg.tool_calls if tc["id"] not in responded_ids]
                 if pending:
                     logger.warning(
@@ -894,6 +933,10 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
                     )
                 else:
                     messages.append(msg)
+            elif msg.content and i < last_human_idx:
+                # Conversational AIMessage from a prior turn — include for follow-up context.
+                messages.append(msg)
+            # AIMessages after the last HumanMessage are same-turn phase outputs — skip.
 
     return messages
 
