@@ -871,10 +871,12 @@ def _get_phase_tools(agent, phase: str) -> list:
         "sector_analysis": get_ontology_tools(),
         "company_analysis": (
             get_ontology_tools()
-            + [t for t in get_quant_tools() if t.name in ("run_dcf", "run_comparable_valuation", "calculate_technical_signals")]
+            + [t for t in get_quant_tools() if t.name in (
+                "run_dcf", "run_comparable_valuation", "calculate_technical_signals", "calculate_risk_metrics"
+            )]
         ),
         "risk_assessment": [
-            t for t in get_quant_tools() if t.name == "run_scenario_simulation"
+            t for t in get_quant_tools() if t.name in ("run_scenario_simulation", "calculate_risk_metrics")
         ] + get_causal_graph_tools(),
     }
 
