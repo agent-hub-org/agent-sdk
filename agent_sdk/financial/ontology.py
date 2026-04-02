@@ -172,6 +172,63 @@ METRIC_DEFINITIONS: dict[str, MetricDefinition] = {
         limitations=["Restructured loans may not be classified as NPA"],
         indian_market_notes="Private banks: < 2% is excellent, 2-4% is acceptable. PSU banks: historically 5-15%, improving trend.",
     ),
+    "SHARPE_RATIO": MetricDefinition(
+        name="SHARPE_RATIO", full_name="Sharpe Ratio",
+        formula="(Annualized Return - Risk-Free Rate) / Annualized Volatility",
+        what_it_measures="Risk-adjusted return — excess return per unit of total volatility",
+        higher_is="better",
+        limitations=[
+            "Uses total volatility (not just downside) — penalizes upside variance equally",
+            "Assumes normally distributed returns; Indian mid/small-caps have fat tails",
+            "Sensitive to the choice of risk-free rate (use RBI repo rate for Indian assets)",
+        ],
+        indian_market_notes="Use 6.5% as proxy for Indian risk-free rate (RBI repo). > 1.0 is good, > 1.5 is excellent for equity portfolios.",
+    ),
+    "SORTINO_RATIO": MetricDefinition(
+        name="SORTINO_RATIO", full_name="Sortino Ratio",
+        formula="(Annualized Return - Risk-Free Rate) / Downside Deviation",
+        what_it_measures="Risk-adjusted return using only downside volatility — penalizes only negative returns",
+        higher_is="better",
+        limitations=[
+            "Less intuitive than Sharpe; requires defining a minimum acceptable return (MAR)",
+            "Lower sample size for downside events makes estimates noisy for short periods",
+        ],
+        indian_market_notes="Preferred over Sharpe for asymmetric return profiles (momentum, small-cap). > 1.5 is considered good.",
+    ),
+    "MAX_DRAWDOWN": MetricDefinition(
+        name="MAX_DRAWDOWN", full_name="Maximum Drawdown",
+        formula="(Trough Value - Peak Value) / Peak Value × 100%",
+        what_it_measures="Largest peak-to-trough decline — worst-case loss from a historical high",
+        higher_is="worse",
+        limitations=[
+            "Historical measure; does not predict future drawdowns",
+            "Period-dependent: 1Y drawdown looks very different from 5Y",
+        ],
+        indian_market_notes="Nifty 50 typical bear-market drawdown: 25-40%. Mid-cap: 40-60%. Use as tail-risk anchor in scenario analysis.",
+    ),
+    "BETA": MetricDefinition(
+        name="BETA", full_name="Beta (Market Sensitivity)",
+        formula="Covariance(Stock Returns, Nifty Returns) / Variance(Nifty Returns)",
+        what_it_measures="Sensitivity of a stock's returns to market movements (Nifty 50 as benchmark)",
+        higher_is="neutral",
+        limitations=[
+            "Backward-looking; beta changes over business cycles",
+            "Low beta ≠ low risk for illiquid stocks",
+            "Beta > 1 = more volatile than market; < 1 = less volatile",
+        ],
+        indian_market_notes="Defensives (pharma, FMCG): beta 0.4-0.8. Cyclicals (metals, PSU banks): beta 1.1-1.6. Use 1Y daily returns vs Nifty 50.",
+    ),
+    "ALPHA": MetricDefinition(
+        name="ALPHA", full_name="Jensen's Alpha",
+        formula="Stock Return - [Risk-Free Rate + Beta × (Market Return - Risk-Free Rate)]",
+        what_it_measures="Excess return above what CAPM predicts — skill/idiosyncratic performance",
+        higher_is="better",
+        limitations=[
+            "Requires accurate beta; CAPM is a simplification of actual return drivers",
+            "Short measurement periods produce noisy alpha estimates",
+        ],
+        indian_market_notes="Positive alpha over 2+ years vs Nifty 50 indicates genuine outperformance beyond market exposure.",
+    ),
 }
 
 
