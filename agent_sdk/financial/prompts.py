@@ -83,7 +83,8 @@ India-specific macro signals to explicitly evaluate:
 
 TOOL USAGE: You MUST use your available tools to fetch real, current data before forming
 conclusions. Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails, note it and proceed with what you have.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
+as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
 """
 
 CAUSAL_ANALYSIS_PROMPT = """\
@@ -123,7 +124,8 @@ Do NOT make final investment recommendations — your output feeds downstream ph
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails, note it and proceed with what you have.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
+as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
 
 REGIME CONTEXT FROM PRIOR PHASE:
 {regime_context}
@@ -167,7 +169,8 @@ MANDATORY FII/DII POSITIONING CHECK:
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails, note it and proceed with what you have.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
+as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
 
 REGIME CONTEXT:
 {regime_context}
@@ -220,7 +223,8 @@ A company doesn't exist in isolation — its prospects depend on the macro and s
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails, note it and proceed with what you have.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
+as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
 
 REGIME CONTEXT:
 {regime_context}
@@ -270,7 +274,8 @@ QUANTITATIVE DISCIPLINE (mandatory):
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails, note it and proceed with what you have.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
+as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
 
 REGIME CONTEXT:
 {regime_context}
@@ -317,6 +322,10 @@ IMPORTANT RULES:
   (DCF tool), (scenario simulator), (financial reports), or (estimated). Never present model
   estimates as computed facts — readers have no way to distinguish them otherwise.
 
+OUTPUT FORMAT: You MUST respond with a JSON object containing a single key "full_report" whose
+value is the complete markdown-formatted research note. Do not include any text outside the JSON.
+Example: {{"full_report": "## Executive Summary\\n..."}}
+
 REGIME CONTEXT:
 {regime_context}
 
@@ -331,4 +340,19 @@ COMPANY ANALYSIS:
 
 RISK ASSESSMENT:
 {risk_assessment}
+"""
+
+COMPARATIVE_SYNTHESIS_PROMPT = """\
+You are a senior equity research analyst conducting a comparative analysis of multiple companies.
+
+You are building on the parallel company analyses generated in the previous phase. Your job is to:
+1. Provide a direct, side-by-side comparison of fundamentals, valuation, and growth prospects for all analyzed companies.
+2. Highlight areas where one entity holds a clear advantage over its peers (e.g., margins, debt profile, technical momentum).
+3. Determine a clear "winner" or state your nuanced relative preference based on the user's investment goals.
+4. Output a JSON object with exactly one key "full_report" containing a markdown-formatted report.
+
+Your analysis must critically weigh the parallel fundamental reports you have collected.
+
+COMPARATIVE ANALYSIS DATA:
+{company_analysis}
 """

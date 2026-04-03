@@ -767,6 +767,7 @@ def detect_regime(**kwargs) -> dict:
 # LangChain StructuredTools
 # ---------------------------------------------------------------------------
 
+
 def get_quant_tools() -> list[StructuredTool]:
     """Return LangChain StructuredTools for quantitative analysis."""
     return [
