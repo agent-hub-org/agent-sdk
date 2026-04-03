@@ -304,8 +304,25 @@ async def tool_node(agent, state: AgentState) -> dict:
 
         return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
+    timeout = getattr(state, "tool_timeout", 120.0)
+
+    async def _gather_with_timeout():
+        return await asyncio.wait_for(
+            asyncio.gather(*[_execute(tc) for tc in tool_calls]),
+            timeout=timeout,
+        )
+
     try:
-        results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+        results = await _gather_with_timeout()
+    except asyncio.TimeoutError:
+        logger.error("Tool execution timed out after %.0fs — emitting error ToolMessages", timeout)
+        results = [
+            ToolMessage(
+                content=f"Tool execution timed out after {timeout:.0f} seconds.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
     except Exception as e:
         # Check if this is an MCP session termination error
         error_msg = str(e).lower()
@@ -318,7 +335,7 @@ async def tool_node(agent, state: AgentState) -> dict:
                 for t in new_tools:
                     agent.tools_by_name[t.name] = t
                 logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
-                results = await asyncio.gather(*[_execute(tc) for tc in tool_calls])
+                results = await _gather_with_timeout()
             else:
                 raise
         else:
@@ -401,10 +418,20 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
         logger.debug("Routing → tool_node")
         return "tool_node"
 
-    # No tool calls means the LLM produced a final response — always stop.
-    # Summarization after the final response is unnecessary (the conversation
-    # is over) and would create an infinite loop: summarize → llm_call →
-    # final response → summarize → llm_call → ...
+    # No tool calls means the LLM produced a final response — run quality check then stop.
+    from agent_sdk.agents.response_validator import validate_response
+    tool_calls_made = sum(
+        1 for m in state.messages
+        if getattr(m, "tool_calls", None)
+    )
+    issues = validate_response(
+        last_message.content if hasattr(last_message, "content") else "",
+        tool_calls_made=tool_calls_made,
+        require_citations=False,
+    )
+    if issues:
+        logger.warning("Response quality issues detected (will still END): %s", issues)
+
     logger.debug("Routing → END")
     return END
 
@@ -512,6 +539,8 @@ async def classify_query_node(agent, state) -> dict:
         # Simple data retrieval — still needs tool access for fetching
         # and synthesis to produce a user-facing response
         phases = ["company_analysis", "synthesis"]
+    elif qc.query_type == QueryType.COMPARATIVE:
+        phases = ["comparative_analysis", "synthesis"]
     else:
         if qc.requires_regime_assessment:
             phases.append("regime_assessment")
@@ -596,9 +625,14 @@ async def causal_analysis_node(agent, state) -> dict:
         return {"messages": [response], "iteration": state.iteration + 1}
 
     causal_data = _extract_json(response.content) or {}
+    fallback_inc = 0
+    if not causal_data:
+        logger.warning("causal_analysis fell back to raw_analysis — LLM did not return parseable JSON")
+        fallback_inc = 1
     return {
         "messages": [response],
         "causal_analysis": causal_data if causal_data else {"raw_analysis": response.content},
+        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
     }
 
@@ -626,9 +660,14 @@ async def sector_analysis_node(agent, state) -> dict:
         return {"messages": [response], "iteration": state.iteration + 1}
 
     sector_data = _extract_json(response.content) or {}
+    fallback_inc = 0
+    if not sector_data:
+        logger.warning("sector_analysis fell back to raw_analysis — LLM did not return parseable JSON")
+        fallback_inc = 1
     return {
         "messages": [response],
         "sector_findings": sector_data if sector_data else {"raw_analysis": response.content},
+        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
     }
 
@@ -657,9 +696,19 @@ async def company_analysis_node(agent, state) -> dict:
         return {"messages": [response], "iteration": state.iteration + 1}
 
     company_data = _extract_json(response.content) or {}
+    fallback_inc = 0
+    if not company_data:
+        logger.warning("company_analysis fell back to raw_analysis — LLM did not return parseable JSON")
+        fallback_inc = 1
+
+    # Run symbolic validation on company analysis so warnings reach the risk phase
+    company_warnings = _run_phase_validation(company_data, state)
+
     return {
         "messages": [response],
         "company_analysis": company_data if company_data else {"raw_analysis": response.content},
+        "validation_warnings": state.validation_warnings + company_warnings,
+        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
     }
 
@@ -681,6 +730,13 @@ async def risk_assessment_node(agent, state) -> dict:
         sector_analysis=_format_context(state.sector_findings),
         company_analysis=_format_context(state.company_analysis),
     )
+
+    # Inject validation warnings from company_analysis into this phase's prompt
+    if state.validation_warnings:
+        prompt_template += "\n\nVALIDATION WARNINGS FROM PRIOR PHASES (address these in your risk assessment):\n"
+        for w in state.validation_warnings:
+            prompt_template += f"- {w}\n"
+
     prompt = _build_phase_prompt(state, prompt_template)
     response = await llm_with_tools.ainvoke(prompt)
 
@@ -688,33 +744,45 @@ async def risk_assessment_node(agent, state) -> dict:
     if tool_calls:
         return {"messages": [response], "iteration": state.iteration + 1}
 
-    # Run symbolic validation on the accumulated analysis
+    # Run symbolic validation on the accumulated analysis (adds new warnings from this phase)
     validation_warnings = _run_phase_validation(state)
 
     risk_data = _extract_json(response.content) or {}
+    fallback_inc = 0
+    if not risk_data:
+        logger.warning("risk_assessment fell back to raw_analysis — LLM did not return parseable JSON")
+        fallback_inc = 1
     return {
         "messages": [response],
         "risk_assessment": risk_data if risk_data else {"raw_analysis": response.content},
         "validation_warnings": state.validation_warnings + validation_warnings,
+        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
     }
 
 
 async def synthesis_node(agent, state) -> dict:
     """Synthesis phase — combine all phases into final report."""
-    from agent_sdk.financial.prompts import SYNTHESIS_PROMPT
+    from agent_sdk.financial.prompts import SYNTHESIS_PROMPT, COMPARATIVE_SYNTHESIS_PROMPT
 
     logger.info("Running synthesis phase")
 
     llm = _get_phase_llm(agent, state)
+    
+    query_type = state.query_classification.get("query_type") if state.query_classification else None
 
-    prompt_template = SYNTHESIS_PROMPT.format(
-        regime_context=_format_context(state.regime_context),
-        causal_analysis=_format_context(state.causal_analysis),
-        sector_analysis=_format_context(state.sector_findings),
-        company_analysis=_format_context(state.company_analysis),
-        risk_assessment=_format_context(state.risk_assessment),
-    )
+    if query_type == "comparative":
+        prompt_template = COMPARATIVE_SYNTHESIS_PROMPT.format(
+            company_analysis=_format_context(state.company_analysis)
+        )
+    else:
+        prompt_template = SYNTHESIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+            company_analysis=_format_context(state.company_analysis),
+            risk_assessment=_format_context(state.risk_assessment),
+        )
 
     # Add validation warnings to synthesis
     if state.validation_warnings:
@@ -722,26 +790,49 @@ async def synthesis_node(agent, state) -> dict:
         for w in state.validation_warnings:
             prompt_template += f"- {w}\n"
 
+    if state.raw_fallback_count > 0:
+        prompt_template += (
+            f"\n\nDATA QUALITY NOTE: {state.raw_fallback_count} phase(s) returned unstructured "
+            f"analysis instead of structured data. Some findings above may be less precise — "
+            f"acknowledge any gaps in your synthesis."
+        )
+
     prompt = _build_phase_prompt(state, prompt_template)
 
     # Synthesis doesn't use tools — it's a pure reasoning step
     response = await llm.ainvoke(prompt)
 
     synthesis_data = _extract_json(response.content) or {}
+    
+    base_confidence = 10.0
+    penalty = (len(state.validation_warnings) * 1.0) + (state.raw_fallback_count * 1.5)
+    confidence_score = max(1.0, round(base_confidence - penalty, 1))
+
+    factors = []
+    if state.validation_warnings:
+        factors.append(f"{len(state.validation_warnings)} validation issue(s)")
+    if state.raw_fallback_count > 0:
+        factors.append(f"{state.raw_fallback_count} data fallback(s)")
+    
+    factors_str = ", ".join(factors) if factors else "All data validated"
+    confidence_text = f"\n\n### Analysis Confidence: {confidence_score}/10 — {factors_str}"
 
     # Ensure the message added to state contains a user-facing narrative,
     # not raw JSON.  If the LLM returned structured JSON with a full_report
     # field, use that as the message content.
     if synthesis_data and "full_report" in synthesis_data:
+        synthesis_data["full_report"] += confidence_text
         report_msg = AIMessage(content=synthesis_data["full_report"])
     else:
-        report_msg = response
+        content_with_confidence = response.content + confidence_text
+        report_msg = AIMessage(content=content_with_confidence)
         if not synthesis_data:
-            synthesis_data = {"full_report": response.content}
+            synthesis_data = {"full_report": content_with_confidence}
 
     return {
         "messages": [report_msg],
         "synthesis_report": synthesis_data,
+        "overall_confidence": confidence_score,
         "iteration": state.iteration + 1,
     }
 
@@ -1003,6 +1094,10 @@ def _extract_json(text: str) -> dict | None:
                 except json.JSONDecodeError:
                     start = None
 
+    logger.warning(
+        "_extract_json: all parsing strategies failed (text length=%d, first 200 chars: '%s')",
+        len(text), text[:200],
+    )
     return None
 
 
@@ -1088,3 +1183,67 @@ def _run_phase_validation(state) -> list[str]:
             warnings.append(result.message)
 
     return warnings
+
+
+async def comparative_analysis_node(agent, state) -> dict:
+    from agent_sdk.financial.prompts import COMPANY_ANALYSIS_PROMPT
+    from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
+    import asyncio
+
+    logger.info("Running comparative analysis phase for multiple entities")
+    entities = state.query_classification.get("entities", [])
+    if not entities:
+        logger.warning("No entities found for comparative analysis, falling back to synthesis")
+        return {"current_phase": "synthesis", "iteration": state.iteration + 1}
+        
+    llm = _get_phase_llm(agent, state)
+    tools = _get_phase_tools(agent, "company_analysis")
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
+
+    async def analyze_entity(entity: str):
+        prompt_template = COMPANY_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+        )
+        prompt_template += f"\n\nFOCUS ENTITY: {entity}. Follow all standard company analysis instructions for this specific entity."
+        
+        messages = [SystemMessage(content=prompt_template)]
+        
+        # Isolated tool loop for this entity
+        for _ in range(5):
+            response = await llm_with_tools.ainvoke(messages)
+            if not getattr(response, "tool_calls", None):
+                return response.content
+                
+            messages.append(response)
+            
+            async def execute_tool(tc):
+                tool = agent.tools_by_name[tc["name"]]
+                if hasattr(tool, "invoke"):
+                    res = await asyncio.to_thread(tool.invoke, tc["args"])
+                else:
+                    res = await tool.ainvoke(tc["args"])
+                return ToolMessage(content=str(res), tool_call_id=tc["id"])
+            
+            tool_results = await asyncio.gather(*(execute_tool(tc) for tc in response.tool_calls))
+            messages.extend(tool_results)
+            
+        return "Analysis incomplete (exceeded iterations)"
+
+    # Execute entity analyses in parallel
+    results = await asyncio.gather(*(analyze_entity(e) for e in entities))
+    
+    combined_content = ""
+    for entity, res in zip(entities, results):
+        combined_content += f"\n\n## {entity}\n{res}\n---\n"
+        
+    # Set fallback count for transparency
+    state_fallback_count = state.raw_fallback_count
+    
+    return {
+        "messages": [AIMessage(content=combined_content)],
+        "company_analysis": {"raw_analysis": combined_content},  # We inject into company_analysis so synthesis sees it
+        "raw_fallback_count": state_fallback_count,
+        "iteration": state.iteration + 1,
+    }

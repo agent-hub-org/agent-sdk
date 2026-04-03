@@ -36,6 +36,10 @@ class AgentState(BaseModel):
         default=0,
         description="Current iteration count for the autonomous agent loop.",
     )
+    tool_timeout: float = Field(
+        default=120.0,
+        description="Maximum seconds to wait for a single batch of tool calls before timing out.",
+    )
 
 
 class FinancialAnalysisState(AgentState):
@@ -101,4 +105,14 @@ class FinancialAnalysisState(AgentState):
     validation_warnings: list[str] = Field(
         default_factory=list,
         description="Warnings from symbolic validators accumulated across phases.",
+    )
+
+    raw_fallback_count: int = Field(
+        default=0,
+        description="Number of phases that fell back to raw_analysis due to JSON extraction failure.",
+    )
+
+    overall_confidence: Optional[float] = Field(
+        default=None,
+        description="Calculated confidence score based on validation warnings and fallbacks.",
     )

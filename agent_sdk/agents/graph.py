@@ -105,6 +105,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         causal_analysis_node,
         sector_analysis_node,
         company_analysis_node,
+        comparative_analysis_node,
         risk_assessment_node,
         synthesis_node,
         phase_advance,
@@ -125,6 +126,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_node("causal_analysis", partial(causal_analysis_node, agent))
     graph.add_node("sector_analysis", partial(sector_analysis_node, agent))
     graph.add_node("company_analysis", partial(company_analysis_node, agent))
+    graph.add_node("comparative_analysis", partial(comparative_analysis_node, agent))
     graph.add_node("risk_assessment", partial(risk_assessment_node, agent))
     graph.add_node("synthesis", partial(synthesis_node, agent))
 
@@ -144,6 +146,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         "causal_analysis": "causal_analysis",
         "sector_analysis": "sector_analysis",
         "company_analysis": "company_analysis",
+        "comparative_analysis": "comparative_analysis",
         "risk_assessment": "risk_assessment",
         "synthesis": "synthesis",
         END: END,
@@ -156,7 +159,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         "phase_advance": "phase_advance",
     }
     for phase_name in ["regime_assessment", "causal_analysis", "sector_analysis",
-                       "company_analysis", "risk_assessment", "synthesis"]:
+                       "company_analysis", "comparative_analysis", "risk_assessment", "synthesis"]:
         graph.add_conditional_edges(
             phase_name, partial(financial_should_continue, phase_name), _phase_continue_map
         )
@@ -167,6 +170,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         "causal_analysis": "causal_analysis",
         "sector_analysis": "sector_analysis",
         "company_analysis": "company_analysis",
+        "comparative_analysis": "comparative_analysis",
         "risk_assessment": "risk_assessment",
         "synthesis": "synthesis",
     }
@@ -195,6 +199,7 @@ def _route_phase(state: FinancialAnalysisState) -> str:
         "causal_analysis": "causal_analysis",
         "sector_analysis": "sector_analysis",
         "company_analysis": "company_analysis",
+        "comparative_analysis": "comparative_analysis",
         "risk_assessment": "risk_assessment",
         "synthesis": "synthesis",
     }

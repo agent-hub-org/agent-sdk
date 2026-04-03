@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -13,7 +14,6 @@ from mcp.client.streamable_http import streamable_http_client
 logger = logging.getLogger("agent_sdk.mcp")
 
 MAX_RETRIES = 5
-RETRY_DELAY = 3  # seconds
 
 _STREAMABLE_HTTP_TRANSPORTS = frozenset({"streamable_http", "streamable-http", "http"})
 
@@ -79,9 +79,10 @@ class MCPConnectionManager:
             except Exception as e:
                 await self._cleanup()
                 if attempt < MAX_RETRIES:
-                    logger.warning("MCP connection attempt %d/%d failed: %s — retrying in %ds",
-                                   attempt, MAX_RETRIES, e, RETRY_DELAY)
-                    await asyncio.sleep(RETRY_DELAY)
+                    delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0, 1))
+                    logger.warning("MCP connection attempt %d/%d failed: %s — retrying in %.2fs",
+                                   attempt, MAX_RETRIES, e, delay)
+                    await asyncio.sleep(delay)
                 else:
                     logger.error("MCP connection failed after %d attempts: %s", MAX_RETRIES, e)
                     raise
