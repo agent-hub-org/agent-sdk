@@ -917,11 +917,11 @@ def financial_should_continue(phase_name: str, state) -> str:
     last_message = state.messages[-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
     
-    # Check per-phase budget first (if configured) — use dict access for TypedDict
-    phase_budgets = state.get("phase_iteration_budgets") or {}
+    # Check per-phase budget first (if configured) — use getattr for Pydantic
+    phase_budgets = getattr(state, "phase_iteration_budgets", {})
     if phase_budgets:
         phase_limit = phase_budgets.get(phase_name, 3)
-        if state.get("iteration", 0) >= phase_limit:
+        if getattr(state, "iteration", 0) >= phase_limit:
             logger.warning("Iteration limit reached in phase %s (per-phase budget: %d)", phase_name, phase_limit)
             if has_tool_calls:
                 logger.warning(
@@ -932,7 +932,7 @@ def financial_should_continue(phase_name: str, state) -> str:
             return "phase_advance"
     
     # Global safety check (fallback)
-    if state.get("iteration", 0) >= state.get("max_iterations", 10):
+    if getattr(state, "iteration", 0) >= getattr(state, "max_iterations", 10):
         logger.warning("Global iteration limit reached in phase %s", phase_name)
         if has_tool_calls:
             logger.warning(
