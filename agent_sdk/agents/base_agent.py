@@ -238,6 +238,18 @@ class StreamResult:
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id
+        
+        # For financial_analyst mode, set up per-phase iteration budgets
+        if self._agent.mode == "financial_analyst":
+            stream_input["phase_iteration_budgets"] = {
+                "query_classification": 1,
+                "regime_assessment": 2,
+                "causal_analysis": 2,
+                "sector_analysis": 2,
+                "company_analysis": 8,
+                "risk_assessment": 2,
+                "synthesis": 3,
+            }
 
         async for event in self._agent.graph.astream_events(
             stream_input,
