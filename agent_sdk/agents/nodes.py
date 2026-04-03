@@ -111,7 +111,7 @@ async def llm_call(agent, state: AgentState) -> dict:
         llm = agent.llm
 
     tools = list(agent.tools_by_name.values())
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     # Merge summary into the existing system message to avoid dual SystemMessages
     if state.summary:
@@ -578,7 +578,7 @@ async def regime_assessment_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "regime_assessment")
     logger.info("regime_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     prompt = _build_phase_prompt(state, REGIME_ASSESSMENT_PROMPT)
     response = await llm_with_tools.ainvoke(prompt)
@@ -611,7 +611,7 @@ async def causal_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "causal_analysis")
     logger.info("causal_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     # Inject prior phase context into prompt
     prompt_template = CAUSAL_ANALYSIS_PROMPT.format(
@@ -646,7 +646,7 @@ async def sector_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "sector_analysis")
     logger.info("sector_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     prompt_template = SECTOR_ANALYSIS_PROMPT.format(
         regime_context=_format_context(state.regime_context),
@@ -681,7 +681,7 @@ async def company_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
     logger.info("company_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     prompt_template = COMPANY_ANALYSIS_PROMPT.format(
         regime_context=_format_context(state.regime_context),
@@ -725,7 +725,7 @@ async def risk_assessment_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "risk_assessment")
     logger.info("risk_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, strict=True, parallel_tool_calls=False) if tools else llm
 
     prompt_template = RISK_ASSESSMENT_PROMPT.format(
         regime_context=_format_context(state.regime_context),
