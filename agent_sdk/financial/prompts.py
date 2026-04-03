@@ -28,7 +28,7 @@ Rules:
 - thematic activates regime + sector + company phases
 
 Output ONLY a JSON object with exactly these fields:
-{
+{{
   "query_type": "<one of: data_retrieval, company_analysis, sector_analysis, macro_impact, comparative, thematic>",
   "entities": ["<tickers, sectors, or macro indicators mentioned>"],
   "requires_regime_assessment": true/false,
@@ -37,7 +37,7 @@ Output ONLY a JSON object with exactly these fields:
   "requires_company_analysis": true/false,
   "requires_risk_assessment": true/false,
   "reasoning": "<brief explanation of your classification>"
-}
+}}
 """
 
 REGIME_ASSESSMENT_PROMPT = """\
@@ -184,17 +184,17 @@ You are a fundamental equity research analyst covering Indian listed companies.
 
 **CRITICAL: Return your complete analysis as a valid JSON object** with the following structure:
 ```json
-{
+{{
   "ticker": "...",
-  "financial_summary": {...},
-  "valuation_approaches": {
-    "dcf": {...},
-    "comparable": {...},
-    "technical": {...}
-  },
-  "risk_assessment": {...},
+  "financial_summary": {{...}},
+  "valuation_approaches": {{
+    "dcf": {{...}},
+    "comparable": {{...}},
+    "technical": {{...}}
+  }},
+  "risk_assessment": {{...}},
   "recommendations": "..."
-}
+}}
 ```
 
 You are building on regime, causal, and sector analysis from prior phases.
@@ -220,10 +220,10 @@ Your job is to:
    - Use `retrieve_from_vector_db(query="[PEER] financial metrics P/E P/B ratios")`
    - Use `tavily_quick_search(query="[PEER] P/E ratio Price to Book PEG 2026")`  
 4. Extract target_metrics from downloaded target company data:
-   - Format: `{"pe_ratio": 15.2, "pb_ratio": 2.5, "peg_ratio": 1.1, ...}`
+   - Format: `{{"pe_ratio": 15.2, "pb_ratio": 2.5, "peg_ratio": 1.1, ...}}`
 5. Build peers list with collected metrics:
-   - Format: `[{"ticker": "PEER1.NS", "pe_ratio": 16.3, "pb_ratio": 2.3, ...}, ...]`
-6. **CRITICAL: Call `run_comparable_valuation(target_ticker="TARGET.NS", target_metrics={...}, peers=[...])`**
+   - Format: `[{{"ticker": "PEER1.NS", "pe_ratio": 16.3, "pb_ratio": 2.3, ...}}, ...]`
+6. **CRITICAL: Call `run_comparable_valuation(target_ticker="TARGET.NS", target_metrics={{...}}, peers=[...])`**
    - **ALL THREE parameters are REQUIRED**
    - **Do NOT omit target_metrics or peers**
    - If you cannot gather peer metrics, explicitly tell the user which data is missing
