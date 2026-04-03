@@ -116,3 +116,17 @@ class FinancialAnalysisState(AgentState):
         default=None,
         description="Calculated confidence score based on validation warnings and fallbacks.",
     )
+
+    # --- Iteration Budget Control ---
+    phase_iteration_budgets: dict[str, int] = Field(
+        default_factory=lambda: {
+            "query_classification": 1,
+            "regime_assessment": 2,
+            "causal_analysis": 2,
+            "sector_analysis": 2,
+            "company_analysis": 8,
+            "risk_assessment": 2,
+            "synthesis": 3,
+        },
+        description="Per-phase iteration budgets for the financial cognitive pipeline. Total: 20 iterations.",
+    )

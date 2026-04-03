@@ -698,11 +698,14 @@ async def company_analysis_node(agent, state) -> dict:
     company_data = _extract_json(response.content) or {}
     fallback_inc = 0
     if not company_data:
-        logger.warning("company_analysis fell back to raw_analysis — LLM did not return parseable JSON")
+        logger.warning(
+            "company_analysis fell back to raw_analysis — LLM did not return parseable JSON. "
+            "Raw output (first 500 chars): %s", response.content[:500]
+        )
         fallback_inc = 1
 
     # Run symbolic validation on company analysis so warnings reach the risk phase
-    company_warnings = _run_phase_validation(company_data, state)
+    company_warnings = _run_phase_validation(state)
 
     return {
         "messages": [response],
@@ -907,18 +910,33 @@ def financial_should_continue(phase_name: str, state) -> str:
     Routing function for financial phase nodes.
     If the LLM requested tools, route to financial_tool_node.
     Otherwise, phase is complete — route to phase_advance.
+    
+    Supports per-phase iteration budgets via phase_iteration_budgets dict.
+    Falls back to global max_iterations if not configured.
     """
     last_message = state.messages[-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
-
+    
+    # Check per-phase budget first (if configured)
+    phase_budgets = getattr(state, "phase_iteration_budgets", None) or {}
+    if phase_budgets:
+        phase_limit = phase_budgets.get(phase_name, 3)
+        if state.iteration >= phase_limit:
+            logger.warning("Iteration limit reached in phase %s (per-phase budget: %d)", phase_name, phase_limit)
+            if has_tool_calls:
+                logger.warning(
+                    "Phase %s hit iteration limit with pending tool_calls — routing to tool_node to clear them",
+                    phase_name,
+                )
+                return "financial_tool_node"
+            return "phase_advance"
+    
+    # Global safety check (fallback)
     if state.iteration >= state.max_iterations:
-        logger.warning("Iteration limit reached in phase %s", phase_name)
+        logger.warning("Global iteration limit reached in phase %s", phase_name)
         if has_tool_calls:
-            # Route through financial_tool_node so it can emit error ToolMessages
-            # for the pending tool_call_ids before we advance — prevents orphaned
-            # AIMessage(tool_calls) from polluting subsequent phase prompts.
             logger.warning(
-                "Phase %s hit iteration limit with pending tool_calls — routing to tool_node to clear them",
+                "Phase %s hit global iteration limit with pending tool_calls — routing to tool_node to clear them",
                 phase_name,
             )
             return "financial_tool_node"
@@ -1095,8 +1113,8 @@ def _extract_json(text: str) -> dict | None:
                     start = None
 
     logger.warning(
-        "_extract_json: all parsing strategies failed (text length=%d, first 200 chars: '%s')",
-        len(text), text[:200],
+        "_extract_json: all parsing strategies failed (text length=%d, first 500 chars: '%s')",
+        len(text), text[:500],
     )
     return None
 

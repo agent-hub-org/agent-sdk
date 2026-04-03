@@ -134,6 +134,18 @@ class BaseAgent:
         }
         if model_id:
             invoke_input["model_id"] = model_id
+        
+        # For financial_analyst mode, set up per-phase iteration budgets
+        if self.mode == "financial_analyst":
+            invoke_input["phase_iteration_budgets"] = {
+                "query_classification": 1,
+                "regime_assessment": 2,
+                "causal_analysis": 2,
+                "sector_analysis": 2,
+                "company_analysis": 8,
+                "risk_assessment": 2,
+                "synthesis": 3,
+            }
 
         result = await self.graph.ainvoke(
             invoke_input,
