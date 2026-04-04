@@ -19,17 +19,17 @@ MODEL_CATALOG = {
     },
 
     # Azure AI Foundry — GPT-4o mini (tool calling + prompt caching)
-    "azure/gpt-4o-mini": {
+    "azure/gpt-5-nano": {
         "provider": "Azure AI Foundry",
-        "model": "gpt-4o-mini",
-        "label": "GPT-4o mini",
+        "model": "gpt-5-nano",
+        "label": "GPT-5 nano",
     },
 
     # Azure AI Foundry — GPT-4.1 mini (latest GPT-4.1 series, strong reasoning + tool calling)
-    "azure/gpt-4.1-mini": {
+    "azure/gpt-5.4-nano": {
         "provider": "Azure AI Foundry",
-        "model": "gpt-4.1-mini",
-        "label": "GPT-4.1 mini",
+        "model": "gpt-5.4-nano",
+        "label": "GPT-5.4 nano",
     },
 
     # Azure AI Foundry — GPT-OSS-120B (Apache 2.0, o4-mini-level claims)
@@ -59,7 +59,7 @@ MODEL_CATALOG = {
     },
 }
 
-_DEFAULT_MODEL_ID = "azure/gpt-4o-mini"
+_DEFAULT_MODEL_ID = "azure/gpt-5-nano"
 
 
 def get_llm(model_id: str, temperature: float = 0.7):
