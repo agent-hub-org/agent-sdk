@@ -865,6 +865,12 @@ async def synthesis_node(agent, state) -> dict:
         synthesis_data["full_report"] += confidence_text
         report_msg = AIMessage(content=synthesis_data["full_report"])
     else:
+        logger.warning(
+            "Synthesis did not return structured JSON; falling back to raw content (%d chars). "
+            "First 200 chars: %s",
+            len(response.content),
+            response.content[:200],
+        )
         content_with_confidence = response.content + confidence_text
         report_msg = AIMessage(content=content_with_confidence)
         if not synthesis_data:

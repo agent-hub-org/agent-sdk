@@ -20,6 +20,19 @@ _STREAMING_NODES = {
     "risk_assessment", "synthesis",
 }
 
+# Human-readable labels for financial pipeline phases — shown as progress markers
+# while intermediate phases run silently (i.e. when _STREAMING_NODES is restricted).
+_PHASE_PROGRESS_LABELS: dict[str, str] = {
+    "classify_query":        "🔎 Classifying query...",
+    "regime_assessment":     "🌐 Analyzing macro regime & market environment...",
+    "causal_analysis":       "🔗 Mapping causal transmission chains...",
+    "sector_analysis":       "📊 Evaluating sector positioning...",
+    "company_analysis":      "🏢 Running company fundamental analysis...",
+    "comparative_analysis":  "⚖️ Running comparative analysis...",
+    "risk_assessment":       "⚠️ Stress-testing scenarios & risks...",
+    "synthesis":             "✍️ Synthesizing final report...",
+}
+
 
 class BaseAgent:
     """
@@ -193,7 +206,10 @@ class BaseAgent:
 
         logger.info("Agent run completed — session='%s', response length: %d chars, steps: %d",
                     session_id, len(response), len(steps))
-        return {"response": response, "steps": steps}
+        # Include structured synthesis (if available) so callers can render rich UI.
+        # Only exposed for financial_analyst mode to avoid unexpected payload bloat elsewhere.
+        structured = result.get("synthesis_report") if self.mode == "financial_analyst" else None
+        return {"response": response, "steps": steps, "synthesis_report": structured}
 
     def astream(self, query: str, session_id: str = "default",
                 system_prompt: str | None = None, model_id: str | None = None):
@@ -228,8 +244,13 @@ class StreamResult:
 
         logger.info("Agent stream started — session='%s', query='%s'", self._session_id, self._query[:100])
 
+        import json as _json
+
         chunks_yielded = False
         last_full_response = ""
+        # Synthesis outputs JSON-wrapped content {"full_report": "..."}. Buffer its tokens
+        # and unwrap on model-end so the client receives clean markdown, not raw JSON.
+        _synthesis_buffer: list[str] = []
 
         stream_input = {
             "messages": [HumanMessage(content=self._query)],
@@ -238,7 +259,7 @@ class StreamResult:
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id
-        
+
         # For financial_analyst mode, set up per-phase iteration budgets
         if self._agent.mode == "financial_analyst":
             stream_input["phase_iteration_budgets"] = {
@@ -251,11 +272,26 @@ class StreamResult:
                 "synthesis": 3,
             }
 
+        _phases_announced: set[str] = set()
+
         async for event in self._agent.graph.astream_events(
             stream_input,
             config={"recursion_limit": 100, "configurable": {"thread_id": self._session_id}},
             version="v2",
         ):
+            # Emit a progress marker when a financial pipeline phase node starts.
+            # Shown for all phase nodes so users see pipeline progress even when
+            # intermediate phases are excluded from _STREAMING_NODES.
+            if event["event"] == "on_chain_start":
+                node = event.get("metadata", {}).get("langgraph_node") or event.get("name", "")
+                label = _PHASE_PROGRESS_LABELS.get(node)
+                if label and node not in _phases_announced:
+                    _phases_announced.add(node)
+                    # Prefixed so callers (e.g. the SSE event_stream) can route
+                    # progress lines to a separate event type and exclude them
+                    # from the saved conversation response.
+                    yield f"__PROGRESS__:{label}"
+
             if event["event"] == "on_chat_model_stream":
                 # Only stream user-facing LLM nodes, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
@@ -263,19 +299,50 @@ class StreamResult:
                     continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
-                if isinstance(content, str) and content:
-                    chunks_yielded = True
-                    yield content
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                            chunks_yielded = True
-                            yield block["text"]
+
+                if node == "synthesis":
+                    # Buffer instead of yielding — synthesis outputs JSON that must be unwrapped first
+                    if isinstance(content, str) and content:
+                        _synthesis_buffer.append(content)
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                                _synthesis_buffer.append(block["text"])
+                else:
+                    if isinstance(content, str) and content:
+                        chunks_yielded = True
+                        yield content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                                chunks_yielded = True
+                                yield block["text"]
+
             elif event["event"] == "on_chat_model_end":
                 # Only track from the main LLM, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
                 if node == "summarize_conversation":
                     continue
+
+                # Flush the synthesis buffer with JSON unwrapping
+                if node == "synthesis" and _synthesis_buffer:
+                    raw = "".join(_synthesis_buffer)
+                    _synthesis_buffer.clear()
+                    clean = raw
+                    try:
+                        parsed = _json.loads(raw)
+                        if isinstance(parsed, dict) and "full_report" in parsed:
+                            clean = parsed["full_report"]
+                            logger.debug(
+                                "Synthesis: unwrapped JSON full_report (%d → %d chars)",
+                                len(raw), len(clean),
+                            )
+                    except Exception:
+                        pass  # Not valid JSON — stream as-is
+                    if clean:
+                        chunks_yielded = True
+                        yield clean
+
                 # Track tool calls from LLM responses
                 output = event["data"].get("output")
                 if output:
@@ -297,6 +364,7 @@ class StreamResult:
                                 parts.append(block["text"])
                         if parts:
                             last_full_response = "".join(parts)
+
             elif event["event"] == "on_tool_end":
                 # Track tool results
                 output = event["data"].get("output")
@@ -311,9 +379,19 @@ class StreamResult:
 
         # Fallback: if no streaming chunks were yielded, emit the full response
         if not chunks_yielded and last_full_response:
-            logger.warning("No streaming chunks received — falling back to full response (%d chars)",
-                          len(last_full_response))
-            yield last_full_response
+            logger.warning(
+                "No streaming chunks received — falling back to full response (%d chars)",
+                len(last_full_response),
+            )
+            # Also unwrap JSON on the fallback path
+            clean_fallback = last_full_response
+            try:
+                parsed = _json.loads(last_full_response)
+                if isinstance(parsed, dict) and "full_report" in parsed:
+                    clean_fallback = parsed["full_report"]
+            except Exception:
+                pass
+            yield clean_fallback
 
     def run(self, query: str, session_id: str = "default") -> dict:
         """
