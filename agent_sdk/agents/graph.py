@@ -173,6 +173,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         "comparative_analysis": "comparative_analysis",
         "risk_assessment": "risk_assessment",
         "synthesis": "synthesis",
+        "phase_advance": "phase_advance",
     }
     graph.add_conditional_edges("financial_tool_node", _route_back_to_phase, _back_to_phase_map)
 
@@ -209,6 +210,21 @@ def _route_phase(state: FinancialAnalysisState) -> str:
 
 
 def _route_back_to_phase(state: FinancialAnalysisState) -> str:
-    """Route back to the current active phase after tool execution."""
-    logger.info("_route_back_to_phase — current_phase=%s", state.current_phase)
-    return state.current_phase
+    """
+    Route back to the current active phase after tool execution.
+    If the phase budget was reached, force an advance instead of looping.
+    """
+    phase_name = state.current_phase
+    phase_budgets = getattr(state, "phase_iteration_budgets", {})
+    phase_count = getattr(state, "phase_iterations", {}).get(phase_name, 0)
+    phase_limit = phase_budgets.get(phase_name, 3)
+
+    if phase_count >= phase_limit:
+        logger.warning(
+            "Phase %s budget hit (%d/%d) after tool execution — forcing phase_advance to prevent infinite loop",
+            phase_name, phase_count, phase_limit
+        )
+        return "phase_advance"
+
+    logger.info("_route_back_to_phase — current_phase=%s", phase_name)
+    return phase_name

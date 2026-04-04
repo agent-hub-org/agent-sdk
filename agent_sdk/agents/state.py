@@ -1,7 +1,12 @@
-from typing import Annotated, Any, Sequence, Optional
+from typing import Annotated, Any, Sequence, Optional, Dict
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
+
+
+def merge_dicts(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+    """Simple dictionary merger for state fields."""
+    return {**left, **right}
 
 
 class AgentState(BaseModel):
@@ -118,6 +123,11 @@ class FinancialAnalysisState(AgentState):
     )
 
     # --- Iteration Budget Control ---
+    phase_iterations: Annotated[dict[str, int], merge_dicts] = Field(
+        default_factory=dict,
+        description="Current iteration count for each phase.",
+    )
+
     phase_iteration_budgets: dict[str, int] = Field(
         default_factory=lambda: {
             "query_classification": 1,

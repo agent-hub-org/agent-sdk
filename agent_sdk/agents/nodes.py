@@ -449,6 +449,18 @@ async def financial_initialize(state) -> dict:
     """Initialize the financial reasoning pipeline."""
     # Reuse standard initialize for system message setup
     result = await initialize(state)
+    
+    # Initialize phase_iterations with 0 for all phases
+    result["phase_iterations"] = {
+        "query_classification": 0,
+        "regime_assessment": 0,
+        "causal_analysis": 0,
+        "sector_analysis": 0,
+        "company_analysis": 0,
+        "comparative_analysis": 0,
+        "risk_assessment": 0,
+        "synthesis": 0,
+    }
     return result
 
 
@@ -563,6 +575,7 @@ async def classify_query_node(agent, state) -> dict:
         "phases_to_run": phases,
         "current_phase": phases[0] if phases else "done",
         "iteration": state.iteration + 1,
+        "phase_iterations": {"query_classification": 1},
     }
 
 
@@ -586,7 +599,11 @@ async def regime_assessment_node(agent, state) -> dict:
     # Check if LLM wants to call tools
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
-        return {"messages": [response], "iteration": state.iteration + 1}
+        return {
+            "messages": [response], 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"regime_assessment": state.phase_iterations.get("regime_assessment", 0) + 1}
+        }
 
     # Phase complete — extract structured regime context from response
     regime_data = _extract_json(response.content) or {}
@@ -596,6 +613,7 @@ async def regime_assessment_node(agent, state) -> dict:
         "messages": [response],
         "regime_context": regime_data if regime_data else {"raw_assessment": response.content},
         "iteration": state.iteration + 1,
+        "phase_iterations": {"regime_assessment": state.phase_iterations.get("regime_assessment", 0) + 1}
     }
 
 
@@ -622,7 +640,11 @@ async def causal_analysis_node(agent, state) -> dict:
 
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
-        return {"messages": [response], "iteration": state.iteration + 1}
+        return {
+            "messages": [response], 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"causal_analysis": state.phase_iterations.get("causal_analysis", 0) + 1}
+        }
 
     causal_data = _extract_json(response.content) or {}
     fallback_inc = 0
@@ -634,6 +656,7 @@ async def causal_analysis_node(agent, state) -> dict:
         "causal_analysis": causal_data if causal_data else {"raw_analysis": response.content},
         "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"causal_analysis": state.phase_iterations.get("causal_analysis", 0) + 1}
     }
 
 
@@ -657,7 +680,11 @@ async def sector_analysis_node(agent, state) -> dict:
 
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
-        return {"messages": [response], "iteration": state.iteration + 1}
+        return {
+            "messages": [response], 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"sector_analysis": state.phase_iterations.get("sector_analysis", 0) + 1}
+        }
 
     sector_data = _extract_json(response.content) or {}
     fallback_inc = 0
@@ -669,6 +696,7 @@ async def sector_analysis_node(agent, state) -> dict:
         "sector_findings": sector_data if sector_data else {"raw_analysis": response.content},
         "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"sector_analysis": state.phase_iterations.get("sector_analysis", 0) + 1}
     }
 
 
@@ -693,7 +721,11 @@ async def company_analysis_node(agent, state) -> dict:
 
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
-        return {"messages": [response], "iteration": state.iteration + 1}
+        return {
+            "messages": [response], 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"company_analysis": state.phase_iterations.get("company_analysis", 0) + 1}
+        }
 
     company_data = _extract_json(response.content) or {}
     fallback_inc = 0
@@ -713,6 +745,7 @@ async def company_analysis_node(agent, state) -> dict:
         "validation_warnings": state.validation_warnings + company_warnings,
         "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"company_analysis": state.phase_iterations.get("company_analysis", 0) + 1}
     }
 
 
@@ -745,7 +778,11 @@ async def risk_assessment_node(agent, state) -> dict:
 
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
-        return {"messages": [response], "iteration": state.iteration + 1}
+        return {
+            "messages": [response], 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"risk_assessment": state.phase_iterations.get("risk_assessment", 0) + 1}
+        }
 
     # Run symbolic validation on the accumulated analysis (adds new warnings from this phase)
     validation_warnings = _run_phase_validation(state)
@@ -761,6 +798,7 @@ async def risk_assessment_node(agent, state) -> dict:
         "validation_warnings": state.validation_warnings + validation_warnings,
         "raw_fallback_count": state.raw_fallback_count + fallback_inc,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"risk_assessment": state.phase_iterations.get("risk_assessment", 0) + 1}
     }
 
 
@@ -837,6 +875,7 @@ async def synthesis_node(agent, state) -> dict:
         "synthesis_report": synthesis_data,
         "overall_confidence": confidence_score,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"synthesis": state.phase_iterations.get("synthesis", 0) + 1}
     }
 
 
@@ -919,10 +958,12 @@ def financial_should_continue(phase_name: str, state) -> str:
     
     # Check per-phase budget first (if configured) — use getattr for Pydantic
     phase_budgets = getattr(state, "phase_iteration_budgets", {})
+    phase_count = getattr(state, "phase_iterations", {}).get(phase_name, 0)
+    
     if phase_budgets:
         phase_limit = phase_budgets.get(phase_name, 3)
-        if getattr(state, "iteration", 0) >= phase_limit:
-            logger.warning("Iteration limit reached in phase %s (per-phase budget: %d)", phase_name, phase_limit)
+        if phase_count >= phase_limit:
+            logger.warning("Iteration limit reached in phase %s (per-phase budget: %d, used: %d)", phase_name, phase_limit, phase_count)
             if has_tool_calls:
                 logger.warning(
                     "Phase %s hit iteration limit with pending tool_calls — routing to tool_node to clear them",
@@ -933,7 +974,7 @@ def financial_should_continue(phase_name: str, state) -> str:
     
     # Global safety check (fallback)
     if getattr(state, "iteration", 0) >= getattr(state, "max_iterations", 10):
-        logger.warning("Global iteration limit reached in phase %s", phase_name)
+        logger.warning("Global iteration limit reached in phase %s (global budget: %d)", phase_name, getattr(state, "max_iterations", 10))
         if has_tool_calls:
             logger.warning(
                 "Phase %s hit global iteration limit with pending tool_calls — routing to tool_node to clear them",
@@ -1212,7 +1253,11 @@ async def comparative_analysis_node(agent, state) -> dict:
     entities = state.query_classification.get("entities", [])
     if not entities:
         logger.warning("No entities found for comparative analysis, falling back to synthesis")
-        return {"current_phase": "synthesis", "iteration": state.iteration + 1}
+        return {
+            "current_phase": "synthesis", 
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"comparative_analysis": state.phase_iterations.get("comparative_analysis", 0) + 1}
+        }
         
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
@@ -1264,4 +1309,5 @@ async def comparative_analysis_node(agent, state) -> dict:
         "company_analysis": {"raw_analysis": combined_content},  # We inject into company_analysis so synthesis sees it
         "raw_fallback_count": state_fallback_count,
         "iteration": state.iteration + 1,
+        "phase_iterations": {"comparative_analysis": state.phase_iterations.get("comparative_analysis", 0) + 1}
     }
