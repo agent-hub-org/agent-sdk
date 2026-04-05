@@ -10,42 +10,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Notify agent-financials
+      - name: Trigger Agent Syncs
         run: |
-          curl -f -s -S -X POST \
-          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          https://api.github.com/repos/pranjalv23/agent-financials/dispatches \
-          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
-
-      - name: Notify agent-research
-        run: |
-          curl -f -s -S -X POST \
-          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          https://api.github.com/repos/pranjalv23/agent-research/dispatches \
-          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
-
-      - name: Notify agent-interview-prep
-        run: |
-          curl -f -s -S -X POST \
-          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          https://api.github.com/repos/pranjalv23/agent-interview-prep/dispatches \
-          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
-
-      - name: Notify agent-news
-        run: |
-          curl -f -s -S -X POST \
-          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          https://api.github.com/repos/pranjalv23/agent-news/dispatches \
-          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
-
-      - name: Notify agent-health
-        run: |
-          curl -f -s -S -X POST \
-          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-          -H "Accept: application/vnd.github+json" \
-          https://api.github.com/repos/pranjalv23/agent-health/dispatches \
-          -d '{"event_type":"sdk-update","client_payload":{"tag":"'"${GITHUB_REF_NAME}"'"}}'
+          # List of agents that use the SDK as a submodule
+          # (Excludes marketplace as it does not use a submodule)
+          AGENTS=("agent-financials" "agent-health" "agent-interview-prep" "agent-news" "agent-research")
+          
+          for AGENT in "${AGENTS[@]}"; do
+            echo "Triggering sync for $AGENT..."
+            curl -f -s -S -X POST \
+              -H "Authorization: token ${{ secrets.ORG_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/agent-hub-org/$AGENT/actions/workflows/sync-sdk.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"sdk_tag":"'"${GITHUB_REF_NAME}"'"}}'
+          done

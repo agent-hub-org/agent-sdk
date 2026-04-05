@@ -254,20 +254,7 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     return {"summary": response.content, "messages": delete_messages}
 
 
-async def tool_node(agent, state: AgentState) -> dict:
-    """
-    Execute any tool calls from the last assistant message and
-    return the resulting tool messages.
-
-    If an MCP session has dropped (McpError: Session terminated),
-    reconnects and retries the failed tool calls once.
-
-    `agent` is bound via functools.partial at graph build time.
-    """
-
-    last_message = state.messages[-1]
-    tool_calls = getattr(last_message, "tool_calls", None) or []
-
+async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float) -> list[ToolMessage]:
     async def _execute(tool_call: dict) -> ToolMessage:
         name = tool_call["name"]
         args = tool_call.get("args", {})
@@ -292,6 +279,7 @@ async def tool_node(agent, state: AgentState) -> dict:
             elif hasattr(tool, "arun"):
                 observation = await tool.arun(args)
             else:
+                import asyncio
                 observation = await asyncio.to_thread(
                     tool.invoke if hasattr(tool, "invoke") else tool.run, args
                 )
@@ -304,9 +292,8 @@ async def tool_node(agent, state: AgentState) -> dict:
 
         return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
-    timeout = getattr(state, "tool_timeout", 120.0)
-
     async def _gather_with_timeout():
+        import asyncio
         return await asyncio.wait_for(
             asyncio.gather(*[_execute(tc) for tc in tool_calls]),
             timeout=timeout,
@@ -314,32 +301,54 @@ async def tool_node(agent, state: AgentState) -> dict:
 
     try:
         results = await _gather_with_timeout()
-    except asyncio.TimeoutError:
-        logger.error("Tool execution timed out after %.0fs — emitting error ToolMessages", timeout)
-        results = [
-            ToolMessage(
-                content=f"Tool execution timed out after {timeout:.0f} seconds.",
-                tool_call_id=tc["id"],
-            )
-            for tc in tool_calls
-        ]
     except Exception as e:
-        # Check if this is an MCP session termination error
-        error_msg = str(e).lower()
-        if "session terminated" in error_msg or "session" in error_msg and "closed" in error_msg:
-            logger.warning("MCP session dropped — attempting reconnect and retry")
-            if agent._mcp_manager is not None:
-                new_tools = await agent._mcp_manager.reconnect()
-                # Update the agent's tool registry with fresh tool instances
-                agent.tools = list(agent.tools)  # keep non-MCP tools
-                for t in new_tools:
-                    agent.tools_by_name[t.name] = t
-                logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
-                results = await _gather_with_timeout()
+        import asyncio
+        if isinstance(e, asyncio.TimeoutError):
+            logger.error("Tool execution timed out after %.0fs — emitting error ToolMessages", timeout)
+            results = [
+                ToolMessage(
+                    content=f"Tool execution timed out after {timeout:.0f} seconds.",
+                    tool_call_id=tc["id"],
+                )
+                for tc in tool_calls
+            ]
+        else:
+            # Check if this is an MCP session termination error
+            error_msg = str(e).lower()
+            if "session terminated" in error_msg or "session" in error_msg and "closed" in error_msg:
+                logger.warning("MCP session dropped — attempting reconnect and retry")
+                if agent._mcp_manager is not None:
+                    new_tools = await agent._mcp_manager.reconnect()
+                    # Update the agent's tool registry with fresh tool instances
+                    agent.tools = list(agent.tools)  # keep non-MCP tools
+                    for t in new_tools:
+                        agent.tools_by_name[t.name] = t
+                    logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
+                    results = await _gather_with_timeout()
+                else:
+                    raise
             else:
                 raise
-        else:
-            raise
+
+    return list(results)
+
+
+async def tool_node(agent, state: AgentState) -> dict:
+    """
+    Execute any tool calls from the last assistant message and
+    return the resulting tool messages.
+
+    If an MCP session has dropped (McpError: Session terminated),
+    reconnects and retries the failed tool calls once.
+
+    `agent` is bound via functools.partial at graph build time.
+    """
+
+    last_message = state.messages[-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+    timeout = getattr(state, "tool_timeout", 120.0)
+
+    results = await _execute_tool_calls(agent, tool_calls, timeout)
 
     return {"messages": list(results)}
 
@@ -1287,15 +1296,8 @@ async def comparative_analysis_node(agent, state) -> dict:
                 
             messages.append(response)
             
-            async def execute_tool(tc):
-                tool = agent.tools_by_name[tc["name"]]
-                if hasattr(tool, "invoke"):
-                    res = await asyncio.to_thread(tool.invoke, tc["args"])
-                else:
-                    res = await tool.ainvoke(tc["args"])
-                return ToolMessage(content=str(res), tool_call_id=tc["id"])
-            
-            tool_results = await asyncio.gather(*(execute_tool(tc) for tc in response.tool_calls))
+            timeout = getattr(state, "tool_timeout", 120.0)
+            tool_results = await _execute_tool_calls(agent, response.tool_calls, timeout)
             messages.extend(tool_results)
             
         return "Analysis incomplete (exceeded iterations)"

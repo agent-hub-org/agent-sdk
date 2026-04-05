@@ -14,15 +14,15 @@ logger = logging.getLogger("agent_sdk.agent")
 
 # Nodes that produce user-facing LLM output and should be streamed to the client.
 # Covers both the standard graph ("llm_call") and the financial reasoning graph.
-_STREAMING_NODES = {
+DEFAULT_STREAMING_NODES = frozenset({
     "llm_call",
     "regime_assessment", "causal_analysis",
     "sector_analysis", "company_analysis",
     "risk_assessment", "synthesis",
-}
+})
 
 # Human-readable labels for financial pipeline phases — shown as progress markers
-# while intermediate phases run silently (i.e. when _STREAMING_NODES is restricted).
+# while intermediate phases run silently (i.e. when streaming_nodes is restricted).
 _PHASE_PROGRESS_LABELS: dict[str, str] = {
     "classify_query":        "🔎 Classifying query...",
     "regime_assessment":     "🌐 Analyzing macro regime & market environment...",
@@ -54,13 +54,14 @@ class BaseAgent:
 
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
-                 mode: str = "standard"):
+                 mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
 
         tools = tools or []
         self.mode = mode
+        self.streaming_nodes = streaming_nodes or DEFAULT_STREAMING_NODES
 
         self.llm = initialize_agent_azure()
         self.summarizer = initialize_summarizer_azure()
@@ -296,7 +297,7 @@ class StreamResult:
             if event["event"] == "on_chat_model_stream":
                 # Only stream user-facing LLM nodes, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node not in _STREAMING_NODES:
+                if node not in self._agent.streaming_nodes:
                     continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
@@ -415,4 +416,4 @@ class StreamResult:
                 "Use `await BaseAgent.arun(...)` instead."
             )
 
-        return asyncio.run(self._agent.arun(query, session_id=session_id))
+        return asyncio.run(self.arun(query, session_id=session_id))
