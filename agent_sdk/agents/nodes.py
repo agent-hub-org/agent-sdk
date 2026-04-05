@@ -1296,7 +1296,7 @@ async def comparative_analysis_node(agent, state) -> dict:
         messages = [SystemMessage(content=prompt_template)]
         
         # Isolated tool loop for this entity
-        for _ in range(5):
+        for _ in range(8):
             response = await llm_with_tools.ainvoke(messages)
             if not getattr(response, "tool_calls", None):
                 return response.content
