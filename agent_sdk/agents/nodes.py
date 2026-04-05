@@ -1268,6 +1268,66 @@ def _run_phase_validation(state) -> list[str]:
     return warnings
 
 
+async def _compress_entity_messages(agent, messages: list, entity: str, timeout: float) -> list:
+    """
+    Summarize intermediate tool results in the analyze_entity message list to prevent
+    context window overflow. Always preserves the leading SystemMessage and the most
+    recent AI+tool round so the LLM retains fresh context.
+    """
+    from langchain_core.messages import SystemMessage, HumanMessage
+    import asyncio
+
+    has_system = messages and isinstance(messages[0], SystemMessage)
+    system_msg = messages[0] if has_system else None
+    body = messages[1:] if has_system else list(messages)
+
+    # Need at least 2 rounds (AI msg + tools) before compression makes sense
+    if len(body) < 4:
+        return messages
+
+    # Keep the 4 most recent messages (≈1 full AI+tool round) verbatim
+    keep_tail = min(4, len(body))
+    to_summarize = body[:-keep_tail]
+    tail = body[-keep_tail:]
+
+    if not to_summarize:
+        return messages
+
+    summarizer = agent.summarizer or agent.llm
+    summarizer_input = [
+        SystemMessage(content=(
+            f"The following are financial data retrieval results for {entity}. "
+            "Extract and preserve ALL key financial metrics, ratios, figures, dates, and facts verbatim. "
+            "Be comprehensive — do not drop any numerical data. Format as a structured bullet-point summary."
+        )),
+        *to_summarize,
+        SystemMessage(content="Provide the structured financial data summary now."),
+    ]
+
+    try:
+        if hasattr(summarizer, "ainvoke"):
+            resp = await asyncio.wait_for(summarizer.ainvoke(summarizer_input), timeout=timeout)
+        else:
+            resp = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, summarizer.invoke, summarizer_input),
+                timeout=timeout,
+            )
+        summary_text = resp.content if hasattr(resp, "content") else str(resp)
+        logger.info(
+            "Compressed %d messages for entity '%s' → summary (%d chars)",
+            len(to_summarize), entity, len(summary_text),
+        )
+        compressed = []
+        if system_msg:
+            compressed.append(system_msg)
+        compressed.append(HumanMessage(content=f"[Previously retrieved data for {entity}]\n{summary_text}"))
+        compressed.extend(tail)
+        return compressed
+    except Exception:
+        logger.warning("Context compression failed for entity '%s' — proceeding with full context", entity)
+        return messages
+
+
 async def comparative_analysis_node(agent, state) -> dict:
     from agent_sdk.financial.prompts import COMPANY_ANALYSIS_PROMPT
     from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
@@ -1298,17 +1358,53 @@ async def comparative_analysis_node(agent, state) -> dict:
         messages = [SystemMessage(content=prompt_template)]
         
         # Isolated tool loop for this entity
+        llm_timeout = getattr(state, "tool_timeout", 120.0)
+        seen_tool_calls: dict[tuple, str] = {}  # (name, args_key) → cached result
+
         for _ in range(8):
-            response = await llm_with_tools.ainvoke(messages)
+            try:
+                response = await asyncio.wait_for(
+                    llm_with_tools.ainvoke(messages),
+                    timeout=llm_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM call timed out after %.0fs in analyze_entity for '%s'", llm_timeout, entity)
+                return f"Analysis timed out for {entity}"
+
             if not getattr(response, "tool_calls", None):
                 return response.content
-                
+
             messages.append(response)
-            
-            timeout = getattr(state, "tool_timeout", 120.0)
-            tool_results = await _execute_tool_calls(agent, response.tool_calls, timeout, phase_tools=tools)
-            messages.extend(tool_results)
-            
+
+            # Deduplicate tool calls — return cached result for identical (name, args) pairs
+            tool_timeout = getattr(state, "tool_timeout", 120.0)
+            deduped_calls, cached_msgs = [], []
+            for tc in response.tool_calls:
+                key = (tc["name"], str(sorted(tc.get("args", {}).items())))
+                if key in seen_tool_calls:
+                    logger.info("Skipping duplicate tool call '%s' — returning cached result", tc["name"])
+                    cached_msgs.append(ToolMessage(content=seen_tool_calls[key], tool_call_id=tc["id"]))
+                else:
+                    deduped_calls.append(tc)
+
+            fresh_results = []
+            if deduped_calls:
+                fresh_results = await _execute_tool_calls(agent, deduped_calls, tool_timeout, phase_tools=tools)
+                for tc, tr in zip(deduped_calls, fresh_results):
+                    key = (tc["name"], str(sorted(tc.get("args", {}).items())))
+                    seen_tool_calls[key] = tr.content
+
+            messages.extend(fresh_results + cached_msgs)
+
+            # Compress if context is approaching the model's limit
+            phase_token_limit = int(getattr(state, "max_context_tokens", 32768) * 0.70)
+            if _estimate_token_count(messages) > phase_token_limit:
+                logger.info(
+                    "Entity '%s' context approaching limit (%d est. tokens) — compressing",
+                    entity, _estimate_token_count(messages),
+                )
+                messages = await _compress_entity_messages(agent, messages, entity, llm_timeout)
+
         return "Analysis incomplete (exceeded iterations)"
 
     # Execute entity analyses in parallel
