@@ -1152,7 +1152,9 @@ def _extract_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             continue
 
-    # Try to find a JSON object in the text
+    # Try to find JSON objects in the text — collect all valid candidates,
+    # then return the one with the most keys (most likely the intended phase output).
+    candidates: list[dict] = []
     brace_depth = 0
     start = None
     for i, char in enumerate(text):
@@ -1164,9 +1166,14 @@ def _extract_json(text: str) -> dict | None:
             brace_depth -= 1
             if brace_depth == 0 and start is not None:
                 try:
-                    return json.loads(text[start:i + 1])
+                    obj = json.loads(text[start:i + 1])
+                    if isinstance(obj, dict):
+                        candidates.append(obj)
                 except json.JSONDecodeError:
-                    start = None
+                    pass
+                start = None
+    if candidates:
+        return max(candidates, key=lambda x: len(x))
 
     logger.warning(
         "_extract_json: all parsing strategies failed (text length=%d, first 500 chars: '%s')",

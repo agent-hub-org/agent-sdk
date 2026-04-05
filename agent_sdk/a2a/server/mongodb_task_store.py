@@ -19,7 +19,11 @@ class AsyncMongoDBTaskStore(TaskStore):
         db_name: str = "a2a_tasks",
         collection_name: str = "tasks",
     ):
-        self._client = AsyncIOMotorClient(conn_string)
+        self._client = AsyncIOMotorClient(
+            conn_string,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=30000,
+        )
         self._db = self._client[db_name]
         self._collection = self._db[collection_name]
         logger.info(

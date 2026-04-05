@@ -56,7 +56,11 @@ class AsyncMongoDBSaver(MongoDBSaver):
         serde=None,
     ) -> None:
         # Sync client passed to parent for inherited sync methods
-        sync_client = MongoClient(conn_string)
+        sync_client = MongoClient(
+            conn_string,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=30000,
+        )
         super().__init__(
             client=sync_client,
             db_name=db_name,
@@ -67,7 +71,11 @@ class AsyncMongoDBSaver(MongoDBSaver):
         )
 
         # Async client for all overridden async methods
-        async_client = AsyncMongoClient(conn_string)
+        async_client = AsyncMongoClient(
+            conn_string,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=30000,
+        )
         async_db = async_client[db_name]
         self._async_checkpoints = async_db[checkpoint_collection_name]
         self._async_writes = async_db[writes_collection_name]
