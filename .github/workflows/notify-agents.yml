@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+env:
+  # Update this if the GitHub org is ever renamed
+  ORG: agent-hub-org
+
 jobs:
   notify:
     runs-on: ubuntu-latest
@@ -12,15 +16,39 @@ jobs:
     steps:
       - name: Trigger Agent Syncs
         run: |
-          # List of agents that use the SDK as a submodule
-          # (Excludes marketplace as it does not use a submodule)
-          AGENTS=("agent-financials" "agent-health" "agent-interview-prep" "agent-news" "agent-research")
-          
+          # Agents that use the SDK as a submodule.
+          # Add new agents here — marketplace is excluded (no SDK submodule).
+          AGENTS=(
+            "agent-financials"
+            "agent-health"
+            "agent-interview-prep"
+            "agent-news"
+            "agent-research"
+          )
+
+          FAILED=()
           for AGENT in "${AGENTS[@]}"; do
             echo "Triggering sync for $AGENT..."
-            curl -f -s -S -X POST \
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
               -H "Authorization: token ${{ secrets.ORG_PAT }}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/agent-hub-org/$AGENT/actions/workflows/sync-sdk.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"sdk_tag":"'"${GITHUB_REF_NAME}"'"}}'
+              "https://api.github.com/repos/${{ env.ORG }}/$AGENT/actions/workflows/sync-sdk.yml/dispatches" \
+              -d "{\"ref\":\"main\",\"inputs\":{\"sdk_tag\":\"${GITHUB_REF_NAME}\"}}")
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "  ✓ $AGENT dispatched (HTTP $HTTP_STATUS)"
+            else
+              echo "  ✗ $AGENT dispatch failed (HTTP $HTTP_STATUS)"
+              FAILED+=("$AGENT")
+            fi
           done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo ""
+            echo "ERROR: Failed to dispatch sync for: ${FAILED[*]}"
+            exit 1
+          fi
+
+          echo ""
+          echo "All ${#AGENTS[@]} agent(s) notified for SDK tag ${GITHUB_REF_NAME}."
