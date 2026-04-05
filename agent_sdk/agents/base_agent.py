@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -140,7 +141,7 @@ class BaseAgent:
         logger.info("Agent run started — session='%s', query='%s', model_id='%s'",
                     session_id, query[:100], model_id or "default")
 
-        invoke_input = {
+        invoke_input: dict[str, Any] = {
             "messages": [HumanMessage(content=query)],
             "system_prompt": system_prompt or self.system_prompt,
             "iteration": 0,
@@ -252,7 +253,7 @@ class StreamResult:
         # and unwrap on model-end so the client receives clean markdown, not raw JSON.
         _synthesis_buffer: list[str] = []
 
-        stream_input = {
+        stream_input: dict[str, Any] = {
             "messages": [HumanMessage(content=self._query)],
             "system_prompt": self._system_prompt,
             "iteration": 0,
@@ -414,4 +415,4 @@ class StreamResult:
                 "Use `await BaseAgent.arun(...)` instead."
             )
 
-        return asyncio.run(self.arun(query, session_id=session_id))
+        return asyncio.run(self._agent.arun(query, session_id=session_id))
