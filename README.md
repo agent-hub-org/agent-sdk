@@ -45,7 +45,7 @@ from agent_sdk.agents import BaseAgent
 
 # Local tools only
 agent = BaseAgent(tools=[my_tool], system_prompt="...", provider="groq")
-result = await agent.arun("Hello", session_id="abc")
+result = await agent.arun("Hello", session_id="abcd")
 
 # With remote MCP servers
 agent = BaseAgent(
