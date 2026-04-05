@@ -254,13 +254,15 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     return {"summary": response.content, "messages": delete_messages}
 
 
-async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float) -> list[ToolMessage]:
+async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, phase_tools: list | None = None) -> list[ToolMessage]:
+    _lookup = {**agent.tools_by_name, **({t.name: t for t in phase_tools} if phase_tools else {})}
+
     async def _execute(tool_call: dict) -> ToolMessage:
         name = tool_call["name"]
         args = tool_call.get("args", {})
         logger.info("Executing tool '%s' with args: %s", name, args)
 
-        tool = agent.tools_by_name[name]
+        tool = _lookup[name]
         breaker = agent._get_breaker(name)
 
         if breaker.is_open:
@@ -1304,7 +1306,7 @@ async def comparative_analysis_node(agent, state) -> dict:
             messages.append(response)
             
             timeout = getattr(state, "tool_timeout", 120.0)
-            tool_results = await _execute_tool_calls(agent, response.tool_calls, timeout)
+            tool_results = await _execute_tool_calls(agent, response.tool_calls, timeout, phase_tools=tools)
             messages.extend(tool_results)
             
         return "Analysis incomplete (exceeded iterations)"
