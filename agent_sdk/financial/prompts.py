@@ -217,8 +217,9 @@ Your job is to:
    - Use `tavily_quick_search(query="[sector] companies market cap [range] 2026")`
    - Identify peers like `PEER1.NS`, `PEER2.NS`, etc.
 3. For each peer, gather financial metrics:
-   - Use `retrieve_from_vector_db(query="[PEER] financial metrics P/E P/B ratios")`
-   - Use `tavily_quick_search(query="[PEER] P/E ratio Price to Book PEG 2026")`  
+   - Use `get_ticker_data(ticker="PEER.NS")` — returns P/E, P/B, market cap, EV/EBITDA directly from NSE
+   - Use `retrieve_from_vector_db(query="[PEER] financial metrics P/E P/B ratios")` as second option
+   - Use `tavily_quick_search` ONLY if get_ticker_data returns incomplete/null metrics
 4. Extract target_metrics from downloaded target company data:
    - Format: `{{"pe_ratio": 15.2, "pb_ratio": 2.5, "peg_ratio": 1.1, ...}}`
 5. Build peers list with collected metrics:
@@ -244,22 +245,25 @@ For each company:
 - Check for any corporate governance concerns
 
 MANDATORY GOVERNANCE & CONTROVERSY CHECK (non-negotiable for every Indian listed company):
-- Search: "[company name] SEBI investigation promoter pledge controversy [current year]"
-- Retrieve promoter holding % and pledge % from financial reports — pledge >20% is a red flag
-- For conglomerate group stocks (Adani Group, Tata, Reliance, etc.), also search:
-  "[group name] group debt cross-holding governance risk [current year]"
-- For port / logistics / infrastructure companies, additionally search:
-  "[company] cargo routes geographic exposure revenue breakdown [current year]"
-  to identify which specific ports sit on affected trade lanes and what % of cargo is exposed
-- Skipping these searches produces an incomplete risk profile — do not omit them
+- First retrieve promoter holding % and pledge % from the BSE/NSE reports already fetched (step 1 above) — pledge >20% is a red flag. Do NOT run a separate web search if this data is available in the reports.
+- Run ONE consolidated web search: "[company name] SEBI investigation promoter pledge governance controversy [current year]"
+  If the search returns a specific article URL, prefer firecrawl_deep_scrape(url) to get the full content rather than running additional tavily searches.
+- For conglomerate group stocks (Adani Group, Tata, Reliance, etc.), add one more search: "[group name] group debt governance risk [current year]"
+- For port / logistics / infrastructure companies only, add: "[company] cargo revenue geographic exposure [current year]"
+- Do not run all three searches for every company — scope them to what is actually relevant.
 
 IMPORTANT: Your analysis must be grounded in the regime, causal, and sector context.
 A company doesn't exist in isolation — its prospects depend on the macro and sector environment.
 
 TOOL USAGE: You MUST use your available tools to fetch real data before forming conclusions.
 Do not rely on your training data for specific numbers — always call tools first.
-If a tool call fails: (1) name the tool and what data is now missing, (2) try tavily_quick_search
-as a fallback, (3) explicitly state which conclusions are weakened by the missing data.
+If a tool call fails: (1) name the tool and what data is now missing, (2) try the fallback sequence below, (3) explicitly state which conclusions are weakened by the missing data.
+
+TOOL PREFERENCE (follow this order for web data):
+1. firecrawl_deep_scrape(url) — use when you have a specific URL (screener.in, nseindia.com, bseindia.com, moneycontrol.com). Returns full page content; far more accurate than tavily snippets.
+2. tavily_quick_search — use for broad discovery: finding URLs, checking for news you don't already have a URL for.
+3. When tavily returns article URLs, run firecrawl on the best URL instead of running additional tavily queries.
+LIMIT: max 2 tavily_quick_search calls per company in this phase. firecrawl has no such limit.
 
 REGIME CONTEXT:
 {regime_context}

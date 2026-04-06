@@ -1268,6 +1268,50 @@ def _run_phase_validation(state) -> list[str]:
     return warnings
 
 
+_LARGE_RESULT_THRESHOLD = 8_000  # chars; results larger than this are distilled immediately
+
+
+async def _summarize_large_tool_result(agent, tool_result, tool_name: str, entity: str, timeout: float):
+    """
+    Distill a single large tool result to key financial facts right after it arrives,
+    before it is appended to the message history. This keeps per-iteration context
+    bounded so the global compressor never receives an input that exceeds model limits.
+    All numerical values are explicitly preserved in the summariser prompt.
+    """
+    import asyncio
+    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+
+    content = getattr(tool_result, "content", "") or ""
+    if len(content) < _LARGE_RESULT_THRESHOLD:
+        return tool_result
+
+    summarizer = agent.summarizer or agent.llm
+    prompt = [
+        SystemMessage(content=(
+            f"The following is raw financial data for {entity} retrieved via '{tool_name}'. "
+            "Extract and preserve ALL key metrics verbatim: revenue, profit, margins (OPM/NPM/EBITDA%), "
+            "P/E, P/B, EV/EBITDA, ROE, ROCE, debt/equity, FCF, promoter holding%, pledge%, "
+            "dividend yield, capex, working capital, and any guidance or commentary. "
+            "Format as a structured bullet-point summary. Do NOT drop any numerical values."
+        )),
+        HumanMessage(content=content),
+    ]
+    try:
+        resp = await asyncio.wait_for(summarizer.ainvoke(prompt), timeout=timeout)
+        summary = resp.content if hasattr(resp, "content") else str(resp)
+        logger.info(
+            "Pre-compressed large tool result '%s' for '%s': %d → %d chars",
+            tool_name, entity, len(content), len(summary),
+        )
+        return ToolMessage(content=summary, tool_call_id=tool_result.tool_call_id)
+    except Exception:
+        logger.warning(
+            "Pre-compression failed for tool '%s' / entity '%s' — using original result",
+            tool_name, entity,
+        )
+        return tool_result
+
+
 async def _compress_entity_messages(agent, messages: list, entity: str, timeout: float) -> list:
     """
     Summarize intermediate tool results in the analyze_entity message list to prevent
@@ -1324,8 +1368,15 @@ async def _compress_entity_messages(agent, messages: list, entity: str, timeout:
         compressed.extend(tail)
         return compressed
     except Exception:
-        logger.warning("Context compression failed for entity '%s' — proceeding with full context", entity)
-        return messages
+        logger.warning(
+            "Context compression failed for entity '%s' — hard-truncating to last 3 rounds",
+            entity,
+        )
+        # Keep SystemMessage + last 3 AI+tool rounds (≈12 messages) to stay within limits
+        keep = body[-12:]
+        if has_system:
+            return [system_msg] + keep
+        return keep
 
 
 async def comparative_analysis_node(agent, state) -> dict:
@@ -1360,6 +1411,7 @@ async def comparative_analysis_node(agent, state) -> dict:
         # Isolated tool loop for this entity
         llm_timeout = getattr(state, "tool_timeout", 120.0)
         seen_tool_calls: dict[tuple, str] = {}  # (name, args_key) → cached result
+        compression_failures = 0
 
         for _ in range(8):
             try:
@@ -1387,23 +1439,43 @@ async def comparative_analysis_node(agent, state) -> dict:
                 else:
                     deduped_calls.append(tc)
 
-            fresh_results = []
+            fresh_results: list = []
             if deduped_calls:
-                fresh_results = await _execute_tool_calls(agent, deduped_calls, tool_timeout, phase_tools=tools)
+                raw_results = await _execute_tool_calls(agent, deduped_calls, tool_timeout, phase_tools=tools)
+                # Distill large results immediately to prevent context bloat
+                fresh_results = list(await asyncio.gather(*(
+                    _summarize_large_tool_result(agent, tr, tc["name"], entity, llm_timeout)
+                    for tc, tr in zip(deduped_calls, raw_results)
+                )))
                 for tc, tr in zip(deduped_calls, fresh_results):
                     key = (tc["name"], str(sorted(tc.get("args", {}).items())))
                     seen_tool_calls[key] = tr.content
 
             messages.extend(fresh_results + cached_msgs)
 
-            # Compress if context is approaching the model's limit
+            # Compress if context is still approaching the model's limit (safety net)
             phase_token_limit = int(getattr(state, "max_context_tokens", 32768) * 0.70)
             if _estimate_token_count(messages) > phase_token_limit:
+                before_len = len(messages)
                 logger.info(
                     "Entity '%s' context approaching limit (%d est. tokens) — compressing",
                     entity, _estimate_token_count(messages),
                 )
                 messages = await _compress_entity_messages(agent, messages, entity, llm_timeout)
+                if len(messages) >= before_len:
+                    compression_failures += 1
+                    if compression_failures >= 2:
+                        logger.warning(
+                            "Entity '%s' — breaking loop after %d consecutive compression failures",
+                            entity, compression_failures,
+                        )
+                        for msg in reversed(messages):
+                            if (hasattr(msg, "content") and msg.content
+                                    and not getattr(msg, "tool_calls", None)):
+                                return msg.content
+                        return f"Analysis partial — context limit reached for {entity}"
+                else:
+                    compression_failures = 0
 
         return "Analysis incomplete (exceeded iterations)"
 
