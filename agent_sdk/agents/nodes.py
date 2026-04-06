@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Literal, Sequence
 
@@ -11,8 +12,15 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from langgraph.graph import END
 
 from agent_sdk.agents.state import AgentState
+from agent_sdk.config import settings
+from agent_sdk.mcp.exceptions import MCPSessionError
+from agent_sdk.metrics import llm_call_duration, tool_call_duration, raw_fallback_total
 
 logger = logging.getLogger("agent_sdk.nodes")
+
+# Pre-compiled regexes — defined once at import time, not per-call
+_MALFORMED_TOOL_PATTERN = re.compile(r'<function=(\w+)(.*?)</function>', re.DOTALL)
+_JSON_FENCE_PATTERN = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
 
 # Tools that belong to the research agent and must never appear in financial analyst phases
 _RESEARCH_ONLY_TOOLS = frozenset({
@@ -29,8 +37,7 @@ def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
     into a list of structured tool call dicts.
     Returns None if parsing fails.
     """
-    pattern = r'<function=(\w+)(.*?)</function>'
-    matches = re.findall(pattern, failed_generation, re.DOTALL)
+    matches = _MALFORMED_TOOL_PATTERN.findall(failed_generation)
 
     if not matches:
         return None
@@ -132,10 +139,14 @@ async def llm_call(agent, state: AgentState) -> dict:
         prompt = list(state.messages)
 
     try:
+        _t0 = time.monotonic()
         if hasattr(llm_with_tools, "ainvoke"):
             response = await llm_with_tools.ainvoke(prompt)
         else:
             response = llm_with_tools.invoke(prompt)
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        _phase = getattr(state, "current_phase", None) or "standard"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase=_phase).observe(time.monotonic() - _t0)
     except Exception as e:
         # Handle malformed tool calls from Groq (and similar providers)
         # The model generates text like <function=name{...}</function> instead of
@@ -276,6 +287,7 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
             )
 
         try:
+            _tool_t0 = time.monotonic()
             if hasattr(tool, "ainvoke"):
                 observation = await tool.ainvoke(args)
             elif hasattr(tool, "arun"):
@@ -286,6 +298,7 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                     tool.invoke if hasattr(tool, "invoke") else tool.run, args
                 )
             breaker.record_success()
+            tool_call_duration.labels(agent="sdk", tool_name=name).observe(time.monotonic() - _tool_t0)
             logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
         except Exception:
             breaker.record_failure(name)
@@ -315,9 +328,8 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                 for tc in tool_calls
             ]
         else:
-            # Check if this is an MCP session termination error
-            error_msg = str(e).lower()
-            if "session terminated" in error_msg or "session" in error_msg and "closed" in error_msg:
+            # Check if this is an MCP session termination error (typed exception from mcp/client.py)
+            if isinstance(e, MCPSessionError):
                 logger.warning("MCP session dropped — attempting reconnect and retry")
                 if agent._mcp_manager is not None:
                     new_tools = await agent._mcp_manager.reconnect()
@@ -348,7 +360,7 @@ async def tool_node(agent, state: AgentState) -> dict:
 
     last_message = state.messages[-1]
     tool_calls = getattr(last_message, "tool_calls", None) or []
-    timeout = getattr(state, "tool_timeout", 120.0)
+    timeout = state.tool_timeout
 
     results = await _execute_tool_calls(agent, tool_calls, timeout)
 
@@ -455,6 +467,39 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
 # analysis. Each node represents one analytical phase with its own system
 # prompt, tool set, and structured output schema.
 # ============================================================================
+
+
+def _build_phase_return(
+    response,
+    data_key: str,
+    data: dict,
+    state,
+    phase_name: str,
+    extra: dict | None = None,
+) -> dict:
+    """
+    Shared helper for all financial pipeline phase nodes.
+
+    Builds the standard state-update dict for a completed phase, handling the
+    JSON-fallback pattern that was previously copy-pasted across 5+ nodes.
+    If *data* is falsy the phase fell back to raw text — increment the fallback
+    counter and log a warning so operators can detect degraded analysis.
+    """
+    fallback_inc = 0
+    if not data:
+        logger.warning("%s fell back to raw_analysis — LLM did not return parseable JSON", phase_name)
+        fallback_inc = 1
+        raw_fallback_total.labels(phase=phase_name).inc()
+    result: dict = {
+        "messages": [response],
+        data_key: data if data else {"raw_analysis": response.content},
+        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
+        "iteration": state.iteration + 1,
+        "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
+    }
+    if extra:
+        result.update(extra)
+    return result
 
 async def financial_initialize(state) -> dict:
     """Initialize the financial reasoning pipeline."""
@@ -619,13 +664,7 @@ async def regime_assessment_node(agent, state) -> dict:
     # Phase complete — extract structured regime context from response
     regime_data = _extract_json(response.content) or {}
     logger.info("Regime assessment complete: %s", regime_data.get("market_regime", "unknown"))
-
-    return {
-        "messages": [response],
-        "regime_context": regime_data if regime_data else {"raw_assessment": response.content},
-        "iteration": state.iteration + 1,
-        "phase_iterations": {"regime_assessment": state.phase_iterations.get("regime_assessment", 0) + 1}
-    }
+    return _build_phase_return(response, "regime_context", regime_data, state, "regime_assessment")
 
 
 async def causal_analysis_node(agent, state) -> dict:
@@ -658,17 +697,7 @@ async def causal_analysis_node(agent, state) -> dict:
         }
 
     causal_data = _extract_json(response.content) or {}
-    fallback_inc = 0
-    if not causal_data:
-        logger.warning("causal_analysis fell back to raw_analysis — LLM did not return parseable JSON")
-        fallback_inc = 1
-    return {
-        "messages": [response],
-        "causal_analysis": causal_data if causal_data else {"raw_analysis": response.content},
-        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
-        "iteration": state.iteration + 1,
-        "phase_iterations": {"causal_analysis": state.phase_iterations.get("causal_analysis", 0) + 1}
-    }
+    return _build_phase_return(response, "causal_analysis", causal_data, state, "causal_analysis")
 
 
 async def sector_analysis_node(agent, state) -> dict:
@@ -698,17 +727,7 @@ async def sector_analysis_node(agent, state) -> dict:
         }
 
     sector_data = _extract_json(response.content) or {}
-    fallback_inc = 0
-    if not sector_data:
-        logger.warning("sector_analysis fell back to raw_analysis — LLM did not return parseable JSON")
-        fallback_inc = 1
-    return {
-        "messages": [response],
-        "sector_findings": sector_data if sector_data else {"raw_analysis": response.content},
-        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
-        "iteration": state.iteration + 1,
-        "phase_iterations": {"sector_analysis": state.phase_iterations.get("sector_analysis", 0) + 1}
-    }
+    return _build_phase_return(response, "sector_findings", sector_data, state, "sector_analysis")
 
 
 async def company_analysis_node(agent, state) -> dict:
@@ -739,25 +758,14 @@ async def company_analysis_node(agent, state) -> dict:
         }
 
     company_data = _extract_json(response.content) or {}
-    fallback_inc = 0
-    if not company_data:
-        logger.warning(
-            "company_analysis fell back to raw_analysis — LLM did not return parseable JSON. "
-            "Raw output (first 500 chars): %s", response.content[:500]
-        )
-        fallback_inc = 1
 
     # Run symbolic validation on company analysis so warnings reach the risk phase
     company_warnings = _run_phase_validation(state)
 
-    return {
-        "messages": [response],
-        "company_analysis": company_data if company_data else {"raw_analysis": response.content},
-        "validation_warnings": state.validation_warnings + company_warnings,
-        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
-        "iteration": state.iteration + 1,
-        "phase_iterations": {"company_analysis": state.phase_iterations.get("company_analysis", 0) + 1}
-    }
+    return _build_phase_return(
+        response, "company_analysis", company_data, state, "company_analysis",
+        extra={"validation_warnings": state.validation_warnings + company_warnings},
+    )
 
 
 async def risk_assessment_node(agent, state) -> dict:
@@ -799,18 +807,10 @@ async def risk_assessment_node(agent, state) -> dict:
     validation_warnings = _run_phase_validation(state)
 
     risk_data = _extract_json(response.content) or {}
-    fallback_inc = 0
-    if not risk_data:
-        logger.warning("risk_assessment fell back to raw_analysis — LLM did not return parseable JSON")
-        fallback_inc = 1
-    return {
-        "messages": [response],
-        "risk_assessment": risk_data if risk_data else {"raw_analysis": response.content},
-        "validation_warnings": state.validation_warnings + validation_warnings,
-        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
-        "iteration": state.iteration + 1,
-        "phase_iterations": {"risk_assessment": state.phase_iterations.get("risk_assessment", 0) + 1}
-    }
+    return _build_phase_return(
+        response, "risk_assessment", risk_data, state, "risk_assessment",
+        extra={"validation_warnings": state.validation_warnings + validation_warnings},
+    )
 
 
 async def synthesis_node(agent, state) -> dict:
@@ -857,7 +857,10 @@ async def synthesis_node(agent, state) -> dict:
     synthesis_data = _extract_json(response.content) or {}
     
     base_confidence = 10.0
-    penalty = (len(state.validation_warnings) * 1.0) + (state.raw_fallback_count * 1.5)
+    penalty = (
+        len(state.validation_warnings) * settings.confidence_penalty_per_warning
+        + state.raw_fallback_count * settings.confidence_penalty_per_fallback
+    )
     confidence_score = max(1.0, round(base_confidence - penalty, 1))
 
     factors = []
@@ -973,9 +976,9 @@ def financial_should_continue(phase_name: str, state) -> str:
     last_message = state.messages[-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
     
-    # Check per-phase budget first (if configured) — use getattr for Pydantic
-    phase_budgets = getattr(state, "phase_iteration_budgets", {})
-    phase_count = getattr(state, "phase_iterations", {}).get(phase_name, 0)
+    # Check per-phase budget first
+    phase_budgets = state.phase_iteration_budgets
+    phase_count = state.phase_iterations.get(phase_name, 0)
     
     if phase_budgets:
         phase_limit = phase_budgets.get(phase_name, 3)
@@ -990,8 +993,8 @@ def financial_should_continue(phase_name: str, state) -> str:
             return "phase_advance"
     
     # Global safety check (fallback)
-    if getattr(state, "iteration", 0) >= getattr(state, "max_iterations", 10):
-        logger.warning("Global iteration limit reached in phase %s (global budget: %d)", phase_name, getattr(state, "max_iterations", 10))
+    if state.iteration >= state.max_iterations:
+        logger.warning("Global iteration limit reached in phase %s (global budget: %d)", phase_name, state.max_iterations)
         if has_tool_calls:
             logger.warning(
                 "Phase %s hit global iteration limit with pending tool_calls — routing to tool_node to clear them",
@@ -1136,8 +1139,6 @@ def _format_context(data: dict | None) -> str:
 
 def _extract_json(text: str) -> dict | None:
     """Try to extract a JSON object from LLM text output."""
-    import json
-
     # Try the whole text as JSON
     try:
         return json.loads(text)
@@ -1145,9 +1146,7 @@ def _extract_json(text: str) -> dict | None:
         pass
 
     # Try to find JSON block in markdown code fences
-    import re
-    json_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
-    matches = re.findall(json_pattern, text, re.DOTALL)
+    matches = _JSON_FENCE_PATTERN.findall(text)
     for match in matches:
         try:
             return json.loads(match.strip())
@@ -1268,7 +1267,7 @@ def _run_phase_validation(state) -> list[str]:
     return warnings
 
 
-_LARGE_RESULT_THRESHOLD = 8_000  # chars; results larger than this are distilled immediately
+_LARGE_RESULT_THRESHOLD = settings.large_result_threshold  # chars; results larger than this are distilled immediately
 
 
 async def _summarize_large_tool_result(agent, tool_result, tool_name: str, entity: str, timeout: float):
@@ -1281,7 +1280,8 @@ async def _summarize_large_tool_result(agent, tool_result, tool_name: str, entit
     import asyncio
     from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
-    content = getattr(tool_result, "content", "") or ""
+    content = tool_result.content if hasattr(tool_result, "content") else ""
+    content = content or ""
     if len(content) < _LARGE_RESULT_THRESHOLD:
         return tool_result
 
@@ -1409,7 +1409,7 @@ async def comparative_analysis_node(agent, state) -> dict:
         messages = [SystemMessage(content=prompt_template)]
         
         # Isolated tool loop for this entity
-        llm_timeout = getattr(state, "tool_timeout", 120.0)
+        llm_timeout = state.tool_timeout
         seen_tool_calls: dict[tuple, str] = {}  # (name, args_key) → cached result
         compression_failures = 0
 
@@ -1429,7 +1429,7 @@ async def comparative_analysis_node(agent, state) -> dict:
             messages.append(response)
 
             # Deduplicate tool calls — return cached result for identical (name, args) pairs
-            tool_timeout = getattr(state, "tool_timeout", 120.0)
+            tool_timeout = state.tool_timeout
             deduped_calls, cached_msgs = [], []
             for tc in response.tool_calls:
                 key = (tc["name"], str(sorted(tc.get("args", {}).items())))
@@ -1454,7 +1454,7 @@ async def comparative_analysis_node(agent, state) -> dict:
             messages.extend(fresh_results + cached_msgs)
 
             # Compress if context is still approaching the model's limit (safety net)
-            phase_token_limit = int(getattr(state, "max_context_tokens", 32768) * 0.70)
+            phase_token_limit = int(state.max_context_tokens * 0.70)
             if _estimate_token_count(messages) > phase_token_limit:
                 before_len = len(messages)
                 logger.info(

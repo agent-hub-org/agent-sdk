@@ -11,9 +11,15 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from agent_sdk.config import settings
+from agent_sdk.mcp.exceptions import MCPSessionError
+
 logger = logging.getLogger("agent_sdk.mcp")
 
-MAX_RETRIES = 5
+# Keywords in exception messages that indicate a session-termination event.
+# Using MCPSessionError wrapping is preferred; this set is the fallback for
+# exceptions that originate inside the MCP library before we can intercept them.
+_SESSION_TERMINATED_HINTS = frozenset({"session terminated", "session closed", "eof", "connection reset"})
 
 _STREAMABLE_HTTP_TRANSPORTS = frozenset({"streamable_http", "streamable-http", "http"})
 
@@ -46,7 +52,8 @@ class MCPConnectionManager:
         server_configs = self._server_configs
         logger.info("Connecting to %d MCP server(s): %s", len(server_configs), list(server_configs.keys()))
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        max_retries = settings.mcp_max_retries
+        for attempt in range(1, max_retries + 1):
             try:
                 self._client = MultiServerMCPClient(server_configs)
                 self._exit_stack = AsyncExitStack()
@@ -78,13 +85,13 @@ class MCPConnectionManager:
                 return all_tools
             except Exception as e:
                 await self._cleanup()
-                if attempt < MAX_RETRIES:
+                if attempt < max_retries:
                     delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0, 1))
                     logger.warning("MCP connection attempt %d/%d failed: %s — retrying in %.2fs",
-                                   attempt, MAX_RETRIES, e, delay)
+                                   attempt, max_retries, e, delay)
                     await asyncio.sleep(delay)
                 else:
-                    logger.error("MCP connection failed after %d attempts: %s", MAX_RETRIES, e)
+                    logger.error("MCP connection failed after %d attempts: %s", max_retries, e)
                     raise
 
     async def _create_streamable_http_session(self, config: dict[str, Any]) -> ClientSession:
@@ -131,6 +138,12 @@ class MCPConnectionManager:
                 logger.exception("Error closing MCP sessions")
             self._exit_stack = None
         self._client = None
+
+    @staticmethod
+    def _is_session_error(exc: Exception) -> bool:
+        """Return True if *exc* looks like an MCP session-termination error."""
+        msg = str(exc).lower()
+        return any(hint in msg for hint in _SESSION_TERMINATED_HINTS)
 
     async def disconnect(self):
         """Cleanly close all persistent MCP sessions."""

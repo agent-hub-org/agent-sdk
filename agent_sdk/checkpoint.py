@@ -25,6 +25,8 @@ from pymongo.asynchronous.mongo_client import AsyncMongoClient
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.operations import UpdateOne
 
+from agent_sdk.config import settings
+
 logger = logging.getLogger("agent_sdk.checkpoint")
 
 
@@ -58,8 +60,8 @@ class AsyncMongoDBSaver(MongoDBSaver):
         # Sync client passed to parent for inherited sync methods
         sync_client = MongoClient(
             conn_string,
-            serverSelectionTimeoutMS=5000,
-            socketTimeoutMS=30000,
+            serverSelectionTimeoutMS=settings.checkpoint_selection_timeout_ms,
+            socketTimeoutMS=settings.checkpoint_socket_timeout_ms,
         )
         super().__init__(
             client=sync_client,
@@ -73,8 +75,8 @@ class AsyncMongoDBSaver(MongoDBSaver):
         # Async client for all overridden async methods
         async_client = AsyncMongoClient(
             conn_string,
-            serverSelectionTimeoutMS=5000,
-            socketTimeoutMS=30000,
+            serverSelectionTimeoutMS=settings.checkpoint_selection_timeout_ms,
+            socketTimeoutMS=settings.checkpoint_socket_timeout_ms,
         )
         async_db = async_client[db_name]
         self._async_checkpoints = async_db[checkpoint_collection_name]

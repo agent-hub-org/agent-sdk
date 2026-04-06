@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 
+from agent_sdk.config import settings
+
 
 def merge_dicts(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
     """Simple dictionary merger for state fields."""
@@ -21,20 +23,20 @@ class AgentState(BaseModel):
     system_prompt: Optional[str] = None
 
     # maximum allowed tokens before summarization
-    max_context_tokens: int = 32768
+    max_context_tokens: int = Field(default_factory=lambda: settings.max_context_tokens)
 
     # enable automatic summarization
     enable_summarization: bool = True
 
     # number of recent messages to keep
-    keep_last_n_messages: int = 15
+    keep_last_n_messages: int = Field(default_factory=lambda: settings.keep_last_n_messages)
 
     # dynamic model override — if set, llm_call uses this model instead of agent.llm
     model_id: Optional[str] = None
 
     # autonomous agent configuration
     max_iterations: int = Field(
-        default=10,
+        default_factory=lambda: settings.max_iterations,
         description="Maximum number of reasoning/tool-use iterations before forcing a stop.",
     )
     iteration: int = Field(
@@ -42,7 +44,7 @@ class AgentState(BaseModel):
         description="Current iteration count for the autonomous agent loop.",
     )
     tool_timeout: float = Field(
-        default=120.0,
+        default_factory=lambda: settings.tool_timeout,
         description="Maximum seconds to wait for a single batch of tool calls before timing out.",
     )
 

@@ -4,6 +4,8 @@ from typing import Optional
 
 from mem0 import MemoryClient
 
+from agent_sdk.config import settings
+
 logger = logging.getLogger("agent_sdk.database.memory")
 
 _client: Optional[MemoryClient] = None
@@ -20,7 +22,7 @@ def _get_client() -> MemoryClient:
     return _client
 
 
-_MEMORY_SCORE_THRESHOLD = 0.70  # only inject memories with at least 70% semantic relevance
+_MEMORY_SCORE_THRESHOLD = settings.memory_score_threshold
 
 
 def get_memories(user_id: str, query: str) -> tuple[list[str], str | None]:
@@ -35,10 +37,10 @@ def get_memories(user_id: str, query: str) -> tuple[list[str], str | None]:
             query=query,
             version="v2",
             filters={"user_id": user_id},
-            limit=5,
+            limit=settings.memory_max_results,
         )
         memories = [
-            r["memory"][:300]
+            r["memory"][:settings.memory_truncate_chars]
             for r in results.get("results", [])
             if r.get("memory") and r.get("score", 0) >= _MEMORY_SCORE_THRESHOLD
         ]
