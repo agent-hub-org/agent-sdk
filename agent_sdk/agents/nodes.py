@@ -1941,14 +1941,18 @@ async def synthesizer(agent, state: AgentState) -> dict:
 # ============================================================================
 
 _FINANCIAL_PHASE_PLANNER_PREFIX = """\
-PLANNING STEP — DO NOT ANALYZE YET.
+PLANNING STEP — DO NOT ANALYZE YET. DO NOT write explanations, markdown, or ask questions.
 
-Your task is to list ALL tool calls required for this phase of the analysis.
+Your ONLY task is to output a JSON list of tool calls needed for this phase.
 The calls will be executed in parallel and their results returned to you for synthesis.
+
+AUTONOMY RULE: Make all decisions yourself — never ask the user for clarification.
+- For Indian companies where NSE/BSE is not specified, default to NSE (ticker.NS suffix).
+- If a ticker is ambiguous, pick the most likely one and proceed.
 
 {tool_catalog}
 
-Output ONLY valid JSON — no explanation:
+OUTPUT RULE (overrides any other format instruction): Output ONLY valid JSON — no explanation, no markdown:
 {{"calls": [{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...]}}
 
 If no tool calls are needed, output: {{"calls": []}}
@@ -2005,8 +2009,8 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     prompt = _build_phase_prompt(state, phase_prompt)
-    # Replace system message with planning-focused system prompt
-    prompt[0] = SystemMessage(content=planning_prompt + "\n\n" + phase_prompt)
+    # Phase prompt first, then planning constraints last so JSON-only rule takes precedence
+    prompt[0] = SystemMessage(content=phase_prompt + "\n\n" + planning_prompt)
 
     logger.info("financial_phase_planner: planning %s phase", phase_name)
     try:
