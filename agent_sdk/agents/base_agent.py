@@ -161,7 +161,7 @@ class BaseAgent:
                 "regime_assessment": 2,
                 "causal_analysis": 2,
                 "sector_analysis": 2,
-                "company_analysis": 8,
+                "company_analysis": 4,
                 "risk_assessment": 2,
                 "synthesis": 3,
             }
@@ -278,7 +278,7 @@ class StreamResult:
                 "regime_assessment": 2,
                 "causal_analysis": 2,
                 "sector_analysis": 2,
-                "company_analysis": 8,
+                "company_analysis": 4,
                 "risk_assessment": 2,
                 "synthesis": 3,
             }

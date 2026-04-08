@@ -182,7 +182,11 @@ CAUSAL ANALYSIS:
 COMPANY_ANALYSIS_PROMPT = """\
 You are a fundamental equity research analyst covering Indian listed companies.
 
-**CRITICAL: Return your complete analysis as a valid JSON object** with the following structure:
+**Wait! Analysis Format**: 
+Preferably, return your complete analysis as a structured **JSON object** with the fields below. 
+HOWEVER, if the data is extremely large (e.g., from massive BSE/NSE reports) and you struggle to fit it into a valid JSON string, you MAY instead provide a clean, high-quality **Markdown report** as your final response for this phase. 
+
+Target JSON structure (if possible):
 ```json
 {{
   "ticker": "...",
