@@ -912,7 +912,19 @@ async def synthesis_node(agent, state) -> dict:
     prompt = _build_phase_prompt(state, prompt_template)
 
     # Synthesis doesn't use tools — it's a pure reasoning step
-    response = await llm.ainvoke(prompt)
+    _synthesis_timeout = state.tool_timeout  # 120s default
+    try:
+        response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=_synthesis_timeout)
+    except asyncio.TimeoutError:
+        logger.error("Synthesis LLM call timed out after %.0fs", _synthesis_timeout)
+        fallback_content = "Analysis timed out during synthesis. Please try a simpler or more specific query."
+        return {
+            "messages": [AIMessage(content=fallback_content)],
+            "synthesis_report": {"full_report": fallback_content},
+            "overall_confidence": 1.0,
+            "iteration": state.iteration + 1,
+            "phase_iterations": {"synthesis": state.phase_iterations.get("synthesis", 0) + 1},
+        }
 
     synthesis_data = _extract_json(response.content) or {}
     
@@ -1483,7 +1495,7 @@ async def comparative_analysis_node(agent, state) -> dict:
         seen_tool_calls: dict[tuple, str] = {}  # (name, args_key) → cached result
         compression_failures = 0
 
-        for _ in range(8):
+        for _ in range(5):
             try:
                 response = await asyncio.wait_for(
                     llm_with_tools.ainvoke(messages),
@@ -1549,8 +1561,20 @@ async def comparative_analysis_node(agent, state) -> dict:
 
         return "Analysis incomplete (exceeded iterations)"
 
-    # Execute entity analyses in parallel
-    results = await asyncio.gather(*(analyze_entity(e) for e in entities))
+    # Execute entity analyses in parallel with a wall-clock budget per entity
+    _entity_budget = state.tool_timeout * 1.5  # e.g. 120s × 1.5 = 180s per entity
+
+    async def _bounded_analyze(e: str) -> str:
+        try:
+            return await asyncio.wait_for(analyze_entity(e), timeout=_entity_budget)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Entity '%s' hit wall-clock budget (%.0fs) — returning partial analysis", e, _entity_budget
+            )
+            return f"Analysis budget exceeded for {e} — partial data only."
+
+    results = await asyncio.gather(*(_bounded_analyze(e) for e in entities))
+    logger.info("Comparative analysis complete — %d entities processed", len(entities))
     
     combined_content = ""
     for entity, res in zip(entities, results):
