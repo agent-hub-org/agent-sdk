@@ -1219,13 +1219,48 @@ def _format_context(data: dict | None) -> str:
         return str(data)
 
 
+def _fix_json_control_chars(s: str) -> str:
+    """Escape literal \\n/\\r/\\t inside JSON string values.
+
+    LLMs sometimes emit raw newlines inside JSON string values instead of the
+    required \\n escape sequences, causing json.loads to fail.  This helper
+    walks the string character-by-character and fixes those characters only
+    when inside a quoted JSON string context.
+    """
+    out: list[str] = []
+    in_string = False
+    escape_next = False
+    for ch in s:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+        elif ch == '\\':
+            out.append(ch)
+            escape_next = True
+        elif ch == '"':
+            out.append(ch)
+            in_string = not in_string
+        elif in_string and ch == '\n':
+            out.append('\\n')
+        elif in_string and ch == '\r':
+            out.append('\\r')
+        elif in_string and ch == '\t':
+            out.append('\\t')
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
 def _extract_json(text: str) -> dict | None:
     """Try to extract a JSON object from LLM text output."""
     # Try the whole text as JSON
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        pass
+        try:
+            return json.loads(_fix_json_control_chars(text))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     # Try to find JSON block in markdown code fences
     matches = _JSON_FENCE_PATTERN.findall(text)
@@ -1233,7 +1268,10 @@ def _extract_json(text: str) -> dict | None:
         try:
             return json.loads(match.strip())
         except json.JSONDecodeError:
-            continue
+            try:
+                return json.loads(_fix_json_control_chars(match.strip()))
+            except json.JSONDecodeError:
+                continue
 
     # Try to find JSON objects in the text — collect all valid candidates,
     # then return the one with the most keys (most likely the intended phase output).
@@ -1253,7 +1291,12 @@ def _extract_json(text: str) -> dict | None:
                     if isinstance(obj, dict):
                         candidates.append(obj)
                 except json.JSONDecodeError:
-                    pass
+                    try:
+                        obj = json.loads(_fix_json_control_chars(text[start:i + 1]))
+                        if isinstance(obj, dict):
+                            candidates.append(obj)
+                    except json.JSONDecodeError:
+                        pass
                 start = None
     if candidates:
         return max(candidates, key=lambda x: len(x))
@@ -1649,7 +1692,7 @@ def _format_tool_catalog(tools: list) -> str:
         name = getattr(t, "name", str(t))
         desc = (getattr(t, "description", "") or "")[:120]
         try:
-            schema = t.get_input_schema().schema() if hasattr(t, "get_input_schema") else {}
+            schema = t.get_input_schema().model_json_schema() if hasattr(t, "get_input_schema") else {}
             props = schema.get("properties", {})
             required = set(schema.get("required", []))
             arg_parts = [
