@@ -136,11 +136,12 @@ class BaseAgent:
             self._mcp_manager = None
 
     async def arun(self, query: str, session_id: str = "default",
-                   system_prompt: str | None = None, model_id: str | None = None) -> dict:
+                   system_prompt: str | None = None, model_id: str | None = None,
+                   **kwargs) -> dict:
         await self._ensure_initialized()
 
-        logger.info("Agent run started — session='%s', query='%s', model_id='%s'",
-                    session_id, query[:100], model_id or "default")
+        logger.info("Agent run started — session='%s', query='%s', model_id='%s', extra_fields=%s",
+                    session_id, query[:100], model_id or "default", list(kwargs.keys()))
 
         invoke_input: dict[str, Any] = {
             "messages": [HumanMessage(content=query)],
@@ -149,6 +150,9 @@ class BaseAgent:
         }
         if model_id:
             invoke_input["model_id"] = model_id
+        
+        # Merge any extra state fields (e.g. as_of_date)
+        invoke_input.update(kwargs)
         
         # For financial_analyst mode, set up per-phase iteration budgets
         if self.mode == "financial_analyst":
@@ -214,7 +218,8 @@ class BaseAgent:
         return {"response": response, "steps": steps, "synthesis_report": structured}
 
     def astream(self, query: str, session_id: str = "default",
-                system_prompt: str | None = None, model_id: str | None = None):
+                system_prompt: str | None = None, model_id: str | None = None,
+                **kwargs):
         """Return a StreamResult that yields text chunks and tracks tool calls.
 
         Usage:
@@ -223,19 +228,20 @@ class BaseAgent:
                 # send chunk to client
             steps = stream.steps  # available after iteration completes
         """
-        return StreamResult(self, query, session_id, system_prompt or self.system_prompt, model_id)
+        return StreamResult(self, query, session_id, system_prompt or self.system_prompt, model_id, **kwargs)
 
 
 class StreamResult:
     """Async iterator that streams text chunks and collects execution steps."""
 
     def __init__(self, agent: "BaseAgent", query: str, session_id: str,
-                 system_prompt: str, model_id: str | None = None):
+                 system_prompt: str, model_id: str | None = None, **kwargs):
         self._agent = agent
         self._query = query
         self._session_id = session_id
         self._system_prompt = system_prompt
         self._model_id = model_id
+        self._extra_fields = kwargs
         self.steps: list[dict] = []
 
     def __aiter__(self):
@@ -261,6 +267,9 @@ class StreamResult:
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id
+        
+        # Merge any extra state fields (e.g. as_of_date)
+        stream_input.update(self._extra_fields)
 
         # For financial_analyst mode, set up per-phase iteration budgets
         if self._agent.mode == "financial_analyst":

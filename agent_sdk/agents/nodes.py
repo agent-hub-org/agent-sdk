@@ -632,6 +632,7 @@ async def classify_query_node(agent, state) -> dict:
         "current_phase": phases[0] if phases else "done",
         "iteration": state.iteration + 1,
         "phase_iterations": {"query_classification": 1},
+        "as_of_date": state.as_of_date,  # Persist as_of_date
     }
 
 
@@ -647,7 +648,7 @@ async def regime_assessment_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "regime_assessment")
     logger.info("regime_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt = _build_phase_prompt(state, REGIME_ASSESSMENT_PROMPT)
     response = await llm_with_tools.ainvoke(prompt)
@@ -679,7 +680,7 @@ async def causal_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "causal_analysis")
     logger.info("causal_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     # Inject prior phase context into prompt
     prompt_template = CAUSAL_ANALYSIS_PROMPT.format(
@@ -709,7 +710,7 @@ async def sector_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "sector_analysis")
     logger.info("sector_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = SECTOR_ANALYSIS_PROMPT.format(
         regime_context=_format_context(state.regime_context),
@@ -739,7 +740,7 @@ async def company_analysis_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
     logger.info("company_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = COMPANY_ANALYSIS_PROMPT.format(
         regime_context=_format_context(state.regime_context),
@@ -777,7 +778,7 @@ async def risk_assessment_node(agent, state) -> dict:
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "risk_assessment")
     logger.info("risk_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = RISK_ASSESSMENT_PROMPT.format(
         regime_context=_format_context(state.regime_context),
@@ -1072,11 +1073,21 @@ def _build_phase_prompt(state, phase_system_prompt: str) -> list:
     from datetime import datetime, timezone
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    year = datetime.now(timezone.utc).year
-    date_context = (
-        f"\n\nTODAY'S DATE: {today}\n"
-        f"Always include the current year ({year}) in search queries to get up-to-date results."
-    )
+    
+    # Override search year if a historical reference date is provided
+    if state.as_of_date:
+        year = state.as_of_date[:4]
+        date_context = (
+            f"\n\nTODAY'S DATE: {today}. HISTORICAL REFERENCE DATE: {state.as_of_date}\n"
+            f"Always include the historical year ({year}) in search queries to get results "
+            f"relevant to that specific point in time."
+        )
+    else:
+        year = datetime.now(timezone.utc).year
+        date_context = (
+            f"\n\nTODAY'S DATE: {today}\n"
+            f"Always include the current year ({year}) in search queries to get up-to-date results."
+        )
 
     messages = [SystemMessage(content=phase_system_prompt + date_context)]
 

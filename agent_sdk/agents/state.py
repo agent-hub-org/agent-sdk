@@ -124,6 +124,12 @@ class FinancialAnalysisState(AgentState):
         description="Calculated confidence score based on validation warnings and fallbacks.",
     )
 
+    # --- Context Injection ---
+    as_of_date: Optional[str] = Field(
+        default=None,
+        description="Historical reference date for the analysis (YYYY-MM-DD).",
+    )
+
     # --- Iteration Budget Control ---
     phase_iterations: Annotated[dict[str, int], merge_dicts] = Field(
         default_factory=dict,
