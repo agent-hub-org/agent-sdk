@@ -132,9 +132,39 @@ class Mem0MongoMemoryBackend(MemoryBackend):
             )
 
     async def get_snapshots(self, user_id: str, session_id: str) -> list[dict]:
-        """Return in-process cached snapshots for this session (no Mem0 round-trip)."""
+        """Return snapshots for this session.
+
+        Reads from the in-process cache first (fast path). On cache miss — e.g.
+        after a process restart — falls back to Mem0, repopulates the cache, and
+        returns the restored list so the episodic threshold counter is correct.
+        """
         key = f"{user_id}:{session_id}"
-        return list(self._session_snapshots.get(key, []))
+        cached = self._session_snapshots.get(key)
+        if cached:
+            return list(cached)
+
+        # Cache miss: reconstruct from Mem0 (process restart scenario)
+        try:
+            all_memories = await self._mem0_get_all(user_id=user_id)
+            snapshots = [
+                {"summary": r["memory"], "timestamp": r.get("created_at", "")}
+                for r in all_memories
+                if isinstance(r.get("metadata"), dict)
+                and r["metadata"].get("memory_type") == _TYPE_SNAPSHOT
+                and r["metadata"].get("session_id") == session_id
+                and r.get("memory")
+            ]
+            self._session_snapshots[key] = snapshots
+            logger.info(
+                "get_snapshots: restored %d snapshot(s) from Mem0 after cache miss (user=%s session=%s)",
+                len(snapshots), user_id, session_id,
+            )
+            return list(snapshots)
+        except Exception:
+            logger.exception(
+                "get_snapshots: Mem0 fallback failed — user=%s session=%s", user_id, session_id
+            )
+            return []
 
     async def reset_snapshots(self, user_id: str, session_id: str) -> None:
         """Clear the local cache after episodic compilation so the counter resets."""

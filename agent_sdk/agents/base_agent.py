@@ -79,7 +79,7 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
                  mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None,
-                 memory_manager=None):
+                 memory_manager=None, analytical_path: bool = True):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
@@ -109,6 +109,7 @@ class BaseAgent:
             "or respond directly when tools are not needed."
         )
 
+        self.analytical_path = analytical_path
         self._mcp_servers = mcp_servers
         self._mcp_manager = None
         self._initialized = False
@@ -179,6 +180,8 @@ class BaseAgent:
             "system_prompt": system_prompt or self.system_prompt,
             "iteration": 0,
             "session_id": session_id,
+            "enable_analytical_path": self.analytical_path,
+            "scratchpad": None,
         }
         if model_id:
             invoke_input["model_id"] = model_id
@@ -297,6 +300,8 @@ class StreamResult:
             "system_prompt": self._system_prompt,
             "iteration": 0,
             "session_id": self._session_id,
+            "enable_analytical_path": self._agent.analytical_path,
+            "scratchpad": None,
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id

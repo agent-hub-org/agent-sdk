@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
+from typing import Optional, Any
 
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger("agent_sdk.financial.quant_tools")
 
@@ -25,14 +25,22 @@ logger = logging.getLogger("agent_sdk.financial.quant_tools")
 class DCFInput(BaseModel):
     current_fcf_cr: float = Field(description="Current annual Free Cash Flow in crores")
     growth_rate_pct: float = Field(description="Expected FCF growth rate (%) for high-growth phase")
-    high_growth_years: int = Field(default=5, description="Number of years of high growth")
-    fade_rate_pct: float = Field(default=5.0, description="Growth rate (%) during fade period")
-    fade_years: int = Field(default=5, description="Number of fade years")
-    terminal_growth_pct: float = Field(default=4.0, description="Terminal perpetual growth rate (%)")
-    discount_rate_pct: float = Field(default=12.0, description="Weighted average cost of capital (%)")
-    net_debt_cr: float = Field(default=0, description="Net debt (debt - cash) in crores")
-    shares_outstanding_cr: float = Field(default=1.0, description="Shares outstanding in crores")
-    current_price: Optional[float] = Field(default=None, description="Current market price for upside calculation")
+    high_growth_years: int | None = Field(default=5, description="Number of years of high growth")
+    fade_rate_pct: float | None = Field(default=5.0, description="Growth rate (%) during fade period")
+    fade_years: int | None = Field(default=5, description="Number of fade years")
+    terminal_growth_pct: float | None = Field(default=4.0, description="Terminal perpetual growth rate (%)")
+    discount_rate_pct: float | None = Field(default=12.0, description="Weighted average cost of capital (%)")
+    net_debt_cr: float | None = Field(default=0, description="Net debt (debt - cash) in crores")
+    shares_outstanding_cr: float | None = Field(default=1.0, description="Shares outstanding in crores")
+    current_price: float | None = Field(default=None, description="Current market price for upside calculation")
+
+    @field_validator("high_growth_years", "fade_rate_pct", "fade_years", "terminal_growth_pct", 
+                     "discount_rate_pct", "net_debt_cr", "shares_outstanding_cr", mode="before")
+    @classmethod
+    def allow_none_for_numeric(cls, v: Any, info: Any) -> Any:
+        if v is not None:
+            return v
+        return cls.model_fields[info.field_name].default
 
 
 def run_dcf(**kwargs) -> dict:
@@ -348,7 +356,12 @@ def run_scenario_simulation(**kwargs) -> dict:
 
 class TechnicalSignalInput(BaseModel):
     prices: list[float] = Field(description="List of closing prices (most recent last)")
-    volumes: list[float] = Field(default_factory=list, description="List of volumes (same length as prices)")
+    volumes: list[float] | None = Field(default_factory=list, description="List of volumes (same length as prices)")
+
+    @field_validator("volumes", mode="before")
+    @classmethod
+    def allow_none_for_list(cls, v: Any) -> Any:
+        return v if v is not None else []
 
 
 def calculate_technical_signals(**kwargs) -> dict:
@@ -477,8 +490,15 @@ def _ema(data: list[float], period: int) -> float:
 
 class RiskMetricsInput(BaseModel):
     prices: list[float] = Field(description="List of daily closing prices (most recent last, minimum 30)")
-    risk_free_rate_pct: float = Field(default=6.5, description="Annual risk-free rate in % (default: RBI repo rate proxy 6.5%)")
-    trading_days: int = Field(default=252, description="Trading days per year for annualization (252 for India)")
+    risk_free_rate_pct: float | None = Field(default=6.5, description="Annual risk-free rate in % (default: RBI repo rate proxy 6.5%)")
+    trading_days: int | None = Field(default=252, description="Trading days per year for annualization (252 for India)")
+
+    @field_validator("risk_free_rate_pct", "trading_days", mode="before")
+    @classmethod
+    def allow_none_for_numeric(cls, v: Any, info: Any) -> Any:
+        if v is not None:
+            return v
+        return cls.model_fields[info.field_name].default
 
 
 def calculate_risk_metrics(**kwargs) -> dict:

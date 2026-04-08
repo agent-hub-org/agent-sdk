@@ -69,7 +69,15 @@ class AgentState(BaseModel):
         ),
     )
 
-    # --- Structured planning / scratchpad (populated only for analytical queries) ---
+    # --- Structured planning / scratchpad ---
+    enable_analytical_path: bool = Field(
+        default=True,
+        description=(
+            "When False, triager_router always routes to llm_call, bypassing the parallel planner "
+            "and synthesizer. Scratchpad is still captured in tool_node. "
+            "Set to False on BaseAgent(analytical_path=False) for lower-latency deployments."
+        ),
+    )
     query_type: Optional[str] = Field(
         default=None,
         description="'opaque' (direct answer) or 'analytical' (multi-step plan). Set by triager.",
@@ -87,7 +95,10 @@ class AgentState(BaseModel):
     )
     scratchpad: Optional[str] = Field(
         default=None,
-        description="Accumulated tool results written by stateless_executor; read by synthesizer.",
+        description=(
+            "Accumulated tool results. Written by stateless_executor (analytical path) and "
+            "tool_node (opaque path). Read by synthesizer and memory_writer."
+        ),
     )
 
 

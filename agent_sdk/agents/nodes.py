@@ -389,6 +389,9 @@ async def tool_node(agent, state: AgentState) -> dict:
     If an MCP session has dropped (McpError: Session terminated),
     reconnects and retries the failed tool calls once.
 
+    Tool results are also accumulated into state.scratchpad so the memory
+    pipeline captures tool findings for all query types (opaque and analytical).
+
     `agent` is bound via functools.partial at graph build time.
     """
 
@@ -398,7 +401,21 @@ async def tool_node(agent, state: AgentState) -> dict:
 
     results = await _execute_tool_calls(agent, tool_calls, timeout)
 
-    return {"messages": list(results)}
+    if not results:
+        return {"messages": []}
+
+    # Accumulate tool results into scratchpad (zero latency — pure string ops)
+    section = "\n".join(
+        f"[{msg.name}] → {msg.content}"
+        for msg in results
+        if hasattr(msg, "name") and msg.name
+    )
+    existing = getattr(state, "scratchpad", None) or ""
+    new_scratchpad = (existing + "\n\n" + section).strip() if existing else section
+    logger.debug("tool_node: scratchpad updated (%d chars total): %.500s",
+                 len(new_scratchpad), new_scratchpad)
+
+    return {"messages": list(results), "scratchpad": new_scratchpad}
 
 
 def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
@@ -1673,7 +1690,13 @@ async def triager(agent, state: AgentState) -> dict:
 
 
 def triager_router(state: AgentState) -> Literal["llm_call", "parallel_planner"]:
-    """Route after triager: opaque → llm_call (existing ReAct loop), analytical → parallel_planner."""
+    """Route after triager: opaque → llm_call (existing ReAct loop), analytical → parallel_planner.
+
+    When enable_analytical_path is False the planner is bypassed entirely —
+    all queries use the fast opaque path (scratchpad still captured in tool_node).
+    """
+    if not getattr(state, "enable_analytical_path", True):
+        return "llm_call"
     qt = getattr(state, "query_type", None)
     if qt == "analytical":
         return "parallel_planner"
@@ -2222,6 +2245,8 @@ async def memory_writer(agent, state: AgentState) -> dict:
         return {}
 
     scratchpad = getattr(state, "scratchpad", None)
+    logger.debug("memory_writer: scratchpad passed to snapshot (%d chars): %.500s",
+                 len(scratchpad) if scratchpad else 0, scratchpad or "(none)")
 
     # Fire-and-forget: memory pipeline runs in background, never blocks response
     asyncio.create_task(
