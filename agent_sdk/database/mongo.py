@@ -80,10 +80,22 @@ class BaseMongoDatabase:
         return await cursor.to_list(length=settings.mongo_history_limit)
 
     @classmethod
+    async def get_history_by_sessions(cls, session_ids: list[str]) -> list[dict]:
+        if not session_ids:
+            return []
+        cursor = cls._conversations().find(
+            {"session_id": {"$in": session_ids}},
+            {"_id": 0, "query": 1, "response": 1, "created_at": 1, "session_id": 1},
+        ).sort("created_at", -1)
+        return await cursor.to_list(length=settings.mongo_history_limit)
+
+    @classmethod
     async def ensure_indexes(cls) -> None:
         db = cls.get_client()[cls.db_name()]
         await db["conversations"].create_index("created_at", expireAfterSeconds=settings.mongo_ttl_seconds)
-        logger.info("MongoDB TTL indexes ensured for conversations")
+        await db["conversations"].create_index([("user_id", 1), ("created_at", -1)])
+        await db["conversations"].create_index([("session_id", 1), ("created_at", -1)])
+        logger.info("MongoDB indexes ensured for conversations")
 
     @classmethod
     async def close(cls):
