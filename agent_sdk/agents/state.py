@@ -48,6 +48,48 @@ class AgentState(BaseModel):
         description="Maximum seconds to wait for a single batch of tool calls before timing out.",
     )
 
+    # --- User identity (for memory system) ---
+    user_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stable user identifier passed by the caller. Used to scope perspective memory "
+            "across sessions. If None, memory writing is skipped."
+        ),
+    )
+    session_id: str = Field(
+        default="default",
+        description="Session identifier — mirrors the LangGraph thread_id. Set by arun().",
+    )
+    perspective_context: Optional[str] = Field(
+        default=None,
+        description=(
+            "User personality background loaded by load_user_context. "
+            "Injected into llm_call for communication style adaptation ONLY — "
+            "never affects analytical content or planning."
+        ),
+    )
+
+    # --- Structured planning / scratchpad (populated only for analytical queries) ---
+    query_type: Optional[str] = Field(
+        default=None,
+        description="'opaque' (direct answer) or 'analytical' (multi-step plan). Set by triager.",
+    )
+    execution_plan: Optional[list[list[dict]]] = Field(
+        default=None,
+        description=(
+            "Ordered list of parallel batches produced by parallel_planner. "
+            "Each batch is a list of {'tool': name, 'args': {...}} dicts that run concurrently."
+        ),
+    )
+    current_batch_index: int = Field(
+        default=0,
+        description="Index into execution_plan pointing to the next batch to execute.",
+    )
+    scratchpad: Optional[str] = Field(
+        default=None,
+        description="Accumulated tool results written by stateless_executor; read by synthesizer.",
+    )
+
 
 class FinancialAnalysisState(AgentState):
     """
@@ -147,4 +189,17 @@ class FinancialAnalysisState(AgentState):
             "synthesis": 3,
         },
         description="Per-phase iteration budgets for the financial cognitive pipeline. Total: 20 iterations.",
+    )
+
+    # --- Per-phase planning / execution scratchpad ---
+    phase_tool_plan: Optional[list[dict]] = Field(
+        default=None,
+        description=(
+            "Tool calls planned for the current financial phase (reset by each phase planner). "
+            "Format: [{'tool': name, 'args': {...}}, ...]"
+        ),
+    )
+    phase_scratchpad: Optional[str] = Field(
+        default=None,
+        description="Raw tool results for the current financial phase (reset by each phase planner).",
     )

@@ -17,6 +17,15 @@ from agent_sdk.agents.nodes import (
     should_continue,
     post_tool_router,
     pre_llm_router,
+    triager,
+    triager_router,
+    parallel_planner,
+    after_planner_router,
+    stateless_executor,
+    batch_check,
+    synthesizer,
+    load_user_context,
+    memory_writer,
 )
 
 
@@ -41,25 +50,61 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
 
     Graph flow
     ----------
-    START → initialize → llm_call → should_continue → tool_node → post_tool_router → llm_call
-                                                     │                              → summarize_conversation → llm_call
-                                                     → summarize_conversation → llm_call
-                                                     → END
+    START → initialize → triager
+        → (opaque)   llm_call → should_continue → tool_node → post_tool_router → llm_call
+                                                → summarize_conversation → llm_call
+                                                → END
+        → (analytical) parallel_planner → stateless_executor → batch_check
+                                              ↑ (next batch)        ↓ (all done)
+                                                              synthesizer → END
     """
 
     graph = StateGraph(AgentState)
 
-    # initialize and should_continue don't need agent — register directly
     graph.add_node("initialize", initialize)
+    graph.add_node("load_user_context", partial(load_user_context, agent))
+    graph.add_node("triager", partial(triager, agent))
+    graph.add_node("memory_writer", partial(memory_writer, agent))
+    # Opaque path: existing ReAct loop
     graph.add_node("llm_call", partial(llm_call, agent))
     graph.add_node("tool_node", partial(tool_node, agent))
     graph.add_node("summarize_conversation", partial(summarize_conversation, agent))
+    # Analytical path: plan → parallel execute → synthesize
+    graph.add_node("parallel_planner", partial(parallel_planner, agent))
+    graph.add_node("stateless_executor", partial(stateless_executor, agent))
+    graph.add_node("synthesizer", partial(synthesizer, agent))
 
     graph.add_edge(START, "initialize")
-    graph.add_conditional_edges("initialize", pre_llm_router)
-    graph.add_conditional_edges("llm_call", should_continue)
+    graph.add_edge("initialize", "load_user_context")
+    graph.add_conditional_edges("load_user_context", pre_llm_router, {
+        "llm_call": "triager",
+        "summarize_conversation": "summarize_conversation",
+    })
+    graph.add_conditional_edges("triager", triager_router, {
+        "llm_call": "llm_call",
+        "parallel_planner": "parallel_planner",
+    })
+
+    # Opaque path — redirect END through memory_writer
+    graph.add_conditional_edges("llm_call", should_continue, {
+        "tool_node": "tool_node",
+        "summarize_conversation": "summarize_conversation",
+        END: "memory_writer",
+    })
     graph.add_conditional_edges("tool_node", post_tool_router)
     graph.add_edge("summarize_conversation", "llm_call")
+
+    # Analytical path — conditional in case planner fails (falls back to llm_call)
+    graph.add_conditional_edges("parallel_planner", after_planner_router, {
+        "stateless_executor": "stateless_executor",
+        "llm_call": "llm_call",
+    })
+    graph.add_conditional_edges("stateless_executor", batch_check, {
+        "stateless_executor": "stateless_executor",
+        "synthesizer": "synthesizer",
+    })
+    graph.add_edge("synthesizer", "memory_writer")
+    graph.add_edge("memory_writer", END)
 
     return graph.compile(checkpointer=checkpointer)
 
@@ -68,120 +113,104 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     """
     Build the financial reasoning cognitive pipeline.
 
-    This is a hierarchical reasoning graph that replaces the flat
-    llm_call → tools → llm_call loop with structured analytical phases:
+    Each analytical phase now uses a 3-sub-node structure:
+        {phase}      — planner: 1 LLM call → produces phase_tool_plan
+        {phase}_exec — stateless executor: asyncio.gather all tools (no LLM)
+        {phase}_synth — synthesizer: 1 LLM call → structured phase output
 
-        query_classifier → regime_assessment → causal_analysis →
-        sector_analysis → company_analysis → risk_assessment → synthesis
-
-    Each phase:
-    - Has a specific analytical lens (system prompt)
-    - Has access to only the tools relevant to that phase
-    - Writes structured findings to typed state fields
-    - Can read structured findings from prior phases
-
-    The query classifier at the front determines which phases to activate,
-    so simple queries skip unnecessary phases.
+    Phases without tools (synthesis) and the parallel comparative_analysis
+    are unchanged. The query classifier at the front determines which phases
+    to activate, so simple queries skip unnecessary phases.
 
     Graph flow
     ----------
     START → initialize → classify_query → phase_router
-        → regime_assessment_phase → phase_advance → phase_router
-        → causal_analysis_phase   → phase_advance → phase_router
-        → sector_analysis_phase   → phase_advance → phase_router
-        → company_analysis_phase  → phase_advance → phase_router
-        → risk_assessment_phase   → phase_advance → phase_router
-        → synthesis_phase         → END
-
-    Each *_phase node is itself a sub-loop:
-        phase_llm_call → phase_should_continue → phase_tool_node → phase_llm_call
-                                               → phase_complete (write structured output)
+        → regime_assessment (plan) → regime_assessment_exec → regime_assessment_synth → phase_advance
+        → causal_analysis (plan)   → causal_analysis_exec   → causal_analysis_synth   → phase_advance
+        → sector_analysis (plan)   → sector_analysis_exec   → sector_analysis_synth   → phase_advance
+        → company_analysis (plan)  → company_analysis_exec  → company_analysis_synth  → phase_advance
+        → comparative_analysis (unchanged — parallel entity analysis)                 → phase_advance
+        → risk_assessment (plan)   → risk_assessment_exec   → risk_assessment_synth   → phase_advance
+        → synthesis (unchanged — no tools, pure LLM synthesis)                        → END
     """
     from agent_sdk.agents.nodes import (
         financial_initialize,
         classify_query_node,
         phase_router,
-        regime_assessment_node,
-        causal_analysis_node,
-        sector_analysis_node,
-        company_analysis_node,
         comparative_analysis_node,
-        risk_assessment_node,
         synthesis_node,
         phase_advance,
-        financial_tool_node,
-        financial_should_continue,
-        summarize_conversation,
+        financial_phase_planner,
+        financial_stateless_executor_node,
+        financial_phase_synthesizer,
+        _financial_after_plan,
     )
 
     graph = StateGraph(FinancialAnalysisState)
 
     # --- Core nodes ---
     graph.add_node("initialize", financial_initialize)
+    graph.add_node("load_user_context", partial(load_user_context, agent))
     graph.add_node("classify_query", partial(classify_query_node, agent))
     graph.add_node("phase_router", phase_router)
-
-    # --- Phase nodes (each runs the LLM with phase-specific prompt + tools) ---
-    graph.add_node("regime_assessment", partial(regime_assessment_node, agent))
-    graph.add_node("causal_analysis", partial(causal_analysis_node, agent))
-    graph.add_node("sector_analysis", partial(sector_analysis_node, agent))
-    graph.add_node("company_analysis", partial(company_analysis_node, agent))
-    graph.add_node("comparative_analysis", partial(comparative_analysis_node, agent))
-    graph.add_node("risk_assessment", partial(risk_assessment_node, agent))
-    graph.add_node("synthesis", partial(synthesis_node, agent))
-
-    # --- Shared utility nodes ---
     graph.add_node("phase_advance", phase_advance)
-    graph.add_node("financial_tool_node", partial(financial_tool_node, agent))
-    graph.add_node("summarize_conversation", partial(summarize_conversation, agent))
+    graph.add_node("memory_writer", partial(memory_writer, agent))
+
+    # --- Phases with the new plan → exec → synth sub-structure ---
+    _tool_phases = [
+        "regime_assessment",
+        "causal_analysis",
+        "sector_analysis",
+        "company_analysis",
+        "risk_assessment",
+    ]
+    for ph in _tool_phases:
+        graph.add_node(ph,            partial(financial_phase_planner,           ph, agent))
+        graph.add_node(f"{ph}_exec",  partial(financial_stateless_executor_node, ph, agent))
+        graph.add_node(f"{ph}_synth", partial(financial_phase_synthesizer,       ph, agent))
+
+    # --- Unchanged phases ---
+    graph.add_node("comparative_analysis", partial(comparative_analysis_node, agent))
+    graph.add_node("synthesis", partial(synthesis_node, agent))
 
     # --- Edges ---
     graph.add_edge(START, "initialize")
-    graph.add_edge("initialize", "classify_query")
+    graph.add_edge("initialize", "load_user_context")
+    graph.add_edge("load_user_context", "classify_query")
     graph.add_edge("classify_query", "phase_router")
 
-    # Phase router dispatches to the next phase or END
+    # Phase router → entry node of each phase (the planner, or unchanged node)
     _phase_route_map = {
-        "regime_assessment": "regime_assessment",
-        "causal_analysis": "causal_analysis",
-        "sector_analysis": "sector_analysis",
-        "company_analysis": "company_analysis",
-        "comparative_analysis": "comparative_analysis",
-        "risk_assessment": "risk_assessment",
-        "synthesis": "synthesis",
+        "regime_assessment":   "regime_assessment",
+        "causal_analysis":     "causal_analysis",
+        "sector_analysis":     "sector_analysis",
+        "company_analysis":    "company_analysis",
+        "comparative_analysis":"comparative_analysis",
+        "risk_assessment":     "risk_assessment",
+        "synthesis":           "synthesis",
         END: END,
     }
     graph.add_conditional_edges("phase_router", _route_phase, _phase_route_map)
 
-    # Each phase node → check if tools needed or phase complete
-    _phase_continue_map = {
-        "financial_tool_node": "financial_tool_node",
-        "phase_advance": "phase_advance",
-    }
-    for phase_name in ["regime_assessment", "causal_analysis", "sector_analysis",
-                       "company_analysis", "comparative_analysis", "risk_assessment", "synthesis"]:
+    # For each tool-using phase: planner → (exec or synth) → synth → phase_advance
+    for ph in _tool_phases:
         graph.add_conditional_edges(
-            phase_name, partial(financial_should_continue, phase_name), _phase_continue_map
+            ph,
+            partial(_financial_after_plan, ph),
+            {f"{ph}_exec": f"{ph}_exec", f"{ph}_synth": f"{ph}_synth"},
         )
+        graph.add_edge(f"{ph}_exec",  f"{ph}_synth")
+        graph.add_edge(f"{ph}_synth", "phase_advance")
 
-    # Tool node → back to current phase
-    _back_to_phase_map = {
-        "regime_assessment": "regime_assessment",
-        "causal_analysis": "causal_analysis",
-        "sector_analysis": "sector_analysis",
-        "company_analysis": "company_analysis",
-        "comparative_analysis": "comparative_analysis",
-        "risk_assessment": "risk_assessment",
-        "synthesis": "synthesis",
-        "phase_advance": "phase_advance",
-    }
-    graph.add_conditional_edges("financial_tool_node", _route_back_to_phase, _back_to_phase_map)
+    # Comparative analysis → phase_advance (unchanged)
+    graph.add_edge("comparative_analysis", "phase_advance")
 
-    # Phase advance → back to router for next phase
+    # Phase advance → router for next phase
     graph.add_edge("phase_advance", "phase_router")
 
-    # Summarize → back to current phase
-    graph.add_conditional_edges("summarize_conversation", _route_back_to_phase, _back_to_phase_map)
+    # Synthesis → memory_writer → END
+    graph.add_edge("synthesis", "memory_writer")
+    graph.add_edge("memory_writer", END)
 
     return graph.compile(checkpointer=checkpointer)
 

@@ -16,22 +16,48 @@ logger = logging.getLogger("agent_sdk.agent")
 # Covers both the standard graph ("llm_call") and the financial reasoning graph.
 DEFAULT_STREAMING_NODES = frozenset({
     "llm_call",
-    "regime_assessment", "causal_analysis",
-    "sector_analysis", "company_analysis",
-    "risk_assessment", "synthesis",
+    "synthesizer",
+    "regime_assessment_synth", "causal_analysis_synth",
+    "sector_analysis_synth", "company_analysis_synth",
+    "risk_assessment_synth", "synthesis",
 })
 
-# Human-readable labels for financial pipeline phases — shown as progress markers
-# while intermediate phases run silently (i.e. when streaming_nodes is restricted).
+# Human-readable labels shown as progress markers while nodes run silently.
 _PHASE_PROGRESS_LABELS: dict[str, str] = {
-    "classify_query":        "🔎 Classifying query...",
-    "regime_assessment":     "🌐 Analyzing macro regime & market environment...",
-    "causal_analysis":       "🔗 Mapping causal transmission chains...",
-    "sector_analysis":       "📊 Evaluating sector positioning...",
-    "company_analysis":      "🏢 Running company fundamental analysis...",
-    "comparative_analysis":  "⚖️ Running comparative analysis...",
-    "risk_assessment":       "⚠️ Stress-testing scenarios & risks...",
-    "synthesis":             "✍️ Synthesizing final report...",
+    # Memory nodes (both modes)
+    "load_user_context":          "Loading user context...",
+    "memory_writer":              "Saving memory...",
+    # Standard mode
+    "triager":                    "Analyzing query...",
+    "parallel_planner":           "Building execution plan...",
+    "stateless_executor":         "Fetching data in parallel...",
+    "synthesizer":                "Synthesizing response...",
+    # Financial mode — classification
+    "classify_query":             "🔎 Classifying query...",
+    # Financial mode — regime
+    "regime_assessment":          "🌐 Planning regime assessment...",
+    "regime_assessment_exec":     "🌐 Fetching macro data in parallel...",
+    "regime_assessment_synth":    "🌐 Analyzing macro regime & market environment...",
+    # Financial mode — causal
+    "causal_analysis":            "🔗 Planning causal analysis...",
+    "causal_analysis_exec":       "🔗 Fetching causal data in parallel...",
+    "causal_analysis_synth":      "🔗 Mapping causal transmission chains...",
+    # Financial mode — sector
+    "sector_analysis":            "📊 Planning sector analysis...",
+    "sector_analysis_exec":       "📊 Fetching sector data in parallel...",
+    "sector_analysis_synth":      "📊 Evaluating sector positioning...",
+    # Financial mode — company
+    "company_analysis":           "🏢 Planning company analysis...",
+    "company_analysis_exec":      "🏢 Fetching company data in parallel...",
+    "company_analysis_synth":     "🏢 Running company fundamental analysis...",
+    # Financial mode — comparative
+    "comparative_analysis":       "⚖️ Running comparative analysis...",
+    # Financial mode — risk
+    "risk_assessment":            "⚠️ Planning risk assessment...",
+    "risk_assessment_exec":       "⚠️ Fetching risk data in parallel...",
+    "risk_assessment_synth":      "⚠️ Stress-testing scenarios & risks...",
+    # Financial mode — synthesis
+    "synthesis":                  "✍️ Synthesizing final report...",
 }
 
 
@@ -54,7 +80,8 @@ class BaseAgent:
 
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
-                 mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None):
+                 mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None,
+                 memory_manager=None):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
@@ -65,6 +92,12 @@ class BaseAgent:
 
         self.llm = initialize_agent_azure()
         self.summarizer = initialize_summarizer_azure()
+
+        # 3-tier memory system (optional — None disables memory entirely)
+        self.memory_manager = memory_manager
+        if memory_manager is not None and getattr(memory_manager, "llm", None) is None:
+            # Provide the agent's LLM to the memory manager if it doesn't have one
+            memory_manager.llm = self.llm
 
         self.tools = list(tools)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
@@ -147,11 +180,12 @@ class BaseAgent:
             "messages": [HumanMessage(content=query)],
             "system_prompt": system_prompt or self.system_prompt,
             "iteration": 0,
+            "session_id": session_id,
         }
         if model_id:
             invoke_input["model_id"] = model_id
-        
-        # Merge any extra state fields (e.g. as_of_date)
+
+        # Merge any extra state fields (e.g. as_of_date, user_id)
         invoke_input.update(kwargs)
         
         # For financial_analyst mode, set up per-phase iteration budgets
@@ -264,11 +298,12 @@ class StreamResult:
             "messages": [HumanMessage(content=self._query)],
             "system_prompt": self._system_prompt,
             "iteration": 0,
+            "session_id": self._session_id,
         }
         if self._model_id:
             stream_input["model_id"] = self._model_id
-        
-        # Merge any extra state fields (e.g. as_of_date)
+
+        # Merge any extra state fields (e.g. as_of_date, user_id)
         stream_input.update(self._extra_fields)
 
         # For financial_analyst mode, set up per-phase iteration budgets

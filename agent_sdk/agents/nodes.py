@@ -120,20 +120,47 @@ async def llm_call(agent, state: AgentState) -> dict:
     tools = list(agent.tools_by_name.values())
     llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
 
-    # Merge summary into the existing system message to avoid dual SystemMessages
+    # Build appended context sections (summary + perspective) without mutating state.messages
+    extra_sections: list[str] = []
+
     if state.summary:
-        summary_text = (
+        extra_sections.append(
             "INTERNAL CONTEXT (for your reference only — do NOT include, repeat, "
             "or paraphrase any of this in your response to the user):\n"
             f"Previous conversation summary: {state.summary}"
         )
+
+    # Inject financial phase outputs if present (financial_analyst mode follow-up queries)
+    _FINANCIAL_PHASE_FIELDS = [
+        ("regime_context", "Market Regime"),
+        ("causal_analysis", "Causal Analysis"),
+        ("sector_findings", "Sector Analysis"),
+        ("company_analysis", "Company Analysis"),
+        ("risk_assessment", "Risk Assessment"),
+    ]
+    phase_parts = []
+    for field, label in _FINANCIAL_PHASE_FIELDS:
+        val = getattr(state, field, None)
+        if val:
+            serialized = json.dumps(val, default=str)
+            phase_parts.append(f"**{label}**: {serialized[:800]}")
+    if phase_parts:
+        extra_sections.append(
+            "PRIOR ANALYSIS CONTEXT (use to answer follow-up questions accurately — "
+            "do not re-fetch data already captured here):\n" + "\n".join(phase_parts)
+        )
+
+    perspective = getattr(state, "perspective_context", None)
+    if perspective:
+        extra_sections.append(perspective)
+
+    if extra_sections:
         messages = list(state.messages)
+        appended = "\n\n".join(extra_sections)
         if messages and isinstance(messages[0], SystemMessage):
-            messages[0] = SystemMessage(
-                content=f"{messages[0].content}\n\n{summary_text}"
-            )
+            messages[0] = SystemMessage(content=f"{messages[0].content}\n\n{appended}")
         else:
-            messages.insert(0, SystemMessage(content=summary_text))
+            messages.insert(0, SystemMessage(content=appended))
         prompt = messages
     else:
         prompt = list(state.messages)
@@ -231,23 +258,30 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
         return {}
 
     # Build summarization prompt from ONLY the messages being pruned
+    _PRESERVE_INSTRUCTION = (
+        "Preserve ALL ticker symbols, asset names, prices, financial metrics, percentages, "
+        "and specific dates EXACTLY as they appear — do not paraphrase, round, or omit numbers. "
+        "IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize."
+    )
+
     existing_summary = state.summary or ""
     if existing_summary:
         summary_message = (
             f"This is a summary of the conversation to date: {existing_summary}\n\n"
-            "Extend the summary by taking into account the new messages below. "
-            "IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize."
+            f"Extend the summary by taking into account the new messages below. {_PRESERVE_INSTRUCTION}"
         )
     else:
         summary_message = (
-            "Create a concise summary of the facts and context from the conversation below. "
-            "IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize."
+            f"Create a summary of the facts and context from the conversation below. {_PRESERVE_INSTRUCTION}"
         )
 
     summarizer_input = (
         [SystemMessage(content=summary_message)]
         + messages_to_prune
-        + [SystemMessage(content="Provide a concise summary capturing the key facts, decisions, and results. Omit raw data dumps. IMPORTANT: Just state the facts. Do NOT mention that you were asked to summarize.")]
+        + [SystemMessage(content=(
+            "Provide a summary capturing the key facts, decisions, results, and all specific "
+            f"data points (numbers, tickers, dates). {_PRESERVE_INSTRUCTION}"
+        ))]
     )
 
     summarizer = agent.summarizer or agent.llm
@@ -373,16 +407,17 @@ def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "ll
     handing back to the LLM. This enables mid-loop summarization without
     ever skipping pending tool calls.
     """
+    summary_text = state.summary or ""
     needs_summarization = (
         state.enable_summarization
         and (
             len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages) > state.max_context_tokens
+            or _estimate_token_count(state.messages, summary_text) > state.max_context_tokens
         )
     )
     if needs_summarization:
         logger.debug("Post-tool routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), _estimate_token_count(state.messages))
+                     len(state.messages), _estimate_token_count(state.messages, summary_text))
         return "summarize_conversation"
     return "llm_call"
 
@@ -396,24 +431,31 @@ def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_
     This catches long conversational sessions that never trigger tool calls
     and therefore never hit post_tool_router.
     """
+    summary_text = state.summary or ""
     needs_summarization = (
         state.enable_summarization
         and (
             len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages) > state.max_context_tokens * 0.8
+            or _estimate_token_count(state.messages, summary_text) > state.max_context_tokens * 0.8
         )
     )
     if needs_summarization:
         logger.debug("Pre-LLM routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), _estimate_token_count(state.messages))
+                     len(state.messages), _estimate_token_count(state.messages, summary_text))
         return "summarize_conversation"
     logger.debug("Pre-LLM routing → llm_call")
     return "llm_call"
 
 
-def _estimate_token_count(messages: Sequence) -> int:
-    """Rough token estimate: ~4 chars per token for English text."""
-    return sum(len(getattr(m, "content", "") or "") for m in messages) // 4
+def _estimate_token_count(messages: Sequence, extra_text: str = "") -> int:
+    """Rough token estimate: ~4 chars per token for English text.
+
+    Pass extra_text for any content injected outside the messages list
+    (e.g. state.summary appended to the system prompt) so the estimate
+    reflects the real token budget consumed.
+    """
+    msg_chars = sum(len(getattr(m, "content", "") or "") for m in messages)
+    return (msg_chars + len(extra_text)) // 4
 
 
 def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conversation", "__end__"]:
@@ -1507,3 +1549,690 @@ async def comparative_analysis_node(agent, state) -> dict:
         "iteration": state.iteration + 1,
         "phase_iterations": {"comparative_analysis": state.phase_iterations.get("comparative_analysis", 0) + 1}
     }
+
+
+# ============================================================================
+# STRUCTURED PLANNING — Standard Mode Nodes
+# ============================================================================
+# These nodes implement the 4-phase Triager → Parallel Planner →
+# Stateless Executor → Synthesizer flow for mode="standard".
+# Simple ("opaque") queries skip planning and go directly to llm_call.
+# Complex ("analytical") queries are broken into parallel tool batches,
+# executed without any LLM involvement, then synthesized in one final call.
+# ============================================================================
+
+_TRIAGER_SYSTEM_PROMPT = """\
+Classify the user query as either "opaque" or "analytical".
+
+opaque: Can be answered directly or with at most one tool call.
+  Examples: math, greetings, factual single-entity lookups, simple follow-ups.
+
+analytical: Requires multiple distinct tool calls, comparing sources, or multi-step research.
+  Examples: "Compare X and Y", "Research A, B, and C and summarize", "Analyze X in depth".
+
+Output ONLY valid JSON — no explanation, no markdown:
+{"type": "opaque"}
+OR
+{"type": "analytical"}
+"""
+
+_PLANNER_SYSTEM_PROMPT = """\
+You are a task planner. Break the user query into ordered batches of tool calls.
+
+{tool_catalog}
+
+RULES:
+- Group tool calls that are INDEPENDENT into the same batch — they run in parallel.
+- Batches are sequential — later batches may depend on earlier results.
+- Each call must use a tool name from the catalog above with exact argument names.
+- Maximum 4 batches. Maximum 6 calls per batch.
+- Do NOT include reasoning or synthesis steps — only tool calls.
+
+Output ONLY valid JSON:
+{{"batches": [[{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...], ...]}}
+"""
+
+_SYNTHESIZER_SYSTEM_PROMPT = """\
+You are a synthesis assistant. Based on the tool findings below, answer the user's question clearly and accurately.
+Do not reference tool names, internal steps, or JSON structure — respond naturally and directly.
+
+TOOL FINDINGS:
+{scratchpad}
+"""
+
+
+def _format_tool_catalog(tools: list) -> str:
+    """Format a list of tools into a compact catalog string for planner prompts."""
+    lines = ["TOOLS AVAILABLE:"]
+    for t in tools:
+        name = getattr(t, "name", str(t))
+        desc = (getattr(t, "description", "") or "")[:120]
+        try:
+            schema = t.get_input_schema().schema() if hasattr(t, "get_input_schema") else {}
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            arg_parts = [
+                f"{k}: {v.get('type', 'any')}{'*' if k in required else ''}"
+                for k, v in props.items()
+            ]
+            args_str = ", ".join(arg_parts) if arg_parts else "no args"
+        except Exception:
+            args_str = "see description"
+        lines.append(f"- {name}: {desc}\n  args: {args_str}")
+    return "\n".join(lines)
+
+
+async def triager(agent, state: AgentState) -> dict:
+    """
+    Classify the incoming query as 'opaque' (answer directly / single tool call)
+    or 'analytical' (multi-step plan + parallel tool execution).
+
+    A heuristic fast-exit skips the LLM call for trivially short messages to
+    avoid unnecessary latency on greetings and simple follow-ups.
+    """
+    user_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_query = _strip_context_block(msg.content)
+            break
+
+    if not user_query:
+        return {"query_type": "opaque"}
+
+    # Heuristic: short, single-line messages without complex interrogatives → skip LLM
+    words = user_query.split()
+    if len(words) <= 8 and "\n" not in user_query:
+        logger.debug("triager: heuristic fast-exit → opaque (%d words)", len(words))
+        return {"query_type": "opaque"}
+
+    llm = agent.llm
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        llm = get_llm(state.model_id)
+
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke([
+            SystemMessage(content=_TRIAGER_SYSTEM_PROMPT),
+            HumanMessage(content=f"Query: {user_query}"),
+        ])
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase="triager").observe(
+            time.monotonic() - _t0
+        )
+        result = _extract_json(response.content)
+        query_type = (result or {}).get("type", "opaque")
+        if query_type not in ("opaque", "analytical"):
+            query_type = "opaque"
+    except Exception:
+        logger.exception("triager: classification failed — defaulting to opaque")
+        query_type = "opaque"
+
+    logger.info("triager: query_type=%s", query_type)
+    return {"query_type": query_type}
+
+
+def triager_router(state: AgentState) -> Literal["llm_call", "parallel_planner"]:
+    """Route after triager: opaque → llm_call (existing ReAct loop), analytical → parallel_planner."""
+    qt = getattr(state, "query_type", None)
+    if qt == "analytical":
+        return "parallel_planner"
+    return "llm_call"
+
+
+async def parallel_planner(agent, state: AgentState) -> dict:
+    """
+    For analytical queries: generate an ordered plan of parallel tool-call batches.
+
+    Each batch groups independent calls that can run concurrently via asyncio.gather.
+    Later batches may depend on earlier results. The plan is stored in state.execution_plan
+    and executed by stateless_executor without any further LLM involvement.
+
+    Falls back to query_type='opaque' (standard llm_call loop) on any parse error.
+    """
+    tools = list(agent.tools_by_name.values())
+    tool_catalog = _format_tool_catalog(tools) if tools else "No tools available."
+
+    user_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_query = _strip_context_block(msg.content)
+            break
+
+    llm = agent.llm
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        llm = get_llm(state.model_id)
+
+    planner_prompt = _PLANNER_SYSTEM_PROMPT.format(tool_catalog=tool_catalog)
+
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke([
+            SystemMessage(content=planner_prompt),
+            HumanMessage(content=f"Query: {user_query}"),
+        ])
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase="parallel_planner").observe(
+            time.monotonic() - _t0
+        )
+        result = _extract_json(response.content)
+        batches = (result or {}).get("batches")
+        if not batches or not isinstance(batches, list):
+            raise ValueError(f"Invalid batches from planner: {result}")
+        # Validate each entry has 'tool' and 'args'
+        for batch in batches:
+            for call in batch:
+                if "tool" not in call:
+                    raise ValueError(f"Missing 'tool' key in call: {call}")
+                if call["tool"] not in agent.tools_by_name:
+                    logger.warning("parallel_planner: unknown tool '%s' in plan — removing", call["tool"])
+        # Filter out unknown tools
+        batches = [
+            [c for c in batch if c.get("tool") in agent.tools_by_name]
+            for batch in batches
+        ]
+        batches = [b for b in batches if b]  # remove empty batches
+        if not batches:
+            raise ValueError("No valid tool calls in plan after filtering")
+        logger.info("parallel_planner: %d batches, %d total calls",
+                    len(batches), sum(len(b) for b in batches))
+        return {"execution_plan": batches, "current_batch_index": 0}
+    except Exception:
+        logger.exception("parallel_planner: failed — falling back to opaque (standard llm_call)")
+        return {"query_type": "opaque", "execution_plan": None, "current_batch_index": 0}
+
+
+async def stateless_executor(agent, state: AgentState) -> dict:
+    """
+    Execute the current batch of tool calls in parallel (asyncio.gather).
+
+    NO LLM involvement — pure concurrent tool dispatch using the agent's
+    existing tool registry and circuit-breaker infrastructure.
+    Results are appended to state.scratchpad and current_batch_index is advanced.
+    """
+    plan = getattr(state, "execution_plan", None) or []
+    idx = getattr(state, "current_batch_index", 0)
+
+    if idx >= len(plan):
+        logger.warning("stateless_executor: called with no remaining batches (idx=%d, plan len=%d)", idx, len(plan))
+        return {"current_batch_index": idx}
+
+    batch = plan[idx]
+    timeout = state.tool_timeout
+
+    async def run_one(call: dict) -> str:
+        tool_name = call.get("tool", "")
+        args = call.get("args", {})
+        tool = agent.tools_by_name.get(tool_name)
+        if tool is None:
+            return f"[{tool_name}] ERROR: tool not found"
+
+        breaker = agent._get_breaker(tool_name)
+        if breaker.is_open:
+            return f"[{tool_name}] SKIPPED: circuit breaker open"
+
+        try:
+            _t0 = time.monotonic()
+            if hasattr(tool, "ainvoke"):
+                result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(tool.invoke if hasattr(tool, "invoke") else tool.run, args),
+                    timeout=timeout,
+                )
+            breaker.record_success()
+            tool_call_duration.labels(agent="sdk", tool_name=tool_name).observe(time.monotonic() - _t0)
+            logger.info("stateless_executor: '%s' completed (%d chars)", tool_name, len(str(result)))
+            return f"[{tool_name}({args})] → {result}"
+        except asyncio.TimeoutError:
+            breaker.record_failure(tool_name)
+            return f"[{tool_name}] TIMEOUT after {timeout:.0f}s"
+        except Exception as e:
+            breaker.record_failure(tool_name)
+            logger.exception("stateless_executor: tool '%s' failed", tool_name)
+            return f"[{tool_name}] ERROR: {e}"
+
+    logger.info("stateless_executor: batch %d/%d — %d parallel calls: %s",
+                idx + 1, len(plan), len(batch), [c.get("tool") for c in batch])
+
+    results = await asyncio.gather(*[run_one(c) for c in batch])
+
+    batch_section = f"\n\n--- Batch {idx + 1} ---\n" + "\n\n".join(results)
+    existing_scratchpad = getattr(state, "scratchpad", None) or ""
+
+    return {
+        "scratchpad": existing_scratchpad + batch_section,
+        "current_batch_index": idx + 1,
+    }
+
+
+def after_planner_router(state: AgentState) -> Literal["stateless_executor", "llm_call"]:
+    """
+    After parallel_planner: if the plan is valid route to stateless_executor,
+    otherwise fall back to the standard llm_call loop (e.g. if planner failed).
+    """
+    plan = getattr(state, "execution_plan", None)
+    if plan:
+        return "stateless_executor"
+    logger.info("after_planner_router: no valid plan — falling back to llm_call")
+    return "llm_call"
+
+
+def batch_check(state: AgentState) -> Literal["stateless_executor", "synthesizer"]:
+    """After each executor run: proceed to next batch or move to synthesis."""
+    plan = getattr(state, "execution_plan", None) or []
+    idx = getattr(state, "current_batch_index", 0)
+    if idx < len(plan):
+        logger.debug("batch_check: more batches remaining (%d/%d)", idx + 1, len(plan))
+        return "stateless_executor"
+    logger.debug("batch_check: all batches done — routing to synthesizer")
+    return "synthesizer"
+
+
+async def synthesizer(agent, state: AgentState) -> dict:
+    """
+    Final synthesis: one LLM call (no tools) that turns the scratchpad into
+    a user-facing response. Streamed to the client.
+    """
+    scratchpad = getattr(state, "scratchpad", None) or "(no tool results)"
+
+    # Find the user's original query
+    user_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_query = _strip_context_block(msg.content)
+            break
+
+    # Include agent system prompt so synthesizer maintains agent persona
+    system_content = state.system_prompt or "You are a helpful assistant."
+    if state.summary:
+        system_content += (
+            f"\n\nCONVERSATION CONTEXT: {state.summary}"
+        )
+
+    synthesis_system = system_content + "\n\n" + _SYNTHESIZER_SYSTEM_PROMPT.format(
+        scratchpad=scratchpad
+    )
+
+    llm = agent.llm
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        llm = get_llm(state.model_id)
+
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke([
+            SystemMessage(content=synthesis_system),
+            HumanMessage(content=user_query),
+        ])
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase="synthesizer").observe(
+            time.monotonic() - _t0
+        )
+    except Exception:
+        logger.exception("synthesizer: LLM call failed")
+        response = AIMessage(content="I encountered an error synthesizing the results. Please try again.")
+
+    logger.info("synthesizer: response (%d chars)", len(getattr(response, "content", "")))
+    return {
+        "messages": [response],
+        "iteration": state.iteration + 1,
+    }
+
+
+# ============================================================================
+# STRUCTURED PLANNING — Financial Mode Nodes
+# ============================================================================
+# Each financial phase node is split into three sub-nodes:
+#   1. {phase}_plan  — 1 LLM call: output a list of tool calls needed
+#   2. financial_stateless_executor_node  — 0 LLM calls: run them all in parallel
+#   3. {phase}_synth — 1 LLM call: synthesize results into structured phase output
+#
+# comparative_analysis and synthesis phases are unchanged (they have their own
+# parallel entity logic and no tools respectively).
+# ============================================================================
+
+_FINANCIAL_PHASE_PLANNER_PREFIX = """\
+PLANNING STEP — DO NOT ANALYZE YET.
+
+Your task is to list ALL tool calls required for this phase of the analysis.
+The calls will be executed in parallel and their results returned to you for synthesis.
+
+{tool_catalog}
+
+Output ONLY valid JSON — no explanation:
+{{"calls": [{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...]}}
+
+If no tool calls are needed, output: {{"calls": []}}
+"""
+
+# Maps phase name → state field that stores its structured output
+_PHASE_STATE_KEY: dict[str, str] = {
+    "regime_assessment": "regime_context",
+    "causal_analysis": "causal_analysis",
+    "sector_analysis": "sector_findings",
+    "company_analysis": "company_analysis",
+    "risk_assessment": "risk_assessment",
+}
+
+
+async def financial_phase_planner(phase_name: str, agent, state) -> dict:
+    """
+    Planning sub-node for a financial pipeline phase.
+    Calls the LLM once to produce a list of tool calls needed for this phase.
+    Tool calls are stored in state.phase_tool_plan; phase_scratchpad is reset.
+    """
+    from agent_sdk.financial.prompts import (
+        REGIME_ASSESSMENT_PROMPT, CAUSAL_ANALYSIS_PROMPT,
+        SECTOR_ANALYSIS_PROMPT, COMPANY_ANALYSIS_PROMPT, RISK_ASSESSMENT_PROMPT,
+    )
+
+    _phase_prompts = {
+        "regime_assessment": REGIME_ASSESSMENT_PROMPT,
+        "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context)
+        ),
+        "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+        ),
+        "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+        ),
+        "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+            company_analysis=_format_context(state.company_analysis),
+        ),
+    }
+
+    phase_prompt = _phase_prompts.get(phase_name, "")
+    tools = _get_phase_tools(agent, phase_name)
+    tool_catalog = _format_tool_catalog(tools) if tools else "No tools available for this phase."
+
+    planning_prompt = _FINANCIAL_PHASE_PLANNER_PREFIX.format(tool_catalog=tool_catalog)
+
+    llm = _get_phase_llm(agent, state)
+    prompt = _build_phase_prompt(state, phase_prompt)
+    # Replace system message with planning-focused system prompt
+    prompt[0] = SystemMessage(content=planning_prompt + "\n\n" + phase_prompt)
+
+    logger.info("financial_phase_planner: planning %s phase", phase_name)
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke(prompt)
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase=f"{phase_name}_plan").observe(
+            time.monotonic() - _t0
+        )
+        result = _extract_json(response.content)
+        calls = (result or {}).get("calls", [])
+        # Filter to known tools only
+        valid_calls = [c for c in calls if c.get("tool") in {t.name for t in tools}]
+        if len(valid_calls) != len(calls):
+            logger.warning(
+                "financial_phase_planner: dropped %d unknown tool(s) from %s plan",
+                len(calls) - len(valid_calls), phase_name,
+            )
+        logger.info("financial_phase_planner: %s → %d tool call(s)", phase_name, len(valid_calls))
+    except Exception:
+        logger.exception("financial_phase_planner: %s planning failed — empty plan", phase_name)
+        valid_calls = []
+
+    return {
+        "phase_tool_plan": valid_calls,
+        "phase_scratchpad": "",
+        "iteration": state.iteration + 1,
+        "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
+    }
+
+
+async def financial_stateless_executor_node(phase_name: str, agent, state) -> dict:
+    """
+    Stateless executor for a financial pipeline phase.
+    Runs all calls from state.phase_tool_plan in parallel using asyncio.gather.
+    Results are stored in state.phase_scratchpad. No LLM call.
+    """
+    calls = getattr(state, "phase_tool_plan", None) or []
+    if not calls:
+        logger.info("financial_stateless_executor: %s — no tool calls planned, skipping", phase_name)
+        return {"phase_scratchpad": "(no tool calls)"}
+
+    tools = _get_phase_tools(agent, phase_name)
+    tools_by_name = {t.name: t for t in tools}
+    # Also include agent tools
+    tools_by_name.update(agent.tools_by_name)
+    timeout = state.tool_timeout
+
+    async def run_one(call: dict) -> str:
+        tool_name = call.get("tool", "")
+        args = call.get("args", {})
+        tool = tools_by_name.get(tool_name)
+        if tool is None:
+            return f"[{tool_name}] ERROR: tool not found"
+
+        breaker = agent._get_breaker(tool_name)
+        if breaker.is_open:
+            return f"[{tool_name}] SKIPPED: circuit breaker open"
+
+        try:
+            _t0 = time.monotonic()
+            if hasattr(tool, "ainvoke"):
+                result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(tool.invoke if hasattr(tool, "invoke") else tool.run, args),
+                    timeout=timeout,
+                )
+            breaker.record_success()
+            tool_call_duration.labels(agent="sdk", tool_name=tool_name).observe(time.monotonic() - _t0)
+            return f"[{tool_name}] → {result}"
+        except asyncio.TimeoutError:
+            breaker.record_failure(tool_name)
+            return f"[{tool_name}] TIMEOUT after {timeout:.0f}s"
+        except Exception as e:
+            breaker.record_failure(tool_name)
+            logger.exception("financial_stateless_executor: tool '%s' failed", tool_name)
+            return f"[{tool_name}] ERROR: {e}"
+
+    logger.info("financial_stateless_executor: %s — %d parallel calls: %s",
+                phase_name, len(calls), [c.get("tool") for c in calls])
+
+    results = await asyncio.gather(*[run_one(c) for c in calls])
+    scratchpad = "\n\n".join(results)
+    return {"phase_scratchpad": scratchpad}
+
+
+async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
+    """
+    Synthesis sub-node for a financial pipeline phase.
+    Calls the LLM once with the phase system prompt + tool results from phase_scratchpad
+    to produce the structured phase output (regime_context, causal_analysis, etc.).
+    """
+    from agent_sdk.financial.prompts import (
+        REGIME_ASSESSMENT_PROMPT, CAUSAL_ANALYSIS_PROMPT,
+        SECTOR_ANALYSIS_PROMPT, COMPANY_ANALYSIS_PROMPT, RISK_ASSESSMENT_PROMPT,
+    )
+
+    _phase_prompts = {
+        "regime_assessment": REGIME_ASSESSMENT_PROMPT,
+        "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context)
+        ),
+        "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+        ),
+        "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+        ),
+        "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
+            regime_context=_format_context(state.regime_context),
+            causal_analysis=_format_context(state.causal_analysis),
+            sector_analysis=_format_context(state.sector_findings),
+            company_analysis=_format_context(state.company_analysis),
+        ),
+    }
+
+    phase_prompt = _phase_prompts.get(phase_name, "")
+    phase_scratchpad = getattr(state, "phase_scratchpad", None) or "(no tool results retrieved)"
+
+    # Inject tool results into the system prompt
+    synthesis_prefix = (
+        f"TOOL RESULTS FOR THIS PHASE:\n{phase_scratchpad}\n\n"
+        "Now synthesize the above results into the required structured output. "
+        "Output the structured JSON as specified in your instructions."
+    )
+
+    # Add validation warnings for risk_assessment
+    if phase_name == "risk_assessment" and state.validation_warnings:
+        synthesis_prefix += "\n\nVALIDATION WARNINGS FROM PRIOR PHASES (address these):\n"
+        for w in state.validation_warnings:
+            synthesis_prefix += f"- {w}\n"
+
+    llm = _get_phase_llm(agent, state)
+    prompt = _build_phase_prompt(state, phase_prompt)
+    # Append tool results before handing to LLM (inject into system message)
+    prompt[0] = SystemMessage(content=f"{phase_prompt}\n\n{synthesis_prefix}")
+
+    logger.info("financial_phase_synthesizer: synthesizing %s phase", phase_name)
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke(prompt)
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase=f"{phase_name}_synth").observe(
+            time.monotonic() - _t0
+        )
+    except Exception:
+        logger.exception("financial_phase_synthesizer: %s synthesis LLM call failed", phase_name)
+        response = AIMessage(content=f"{{\"error\": \"synthesis failed for {phase_name}\"}}")
+
+    data_key = _PHASE_STATE_KEY.get(phase_name, phase_name)
+    phase_data = _extract_json(response.content) or {}
+
+    result = _build_phase_return(response, data_key, phase_data, state, phase_name)
+
+    # Run symbolic validation for phases that accumulate warnings
+    if phase_name in ("company_analysis", "risk_assessment"):
+        new_warnings = _run_phase_validation(state)
+        result["validation_warnings"] = state.validation_warnings + new_warnings
+
+    return result
+
+
+def _financial_after_plan(phase_name: str, state) -> str:
+    """
+    Conditional edge from a financial phase planner node.
+    Routes to executor if there are tool calls, otherwise directly to synthesizer.
+    """
+    calls = getattr(state, "phase_tool_plan", None) or []
+    if calls:
+        return f"{phase_name}_exec"
+    logger.info("_financial_after_plan: %s has no tool calls — skipping executor", phase_name)
+    return f"{phase_name}_synth"
+
+
+# ============================================================================
+# MEMORY NODES
+# ============================================================================
+
+_PERSPECTIVE_INJECTION_HEADER = """\
+[USER PERSONALITY BACKGROUND]
+The following is background context about this user's communication style and preferences.
+Use it ONLY to adapt tone, vocabulary, and level of detail in your responses.
+Do NOT use this to modify analytical conclusions, filter information, add/remove facts,
+or influence task planning in any way. It is read-only personality context.
+
+{perspective}
+[/USER PERSONALITY BACKGROUND]"""
+
+
+async def load_user_context(agent, state: AgentState) -> dict:
+    """
+    Load perspective memory for the current user and inject it as background
+    context into state.perspective_context.
+
+    Runs after initialize, before triager. No-op if:
+    - agent has no memory_manager
+    - state.user_id is None
+    - no perspective memory exists yet for this user
+    """
+    memory_manager = getattr(agent, "memory_manager", None)
+    if memory_manager is None:
+        return {}
+
+    user_id = getattr(state, "user_id", None)
+    if not user_id:
+        return {}
+
+    perspective = await memory_manager.get_perspective(user_id)
+    if not perspective:
+        return {}
+
+    logger.debug("load_user_context: injecting perspective for user=%s (%d chars)", user_id, len(perspective))
+    return {
+        "perspective_context": _PERSPECTIVE_INJECTION_HEADER.format(perspective=perspective),
+    }
+
+
+async def memory_writer(agent, state: AgentState) -> dict:
+    """
+    Terminal node that fires the memory pipeline as a background asyncio task.
+
+    Creates a snapshot memory summary of the completed query, then (if the
+    episodic threshold is reached) compiles episodic and perspective memories.
+
+    Does NOT block: schedules work via asyncio.create_task and returns {} immediately,
+    so no latency is added to the user-facing response.
+    """
+    memory_manager = getattr(agent, "memory_manager", None)
+    if memory_manager is None:
+        return {}
+
+    user_id = getattr(state, "user_id", None)
+    if not user_id:
+        return {}
+
+    session_id = getattr(state, "session_id", "default")
+
+    # Extract last user query
+    query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            query = _strip_context_block(msg.content)
+            break
+
+    # Extract last agent response
+    response = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+            content = msg.content
+            if isinstance(content, str) and content:
+                response = content
+                break
+
+    if not query or not response:
+        logger.debug("memory_writer: no query or response found — skipping")
+        return {}
+
+    scratchpad = getattr(state, "scratchpad", None)
+
+    # Fire-and-forget: memory pipeline runs in background, never blocks response
+    asyncio.create_task(
+        memory_manager.process_query(
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            response=response,
+            scratchpad=scratchpad,
+            llm=agent.llm,
+        )
+    )
+    logger.debug("memory_writer: background memory task scheduled for user=%s", user_id)
+    return {}
