@@ -15,11 +15,9 @@ logger = logging.getLogger("agent_sdk.agent")
 # Nodes that produce user-facing LLM output and should be streamed to the client.
 # Covers both the standard graph ("llm_call") and the financial reasoning graph.
 DEFAULT_STREAMING_NODES = frozenset({
-    "llm_call",
-    "synthesizer",
-    "regime_assessment_synth", "causal_analysis_synth",
-    "sector_analysis_synth", "company_analysis_synth",
-    "risk_assessment_synth", "synthesis",
+    "llm_call",       # standard mode flat loop
+    "synthesizer",    # standard mode synthesizer
+    "synthesis",      # financial_analyst mode — final user-facing output only
 })
 
 # Human-readable labels shown as progress markers while nodes run silently.
