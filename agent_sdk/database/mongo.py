@@ -2,7 +2,7 @@ import os
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Any, list
+from typing import Optional, Any
 from motor.motor_asyncio import AsyncIOMotorClient
 from agent_sdk.config import settings
 
