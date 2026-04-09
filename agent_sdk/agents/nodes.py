@@ -1358,9 +1358,8 @@ def _run_phase_validation(state) -> list[str]:
     warnings = []
 
     # Validate company analysis if available
-    if state.company_analysis and isinstance(state.company_analysis, dict):
-        ca = state.company_analysis
-
+    ca = state.findings.get("company_analysis")
+    if ca and isinstance(ca, dict):
         # Extract metrics for validation
         val = ca.get("valuation", {})
         fund = ca.get("fundamentals", {})
@@ -1379,9 +1378,10 @@ def _run_phase_validation(state) -> list[str]:
                 warnings.append(r.message)
 
     # Validate confidence calibration
-    if state.regime_context and isinstance(state.regime_context, dict):
-        conf = state.regime_context.get("confidence", 0.5)
-        data_points = len([v for v in state.regime_context.values() if v is not None and v != ""])
+    regime = state.findings.get("regime_assessment")
+    if regime and isinstance(regime, dict):
+        conf = regime.get("confidence", 0.5)
+        data_points = len([v for v in regime.values() if v is not None and v != ""])
         result = validate_confidence(
             stated_confidence=conf,
             data_points_available=data_points,
@@ -1390,6 +1390,7 @@ def _run_phase_validation(state) -> list[str]:
             warnings.append(result.message)
 
     return warnings
+
 
 
 _LARGE_RESULT_THRESHOLD = settings.large_result_threshold  # chars; results larger than this are distilled immediately
