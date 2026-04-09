@@ -743,7 +743,7 @@ async def causal_analysis_node(agent, state) -> dict:
 
     # Inject prior phase context into prompt
     prompt_template = CAUSAL_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.regime_context),
+        regime_context=_format_context(state.findings.get("regime_assessment")),
     )
     prompt = _build_phase_prompt(state, prompt_template)
     response = await llm_with_tools.ainvoke(prompt)
@@ -772,8 +772,8 @@ async def sector_analysis_node(agent, state) -> dict:
     llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = SECTOR_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.regime_context),
-        causal_analysis=_format_context(state.causal_analysis),
+        regime_context=_format_context(state.findings.get("regime_assessment")),
+        causal_analysis=_format_context(state.findings.get("causal_analysis")),
     )
     prompt = _build_phase_prompt(state, prompt_template)
     response = await llm_with_tools.ainvoke(prompt)
@@ -802,9 +802,9 @@ async def company_analysis_node(agent, state) -> dict:
     llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = COMPANY_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.regime_context),
-        causal_analysis=_format_context(state.causal_analysis),
-        sector_analysis=_format_context(state.sector_findings),
+        regime_context=_format_context(state.findings.get("regime_assessment")),
+        causal_analysis=_format_context(state.findings.get("causal_analysis")),
+        sector_analysis=_format_context(state.findings.get("sector_analysis")),
     )
     prompt = _build_phase_prompt(state, prompt_template)
     response = await llm_with_tools.ainvoke(prompt)
@@ -812,7 +812,7 @@ async def company_analysis_node(agent, state) -> dict:
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
         return {
-            "messages": [response], 
+            "messages": [response],
             "iteration": state.iteration + 1,
             "phase_iterations": {"company_analysis": state.phase_iterations.get("company_analysis", 0) + 1}
         }
@@ -840,10 +840,10 @@ async def risk_assessment_node(agent, state) -> dict:
     llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
 
     prompt_template = RISK_ASSESSMENT_PROMPT.format(
-        regime_context=_format_context(state.regime_context),
-        causal_analysis=_format_context(state.causal_analysis),
-        sector_analysis=_format_context(state.sector_findings),
-        company_analysis=_format_context(state.company_analysis),
+        regime_context=_format_context(state.findings.get("regime_assessment")),
+        causal_analysis=_format_context(state.findings.get("causal_analysis")),
+        sector_analysis=_format_context(state.findings.get("sector_analysis")),
+        company_analysis=_format_context(state.findings.get("company_analysis")),
     )
 
     # Inject validation warnings from company_analysis into this phase's prompt
@@ -885,15 +885,15 @@ async def synthesis_node(agent, state) -> dict:
 
     if query_type == "comparative":
         prompt_template = COMPARATIVE_SYNTHESIS_PROMPT.format(
-            company_analysis=_format_context(state.company_analysis)
+            company_analysis=_format_context(state.findings.get("company_analysis"))
         )
     else:
         prompt_template = SYNTHESIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
-            company_analysis=_format_context(state.company_analysis),
-            risk_assessment=_format_context(state.risk_assessment),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
+            company_analysis=_format_context(state.findings.get("company_analysis")),
+            risk_assessment=_format_context(state.findings.get("risk_assessment")),
         )
 
     # Add validation warnings to synthesis
@@ -1526,9 +1526,9 @@ async def comparative_analysis_node(agent, state) -> dict:
 
     async def analyze_entity(entity: str):
         prompt_template = COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
         )
         prompt_template += f"\n\nFOCUS ENTITY: {entity}. Follow all standard company analysis instructions for this specific entity."
         
