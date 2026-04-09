@@ -1,7 +1,7 @@
 from typing import Dict
 
 # Standard response formats used across the agent hub
-RESPONSE_FORMAT_INSTRUCTIONS = {
+RESPONSE_FORMAT_INSTRUCTIONS: Dict[str, str] = {
     "summary": (
         "\n\nRESPONSE FORMAT OVERRIDE: The user wants a QUICK SUMMARY. "
         "Keep your response concise — 5-7 bullet points maximum covering the key metrics, "
