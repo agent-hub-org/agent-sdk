@@ -114,6 +114,12 @@ class FinancialAnalysisState(AgentState):
     Standard agents continue using AgentState unchanged.
     """
 
+    # --- Phase Results (dynamically populated by each phase node) ---
+    query_classification: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Structured output from classify_query_node (query_type, phases_to_run, entities, etc.).",
+    )
+
     # --- Analysis Findings ---
     findings: Dict[str, Any] = Field(
         default_factory=dict,
