@@ -93,7 +93,7 @@ class BaseAgentExecutor(AgentExecutor):
                     task_id=context.task_id,
                     context_id=context.context_id,
                     final=True,
-                    status=TaskStatus(state=TaskState.failed),
+                    status=TaskStatus(state=TaskState.failed, message=str(e)),
                 )
             )
 

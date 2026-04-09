@@ -133,6 +133,11 @@ class BaseAgent:
             self._circuit_breakers[name] = CircuitBreaker()
         return self._circuit_breakers[name]
 
+    def get_available_tools(self, phase_tools: list = None) -> list:
+        """Return tools that are not currently blocked by an OPEN circuit breaker."""
+        subset = phase_tools if phase_tools is not None else self.tools
+        return [t for t in subset if not self._get_breaker(t.name).is_open]
+
     def _build_graph(self):
         """Build the appropriate graph based on mode."""
         if self.mode == "financial_analyst":
@@ -141,14 +146,29 @@ class BaseAgent:
         return create_graph(agent=self, checkpointer=self.memory)
 
     async def _ensure_initialized(self):
-        """Connect to MCP servers (if configured) and build the graph on first use."""
+        """Connect to MCP servers (if configured) and build the graph on first use.
+        Includes retries to handle transient MCP server unavailability.
+        """
         if self._initialized:
             return
 
         if self._mcp_servers:
             from ..mcp.client import MCPConnectionManager
             self._mcp_manager = MCPConnectionManager()
-            mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error("MCP initialization failed after %d attempts: %s", max_retries, e)
+                        raise
+                    backoff = 2 ** attempt
+                    logger.warning("MCP connection attempt %d failed: %s — retrying in %ds", attempt + 1, e, backoff)
+                    import asyncio
+                    await asyncio.sleep(backoff)
 
             # Merge MCP tools with any local tools
             self.tools.extend(mcp_tools)
@@ -224,8 +244,13 @@ class BaseAgent:
         else:
             response = raw
 
+        # SDK-level unwrapping of structured synthesis
+        from agent_sdk.utils.output import unwrap_structured_response
+        response = unwrap_structured_response(response)
+
         # Build execution trace from message history
         steps = []
+
         from langchain_core.messages import AIMessage, ToolMessage
         for msg in result["messages"]:
             if isinstance(msg, AIMessage):
@@ -377,20 +402,14 @@ class StreamResult:
                 if node == "synthesis" and _synthesis_buffer:
                     raw = "".join(_synthesis_buffer)
                     _synthesis_buffer.clear()
-                    clean = raw
-                    try:
-                        parsed = _json.loads(raw)
-                        if isinstance(parsed, dict) and "full_report" in parsed:
-                            clean = parsed["full_report"]
-                            logger.debug(
-                                "Synthesis: unwrapped JSON full_report (%d → %d chars)",
-                                len(raw), len(clean),
-                            )
-                    except Exception:
-                        pass  # Not valid JSON — stream as-is
+
+                    from agent_sdk.utils.output import unwrap_structured_response
+                    clean = unwrap_structured_response(raw)
+
                     if clean:
                         chunks_yielded = True
                         yield clean
+
 
                 # Track tool calls from LLM responses
                 output = event["data"].get("output")
@@ -435,12 +454,12 @@ class StreamResult:
             # Also unwrap JSON on the fallback path
             clean_fallback = last_full_response
             try:
-                parsed = _json.loads(last_full_response)
-                if isinstance(parsed, dict) and "full_report" in parsed:
-                    clean_fallback = parsed["full_report"]
+                from agent_sdk.utils.output import unwrap_structured_response
+                clean_fallback = unwrap_structured_response(last_full_response)
             except Exception:
                 pass
             yield clean_fallback
+
 
     def run(self, query: str, session_id: str = "default") -> dict:
         """

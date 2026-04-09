@@ -169,6 +169,17 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         graph.add_node(f"{ph}_exec",  partial(financial_stateless_executor_node, ph, agent))
         graph.add_node(f"{ph}_synth", partial(financial_phase_synthesizer,       ph, agent))
 
+    # Parallel Fan-out: Sector and Company analysis can run concurrently
+    # We define a combined node that triggers both
+    def parallel_analysis_router(state: FinancialAnalysisState) -> list[str]:
+        if state.current_phase == "causal_analysis" and "sector_analysis" in state.phases_to_run and "company_analysis" in state.phases_to_run:
+            return ["sector_analysis", "company_analysis"]
+        return [state.current_phase]
+
+    # Note: To implement true parallelization in LangGraph, we use the 'Send' pattern or
+    # simply add edges from one node to multiple nodes.
+    # Here we modify the edges instead of adding a router node for simplicity.
+
     # --- Unchanged phases ---
     graph.add_node("comparative_analysis", partial(comparative_analysis_node, agent))
     graph.add_node("synthesis", partial(synthesis_node, agent))
@@ -200,7 +211,26 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
             {f"{ph}_exec": f"{ph}_exec", f"{ph}_synth": f"{ph}_synth"},
         )
         graph.add_edge(f"{ph}_exec",  f"{ph}_synth")
-        graph.add_edge(f"{ph}_synth", "phase_advance")
+
+        # Modified phase_advance for parallelization
+        if ph == "causal_analysis":
+            # After causal analysis synthesis, if both sector and company are next, run them in parallel
+            graph.add_conditional_edges(
+                f"{ph}_synth",
+                lambda state: ["sector_analysis", "company_analysis"]
+                if "sector_analysis" in state.phases_to_run and "company_analysis" in state.phases_to_run
+                else "phase_advance",
+                {
+                    "sector_analysis": "sector_analysis",
+                    "company_analysis": "company_analysis",
+                    "phase_advance": "phase_advance"
+                }
+            )
+        elif ph in ("sector_analysis", "company_analysis"):
+            # Parallel nodes wait for each other by routing to a common sync point (phase_advance)
+            graph.add_edge(f"{ph}_synth", "phase_advance")
+        else:
+            graph.add_edge(f"{ph}_synth", "phase_advance")
 
     # Comparative analysis → phase_advance (unchanged)
     graph.add_edge("comparative_analysis", "phase_advance")

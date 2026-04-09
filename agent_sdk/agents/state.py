@@ -114,41 +114,10 @@ class FinancialAnalysisState(AgentState):
     Standard agents continue using AgentState unchanged.
     """
 
-    # --- Query Classification ---
-    query_classification: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Output of the query classifier — determines which pipeline phases to activate.",
-    )
-
-    # --- Phase Outputs (structured dicts from Pydantic schema .model_dump()) ---
-    regime_context: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Structured regime assessment: monetary/market regime, cycle position, key indicators.",
-    )
-
-    causal_analysis: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Causal chain analysis: transmission mechanisms, affected sectors/companies.",
-    )
-
-    sector_findings: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Sector-level analysis: valuation, growth, rotation signals.",
-    )
-
-    company_analysis: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Company-level fundamental analysis: valuation, quality, DCF, peer comparison.",
-    )
-
-    risk_assessment: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Risk assessment: scenarios, stress tests, validation warnings.",
-    )
-
-    synthesis_report: Optional[dict[str, Any]] = Field(
-        default=None,
-        description="Final synthesized report combining all phases.",
+    # --- Analysis Findings ---
+    findings: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Map of phase name to its structured findings (e.g., {'regime_assessment': {...}}).",
     )
 
     # --- Pipeline Control ---

@@ -1,14 +1,13 @@
-import logging
 import os
+import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Optional, Any, list
 from motor.motor_asyncio import AsyncIOMotorClient
-
 from agent_sdk.config import settings
 
 logger = logging.getLogger("agent_sdk.database.mongo")
 _MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-
 
 class BaseMongoDatabase:
     """
@@ -102,3 +101,33 @@ class BaseMongoDatabase:
         if cls._client:
             cls._client.close()
             cls._client = None
+
+class MongoManager:
+    """
+    Standardized MongoDB client manager for agents.
+    Handles connection pooling and basic CRUD operations.
+    """
+    def __init__(self, uri: str = None, db_name: str = None):
+        self.uri = uri or _MONGO_URI
+        self.db_name = db_name
+        self._client: AsyncIOMotorClient | None = None
+
+    async def get_client(self) -> AsyncIOMotorClient:
+        if self._client is None:
+            logger.info("Initializing Mongo client at %s", self.uri)
+            self._client = AsyncIOMotorClient(
+                self.uri,
+                serverSelectionTimeoutMS=5000,
+                socketTimeoutMS=30000,
+            )
+        return self._client
+
+    async def get_collection(self, collection_name: str, db_override: str = None) -> Any:
+        client = await self.get_client()
+        db_name = db_override or self.db_name or "agent_db"
+        return client[db_name][collection_name]
+
+    async def close(self):
+        if self._client:
+            self._client.close()
+            self._client = None

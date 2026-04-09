@@ -1136,7 +1136,7 @@ def _get_phase_tools(agent, phase: str) -> list:
             combined.append(t)
             seen.add(t.name)
 
-    return combined
+    return agent.get_available_tools(phase_tools=combined)
 
 
 def _build_phase_prompt(state, phase_system_prompt: str) -> list:
@@ -2022,25 +2022,36 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
         SECTOR_ANALYSIS_PROMPT, COMPANY_ANALYSIS_PROMPT, RISK_ASSESSMENT_PROMPT,
     )
 
+    # Deterministic phases bypass the planner and go straight to execution
+    # These are phases where the tool set is effectively constant or handled by a specific logic
+    if phase_name == "query_classification":
+        # We simulate a plan for the classifier tool
+        return {
+            "phase_tool_plan": [{"tool": "classify_query", "args": {}}],
+            "phase_scratchpad": "",
+            "iteration": state.iteration + 1,
+            "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
+        }
+
     _phase_prompts = {
         "regime_assessment": REGIME_ASSESSMENT_PROMPT,
         "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context)
+            regime_context=_format_context(state.findings.get("regime_assessment"))
         ),
         "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
         ),
         "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
         ),
         "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
-            company_analysis=_format_context(state.company_analysis),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
+            company_analysis=_format_context(state.findings.get("company_analysis")),
         ),
     }
 
@@ -2155,22 +2166,22 @@ async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
     _phase_prompts = {
         "regime_assessment": REGIME_ASSESSMENT_PROMPT,
         "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context)
+            regime_context=_format_context(state.findings.get("regime_assessment"))
         ),
         "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
         ),
         "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
         ),
         "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
-            regime_context=_format_context(state.regime_context),
-            causal_analysis=_format_context(state.causal_analysis),
-            sector_analysis=_format_context(state.sector_findings),
-            company_analysis=_format_context(state.company_analysis),
+            regime_context=_format_context(state.findings.get("regime_assessment")),
+            causal_analysis=_format_context(state.findings.get("causal_analysis")),
+            sector_analysis=_format_context(state.findings.get("sector_analysis")),
+            company_analysis=_format_context(state.findings.get("company_analysis")),
         ),
     }
 
@@ -2207,10 +2218,15 @@ async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
         logger.exception("financial_phase_synthesizer: %s synthesis LLM call failed", phase_name)
         response = AIMessage(content=f"{{\"error\": \"synthesis failed for {phase_name}\"}}")
 
-    data_key = _PHASE_STATE_KEY.get(phase_name, phase_name)
+    data_key = phase_name
     phase_data = _extract_json(response.content) or {}
 
+    # Store result in the dynamic findings map
+    findings = state.findings.copy()
+    findings[phase_name] = phase_data
+
     result = _build_phase_return(response, data_key, phase_data, state, phase_name)
+    result["findings"] = findings
 
     # Run symbolic validation for phases that accumulate warnings
     if phase_name in ("company_analysis", "risk_assessment"):
