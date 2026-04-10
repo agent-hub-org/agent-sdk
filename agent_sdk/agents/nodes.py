@@ -1996,6 +1996,13 @@ AUTONOMY RULE: Make all decisions yourself — never ask the user for clarificat
 
 {tool_catalog}
 
+REQUIRED ARGS RULE: Args marked with * are REQUIRED. You MUST provide a concrete, non-empty value
+for every required arg. Never output an empty string "", null, or {{}} for a required field.
+Example of a CORRECT call:
+  {{"tool": "tavily_quick_search", "args": {{"query": "RBI rate cut impact on Indian NBFCs 2026"}}}}
+Example of an INVALID call (will be rejected):
+  {{"tool": "tavily_quick_search", "args": {{}}}}
+
 OUTPUT RULE (overrides any other format instruction): Output ONLY valid JSON — no explanation, no markdown:
 {{"calls": [{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...]}}
 
@@ -2078,12 +2085,36 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
         result = _extract_json(response.content)
         calls = (result or {}).get("calls", [])
         # Filter to known tools only
-        valid_calls = [c for c in calls if c.get("tool") in {t.name for t in tools}]
+        known_names = {t.name for t in tools}
+        valid_calls = [c for c in calls if c.get("tool") in known_names]
         if len(valid_calls) != len(calls):
             logger.warning(
                 "financial_phase_planner: dropped %d unknown tool(s) from %s plan",
                 len(calls) - len(valid_calls), phase_name,
             )
+        # Guard: drop calls with missing required args (e.g. tavily_quick_search with empty args)
+        tools_by_name_map = {t.name: t for t in tools}
+
+        def _args_complete(call: dict) -> bool:
+            tool = tools_by_name_map.get(call.get("tool", ""))
+            if not tool:
+                return False
+            try:
+                schema = tool.get_input_schema().model_json_schema() if hasattr(tool, "get_input_schema") else {}
+                required = set(schema.get("required", []))
+                args = call.get("args") or {}
+                return all(k in args and args[k] not in (None, "", {}, []) for k in required)
+            except Exception:
+                return True  # can't introspect schema — let it through
+
+        complete_calls = [c for c in valid_calls if _args_complete(c)]
+        if len(complete_calls) != len(valid_calls):
+            dropped = [c.get("tool") for c in valid_calls if not _args_complete(c)]
+            logger.warning(
+                "financial_phase_planner: dropped %d call(s) with missing required args from %s plan: %s",
+                len(valid_calls) - len(complete_calls), phase_name, dropped,
+            )
+        valid_calls = complete_calls
         logger.info("financial_phase_planner: %s → %d tool call(s)", phase_name, len(valid_calls))
     except Exception:
         logger.exception("financial_phase_planner: %s planning failed — empty plan", phase_name)
