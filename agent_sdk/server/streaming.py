@@ -91,7 +91,9 @@ class StreamingMathFixer:
             if result:
                 yield result
 
-        # Flush any remaining buffer after the source stream ends
+        # Flush any remaining buffer after the source stream ends.
+        # Only wrap in math delimiters if we're inside a math block (unclosed delimiter).
+        # A lone trailing backslash in normal context is emitted as-is.
         if buffer:
             if in_math:
                 yield "$" + buffer + "$"

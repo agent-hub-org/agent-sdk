@@ -7,7 +7,13 @@ from agent_sdk.config import settings
 
 
 def merge_dicts(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
-    """Simple dictionary merger for state fields."""
+    """Simple dictionary merger for state fields.
+
+    Note: nodes compute absolute values (e.g. phase_iterations reads the current
+    count and returns count+1), so right-wins semantics is correct for counters.
+    Concurrent writes to the same key will lose one update — this is acceptable
+    because parallel fan-out writes to different phase keys.
+    """
     return {**left, **right}
 
 
@@ -171,10 +177,11 @@ class FinancialAnalysisState(AgentState):
             "causal_analysis": 2,
             "sector_analysis": 2,
             "company_analysis": 4,
+            "comparative_analysis": 3,
             "risk_assessment": 2,
             "synthesis": 3,
         },
-        description="Per-phase iteration budgets for the financial cognitive pipeline. Total: 20 iterations.",
+        description="Per-phase iteration budgets for the financial cognitive pipeline. Total: 19 iterations.",
     )
 
     # --- Per-phase planning / execution scratchpad ---

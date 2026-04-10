@@ -132,15 +132,17 @@ async def llm_call(agent, state: AgentState) -> dict:
 
     # Inject financial phase outputs if present (financial_analyst mode follow-up queries)
     _FINANCIAL_PHASE_FIELDS = [
-        ("regime_context", "Market Regime"),
+        ("regime_assessment", "Market Regime"),
         ("causal_analysis", "Causal Analysis"),
-        ("sector_findings", "Sector Analysis"),
+        ("sector_analysis", "Sector Analysis"),
         ("company_analysis", "Company Analysis"),
         ("risk_assessment", "Risk Assessment"),
     ]
     phase_parts = []
+    # FinancialAnalysisState stores phase results in state.findings dict
+    findings = getattr(state, "findings", None) or {}
     for field, label in _FINANCIAL_PHASE_FIELDS:
-        val = getattr(state, field, None)
+        val = findings.get(field)
         if val:
             serialized = json.dumps(val, default=str)
             phase_parts.append(f"**{label}**: {serialized[:800]}")
@@ -307,6 +309,12 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
         args = tool_call.get("args", {})
         logger.info("Executing tool '%s' with args: %s", name, args)
 
+        if name not in _lookup:
+            return ToolMessage(
+                content=f"Error: unknown tool '{name}'. Available tools: {', '.join(sorted(_lookup.keys()))}",
+                tool_call_id=tool_call["id"],
+            )
+
         tool = _lookup[name]
         breaker = agent._get_breaker(name)
 
@@ -371,6 +379,11 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                     agent.tools = list(agent.tools)  # keep non-MCP tools
                     for t in new_tools:
                         agent.tools_by_name[t.name] = t
+                    # Rebuild the lookup dict so the retry uses the new tool objects
+                    _lookup.clear()
+                    _lookup.update(agent.tools_by_name)
+                    if phase_tools:
+                        _lookup.update({t.name: t for t in phase_tools})
                     logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
                     results = await _gather_with_timeout()
                 else:
@@ -724,7 +737,7 @@ async def regime_assessment_node(agent, state) -> dict:
     # Phase complete — extract structured regime context from response
     regime_data = _extract_json(response.content) or {}
     logger.info("Regime assessment complete: %s", regime_data.get("market_regime", "unknown"))
-    return _build_phase_return(response, "regime_context", regime_data, state, "regime_assessment")
+    return _build_phase_return(response, "regime_assessment", regime_data, state, "regime_assessment")
 
 
 async def causal_analysis_node(agent, state) -> dict:
@@ -787,7 +800,7 @@ async def sector_analysis_node(agent, state) -> dict:
         }
 
     sector_data = _extract_json(response.content) or {}
-    return _build_phase_return(response, "sector_findings", sector_data, state, "sector_analysis")
+    return _build_phase_return(response, "sector_analysis", sector_data, state, "sector_analysis")
 
 
 async def company_analysis_node(agent, state) -> dict:
@@ -1005,6 +1018,9 @@ async def financial_tool_node(agent, state) -> dict:
     so state.messages never contains an orphaned AIMessage(tool_calls).
     """
     phase_tools = _get_phase_tools(agent, state.current_phase)
+    # Save original so we can restore after this node finishes.
+    # NOTE: agent.tools_by_name is mutated temporarily. This is safe because
+    # LangGraph nodes execute sequentially within a step — no concurrent access.
     original_tools_by_name = dict(agent.tools_by_name)
 
     for t in phase_tools:
@@ -1299,7 +1315,16 @@ def _extract_json(text: str) -> dict | None:
                         pass
                 start = None
     if candidates:
-        return max(candidates, key=lambda x: len(x))
+        # Heuristic: prefer candidates with string-valued keys (phase outputs have
+        # descriptive keys), and among those pick the one with the most keys.
+        # Skip tiny objects (e.g., {"type": "tool_call"}) that are likely not phase output.
+        scored = []
+        for obj in candidates:
+            string_keys = sum(1 for v in obj.values() if isinstance(v, str) and len(v) > 10)
+            score = len(obj) + string_keys * 2
+            scored.append((score, obj))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
 
     logger.warning(
         "_extract_json: all parsing strategies failed (text length=%d, first 500 chars: '%s')",
@@ -2011,9 +2036,9 @@ If no tool calls are needed, output: {{"calls": []}}
 
 # Maps phase name → state field that stores its structured output
 _PHASE_STATE_KEY: dict[str, str] = {
-    "regime_assessment": "regime_context",
+    "regime_assessment": "regime_assessment",
     "causal_analysis": "causal_analysis",
-    "sector_analysis": "sector_findings",
+    "sector_analysis": "sector_analysis",
     "company_analysis": "company_analysis",
     "risk_assessment": "risk_assessment",
 }

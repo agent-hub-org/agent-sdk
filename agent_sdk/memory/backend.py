@@ -81,6 +81,10 @@ class InMemoryBackend(MemoryBackend):
         return list(self._snapshots.get(f"{user_id}:{session_id}", []))
 
     async def reset_snapshots(self, user_id: str, session_id: str) -> None:
+        # NOTE: This destroys all snapshots for the session. If a new snapshot
+        # arrives between get_snapshots and reset_snapshots, it will be lost.
+        # For production backends (MongoDB, Redis), consider filtering by
+        # timestamp instead of clearing the entire key.
         self._snapshots.pop(f"{user_id}:{session_id}", None)
         logger.debug("InMemoryBackend: reset snapshot cache for %s:%s", user_id, session_id)
 

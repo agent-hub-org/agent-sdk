@@ -50,6 +50,12 @@ class AgentSDKSettings(BaseSettings):
     min_routing_confidence: float = 0.25
     a2a_max_retries: int = 3
 
+    # ── LLM defaults ────────────────────────────────────────────────────────────
+    llm_temperature: float = 0.7
+    llm_model: str = "gpt-5-nano"
+    llm_timeout: float = 120.0
+    llm_max_retries: int = 3
+
     # ── Financial pipeline confidence scoring ─────────────────────────────────
     confidence_penalty_per_warning: float = 1.0
     confidence_penalty_per_fallback: float = 1.5

@@ -1,9 +1,9 @@
 [project]
 name = "agent-sdk"
 version = "0.1.0"
-description = ""
+description = "Shared SDK for agent-hub multi-agent system"
 authors = [
-    {name = "Your Name",email = "you@example.com"}
+    {name = "Pranjal Verma",email = "pranjalv23@users.noreply.github.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.13,<4.0"
@@ -16,9 +16,20 @@ dependencies = [
     "pydantic (>=2.12.5,<4.0.0)",
     "pydantic-settings (>=2.0.0,<4.0.0)",
     "langchain-openai (>=0.3.0,<1.0.0)",
-    "langchain-mcp-adapters (>=0.1.0)",
+    "langchain-mcp-adapters (>=0.1.0,<0.3.0)",
     "networkx (>=3.0,<4.0.0)",
-    "prometheus-client (>=0.20.0,<1.0.0)"
+    "prometheus-client (>=0.20.0,<1.0.0)",
+    "motor (>=3.6.0,<4.0.0)",
+    "pymongo (>=4.10.0,<5.0.0)",
+    "httpx (>=0.28.0,<1.0.0)",
+    "a2a-sdk (>=0.2.0,<0.4.0)",
+    "python-jose (>=3.3.0,<4.0.0)",
+    "starlette (>=0.45.0,<1.0.0)",
+]
+
+[project.optional-dependencies]
+memory = [
+    "mem0ai (>=0.1.0,<1.0.0)",
 ]
 
 [tool.poetry.group.dev.dependencies]

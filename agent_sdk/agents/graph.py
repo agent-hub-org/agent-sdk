@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any, Optional
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
 
 from agent_sdk.agents.state import AgentState, FinancialAnalysisState
 
@@ -215,17 +216,12 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         # Modified phase_advance for parallelization
         if ph == "causal_analysis":
             # After causal analysis synthesis, if both sector and company are next, run them in parallel
-            graph.add_conditional_edges(
-                f"{ph}_synth",
-                lambda state: ["sector_analysis", "company_analysis"]
-                if "sector_analysis" in state.phases_to_run and "company_analysis" in state.phases_to_run
-                else "phase_advance",
-                {
-                    "sector_analysis": "sector_analysis",
-                    "company_analysis": "company_analysis",
-                    "phase_advance": "phase_advance"
-                }
-            )
+            def _causal_synth_router(state):
+                if "sector_analysis" in state.phases_to_run and "company_analysis" in state.phases_to_run:
+                    return [Send("sector_analysis", state), Send("company_analysis", state)]
+                return "phase_advance"
+
+            graph.add_conditional_edges(f"{ph}_synth", _causal_synth_router)
         elif ph in ("sector_analysis", "company_analysis"):
             # Parallel nodes wait for each other by routing to a common sync point (phase_advance)
             graph.add_edge(f"{ph}_synth", "phase_advance")
@@ -267,23 +263,3 @@ def _route_phase(state: FinancialAnalysisState) -> str:
     logger.info("Routing to phase: %s (node: %s)", next_phase, target)
     return target
 
-
-def _route_back_to_phase(state: FinancialAnalysisState) -> str:
-    """
-    Route back to the current active phase after tool execution.
-    If the phase budget was reached, force an advance instead of looping.
-    """
-    phase_name = state.current_phase
-    phase_budgets = getattr(state, "phase_iteration_budgets", {})
-    phase_count = getattr(state, "phase_iterations", {}).get(phase_name, 0)
-    phase_limit = phase_budgets.get(phase_name, 3)
-
-    if phase_count >= phase_limit:
-        logger.warning(
-            "Phase %s budget hit (%d/%d) after tool execution — forcing phase_advance to prevent infinite loop",
-            phase_name, phase_count, phase_limit
-        )
-        return "phase_advance"
-
-    logger.info("_route_back_to_phase — current_phase=%s", phase_name)
-    return phase_name

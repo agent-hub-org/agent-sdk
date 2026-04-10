@@ -25,7 +25,7 @@ class _State(Enum):
 
 
 class CircuitBreaker:
-    """Lightweight, asyncio-safe circuit breaker (no external dependencies).
+    """Lightweight circuit breaker for MCP tool calls.
 
     Usage::
 

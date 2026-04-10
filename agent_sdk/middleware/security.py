@@ -39,7 +39,11 @@ class JWTAuth:
             if payload.get("type") != "refresh":
                 return None
             return payload.get("sub")
+        except ExpiredSignatureError:
+            logger.info("Refresh token expired")
+            return None
         except JWTError:
+            logger.warning("Invalid refresh token")
             return None
 
     def create_access_token(self, user_id: str, expires_delta: Optional[timedelta] = None) -> str:

@@ -57,7 +57,10 @@ class AsyncMongoDBSaver(MongoDBSaver):
         ttl: Optional[int] = None,
         serde=None,
     ) -> None:
-        # Sync client passed to parent for inherited sync methods
+        # Sync client passed to parent for inherited sync methods.
+        # NOTE: This doubles connection pool usage since both sync and async clients
+        # connect to the same MongoDB. If sync methods are never used, consider
+        # removing the sync client and parent class inheritance.
         sync_client = MongoClient(
             conn_string,
             serverSelectionTimeoutMS=settings.checkpoint_selection_timeout_ms,
