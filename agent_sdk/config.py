@@ -18,7 +18,7 @@ class AgentSDKSettings(BaseSettings):
     max_context_tokens: int = 32768
     keep_last_n_messages: int = 15
     max_iterations: int = 10
-    tool_timeout: float = 120.0
+    tool_timeout: float = 180.0
 
     # ── Streaming ──────────────────────────────────────────────────────────────
     stream_timeout_seconds: float = 300.0
