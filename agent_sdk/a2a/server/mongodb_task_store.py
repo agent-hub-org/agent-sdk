@@ -1,7 +1,9 @@
 import logging
 from typing import Any, Optional
 
+from a2a.server.context import ServerCallContext
 from a2a.server.tasks import TaskStore
+from a2a.types import Task
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger("agent_sdk.a2a.mongodb_task_store")
@@ -32,34 +34,28 @@ class AsyncMongoDBTaskStore(TaskStore):
             collection_name,
         )
 
-    async def get(self, task_id: str) -> Optional[Any]:
+    async def get(
+        self, task_id: str, context: ServerCallContext | None = None
+    ) -> Task | None:
         """Retrieve a task from MongoDB."""
         doc = await self._collection.find_one({"task_id": task_id})
-        if doc:
-            # Note: We assume the task object is stored in 'task_data'
-            # Depending on how a2a-sdk expects the object (instance vs dict),
-            # we might need to reconstruct the object here.
-            # However, since we don't have the class info, we store/return as is.
-            # If a2a-sdk expects a specific type, this might need an adapter.
-            return doc.get("task_data")
+        if doc and (task_data := doc.get("task_data")):
+            return Task.model_validate(task_data)
         return None
 
-    async def save(self, task_id: str, task: Any) -> None:
+    async def save(
+        self, task: Task, context: ServerCallContext | None = None
+    ) -> None:
         """Save or update a task in MongoDB."""
-        # Handle Pydantic models if present
-        task_data = task
-        if hasattr(task, "model_dump"):
-            task_data = task.model_dump()
-        elif hasattr(task, "dict"):
-            task_data = task.dict()
-
         await self._collection.update_one(
-            {"task_id": task_id},
-            {"$set": {"task_id": task_id, "task_data": task_data}},
+            {"task_id": task.id},
+            {"$set": {"task_id": task.id, "task_data": task.model_dump()}},
             upsert=True,
         )
 
-    async def delete(self, task_id: str) -> None:
+    async def delete(
+        self, task_id: str, context: ServerCallContext | None = None
+    ) -> None:
         """Remove a task from MongoDB."""
         await self._collection.delete_one({"task_id": task_id})
 
