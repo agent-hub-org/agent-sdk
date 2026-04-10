@@ -6,7 +6,9 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.types import (
     Artifact,
+    Message,
     Part,
+    Role,
     TaskArtifactUpdateEvent,
     TaskState,
     TaskStatus,
@@ -73,6 +75,7 @@ class BaseAgentExecutor(AgentExecutor):
                     task_id=context.task_id,
                     context_id=context.context_id,
                     artifact=Artifact(
+                        artifact_id=f"artifact-{context.task_id}",
                         parts=[Part(root=TextPart(text=response_text))],
                     ),
                     last_chunk=True,
@@ -93,7 +96,14 @@ class BaseAgentExecutor(AgentExecutor):
                     task_id=context.task_id,
                     context_id=context.context_id,
                     final=True,
-                    status=TaskStatus(state=TaskState.failed, message=str(e)),
+                    status=TaskStatus(
+                        state=TaskState.failed,
+                        message=Message(
+                            message_id=f"error-{context.task_id}",
+                            role=Role.agent,
+                            parts=[Part(root=TextPart(text=str(e)))],
+                        ),
+                    ),
                 )
             )
 
