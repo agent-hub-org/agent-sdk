@@ -1877,6 +1877,9 @@ async def stateless_executor(agent, state: AgentState) -> dict:
     batch = plan[idx]
     timeout = state.tool_timeout
 
+    # Normalize inputs: handle lists fanned out by LLM where strings were expected
+    batch = _normalize_tool_calls(batch, agent.tools_by_name)
+
     async def run_one(call: dict) -> str:
         tool_name = call.get("tool", "")
         args = call.get("args", {})
@@ -1921,6 +1924,60 @@ async def stateless_executor(agent, state: AgentState) -> dict:
         "scratchpad": existing_scratchpad + batch_section,
         "current_batch_index": idx + 1,
     }
+
+
+def _normalize_tool_calls(calls: list[dict], tools_by_name: dict) -> list[dict]:
+    """
+    Handle tool calls where the LLM provided a list for an argument that expects a string.
+    If a list has multiple elements, the call is split into multiple parallel calls (multi-dispatch).
+    If a list has a single element, it is flattened to a string.
+    """
+    normalized = []
+    for call in calls:
+        tool_name = call.get("tool")
+        args = call.get("args", {})
+        tool = tools_by_name.get(tool_name)
+
+        if not tool or not hasattr(tool, "args_schema") or not hasattr(tool.args_schema, "model_json_schema"):
+            normalized.append(call)
+            continue
+
+        try:
+            schema = tool.args_schema.model_json_schema().get("properties", {})
+        except Exception:
+            normalized.append(call)
+            continue
+
+        # Detect fanned-out list arguments
+        fanned_arg = None
+        fanned_values = []
+
+        # We only fan out on the FIRST encountered list argument that should be a string.
+        # This covers 99% of LLM planning mistakes.
+        current_args = dict(args)
+        for arg_name, arg_val in current_args.items():
+            if isinstance(arg_val, list) and arg_name in schema:
+                arg_def = schema[arg_name]
+                # If the schema says it should be a string, but we got a list...
+                if arg_def.get("type") == "string":
+                    if len(arg_val) == 1:
+                        # Simple wrapping: ["item"] -> "item"
+                        current_args[arg_name] = arg_val[0]
+                    else:
+                        # Multi-dispatch: split this one call into many
+                        fanned_arg = arg_name
+                        fanned_values = arg_val
+                        break
+
+        if fanned_arg:
+            for val in fanned_values:
+                new_args = current_args.copy()
+                new_args[fanned_arg] = val
+                normalized.append({"tool": tool_name, "args": new_args})
+        else:
+            normalized.append({"tool": tool_name, "args": current_args})
+
+    return normalized
 
 
 def after_planner_router(state: AgentState) -> Literal["stateless_executor", "llm_call"]:
@@ -2153,12 +2210,6 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
     }
 
 
-async def financial_stateless_executor_node(phase_name: str, agent, state) -> dict:
-    """
-    Stateless executor for a financial pipeline phase.
-    Runs all calls from state.phase_tool_plan in parallel using asyncio.gather.
-    Results are stored in state.phase_scratchpad. No LLM call.
-    """
     calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
     if not calls:
         logger.info("financial_stateless_executor: %s — no tool calls planned, skipping", phase_name)
@@ -2168,6 +2219,10 @@ async def financial_stateless_executor_node(phase_name: str, agent, state) -> di
     tools_by_name = {t.name: t for t in tools}
     # Also include agent tools
     tools_by_name.update(agent.tools_by_name)
+    
+    # Normalize inputs: handle lists fanned out by LLM where strings were expected
+    calls = _normalize_tool_calls(calls, tools_by_name)
+    
     timeout = state.tool_timeout
 
     async def run_one(call: dict) -> str:
@@ -2201,7 +2256,7 @@ async def financial_stateless_executor_node(phase_name: str, agent, state) -> di
             logger.exception("financial_stateless_executor: tool '%s' failed", tool_name)
             return f"[{tool_name}] ERROR: {e}"
 
-    logger.info("financial_stateless_executor: %s — %d parallel calls: %s",
+    logger.info("financial_stateless_executor: %s — %d parallel calls (normalized): %s",
                 phase_name, len(calls), [c.get("tool") for c in calls])
 
     results = await asyncio.gather(*[run_one(c) for c in calls])
