@@ -565,7 +565,7 @@ def _build_phase_return(
     result: dict = {
         "messages": [response],
         data_key: data if data else {"raw_analysis": response.content},
-        "raw_fallback_count": state.raw_fallback_count + fallback_inc,
+        "raw_fallback_count": fallback_inc,
         "iteration": state.iteration + 1,
         "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
     }
@@ -2146,8 +2146,8 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
         valid_calls = []
 
     return {
-        "phase_tool_plan": valid_calls,
-        "phase_scratchpad": "",
+        "phase_tool_plan": {phase_name: valid_calls},
+        "phase_scratchpad": {phase_name: ""},
         "iteration": state.iteration + 1,
         "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
     }
@@ -2159,10 +2159,10 @@ async def financial_stateless_executor_node(phase_name: str, agent, state) -> di
     Runs all calls from state.phase_tool_plan in parallel using asyncio.gather.
     Results are stored in state.phase_scratchpad. No LLM call.
     """
-    calls = getattr(state, "phase_tool_plan", None) or []
+    calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
     if not calls:
         logger.info("financial_stateless_executor: %s — no tool calls planned, skipping", phase_name)
-        return {"phase_scratchpad": "(no tool calls)"}
+        return {"phase_scratchpad": {phase_name: "(no tool calls)"}}
 
     tools = _get_phase_tools(agent, phase_name)
     tools_by_name = {t.name: t for t in tools}
@@ -2205,8 +2205,8 @@ async def financial_stateless_executor_node(phase_name: str, agent, state) -> di
                 phase_name, len(calls), [c.get("tool") for c in calls])
 
     results = await asyncio.gather(*[run_one(c) for c in calls])
-    scratchpad = "\n\n".join(results)
-    return {"phase_scratchpad": scratchpad}
+    combined_scratchpad = "\n\n".join(results)
+    return {"phase_scratchpad": {phase_name: combined_scratchpad}}
 
 
 async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
@@ -2243,7 +2243,7 @@ async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
     }
 
     phase_prompt = _phase_prompts.get(phase_name, "")
-    phase_scratchpad = getattr(state, "phase_scratchpad", None) or "(no tool results retrieved)"
+    phase_scratchpad = (getattr(state, "phase_scratchpad", None) or {}).get(phase_name, "(no tool results retrieved)")
 
     # Inject tool results into the system prompt
     synthesis_prefix = (
@@ -2278,17 +2278,13 @@ async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
     data_key = phase_name
     phase_data = _extract_json(response.content) or {}
 
-    # Store result in the dynamic findings map
-    findings = state.findings.copy()
-    findings[phase_name] = phase_data
-
     result = _build_phase_return(response, data_key, phase_data, state, phase_name)
-    result["findings"] = findings
+    result["findings"] = {phase_name: phase_data}
 
     # Run symbolic validation for phases that accumulate warnings
     if phase_name in ("company_analysis", "risk_assessment"):
         new_warnings = _run_phase_validation(state)
-        result["validation_warnings"] = state.validation_warnings + new_warnings
+        result["validation_warnings"] = new_warnings
 
     return result
 
@@ -2298,7 +2294,7 @@ def _financial_after_plan(phase_name: str, state) -> str:
     Conditional edge from a financial phase planner node.
     Routes to executor if there are tool calls, otherwise directly to synthesizer.
     """
-    calls = getattr(state, "phase_tool_plan", None) or []
+    calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
     if calls:
         return f"{phase_name}_exec"
     logger.info("_financial_after_plan: %s has no tool calls — skipping executor", phase_name)

@@ -1,3 +1,4 @@
+import operator
 from typing import Annotated, Any, Sequence, Optional, Dict
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
@@ -14,7 +15,25 @@ def merge_dicts(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
     Concurrent writes to the same key will lose one update — this is acceptable
     because parallel fan-out writes to different phase keys.
     """
+    if not left:
+        return right
+    if not right:
+        return left
     return {**left, **right}
+
+
+def max_int(left: int, right: int) -> int:
+    """Reducer that keeps the maximum value."""
+    return max(left, right)
+
+
+def join_strings(left: str | None, right: str | None) -> str:
+    """Reducer that joins strings with double newlines."""
+    l = left or ""
+    r = right or ""
+    if l and r:
+        return f"{l}\n\n{r}"
+    return l or r
 
 
 class AgentState(BaseModel):
@@ -45,7 +64,7 @@ class AgentState(BaseModel):
         default_factory=lambda: settings.max_iterations,
         description="Maximum number of reasoning/tool-use iterations before forcing a stop.",
     )
-    iteration: int = Field(
+    iteration: Annotated[int, max_int] = Field(
         default=0,
         description="Current iteration count for the autonomous agent loop.",
     )
@@ -95,11 +114,11 @@ class AgentState(BaseModel):
             "Each batch is a list of {'tool': name, 'args': {...}} dicts that run concurrently."
         ),
     )
-    current_batch_index: int = Field(
+    current_batch_index: Annotated[int, max_int] = Field(
         default=0,
         description="Index into execution_plan pointing to the next batch to execute.",
     )
-    scratchpad: Optional[str] = Field(
+    scratchpad: Annotated[Optional[str], join_strings] = Field(
         default=None,
         description=(
             "Accumulated tool results. Written by stateless_executor (analytical path) and "
@@ -127,7 +146,7 @@ class FinancialAnalysisState(AgentState):
     )
 
     # --- Analysis Findings ---
-    findings: Dict[str, Any] = Field(
+    findings: Annotated[Dict[str, Any], merge_dicts] = Field(
         default_factory=dict,
         description="Map of phase name to its structured findings (e.g., {'regime_assessment': {...}}).",
     )
@@ -143,12 +162,12 @@ class FinancialAnalysisState(AgentState):
         description="Ordered list of phases to execute, determined by query classifier.",
     )
 
-    validation_warnings: list[str] = Field(
+    validation_warnings: Annotated[list[str], operator.add] = Field(
         default_factory=list,
         description="Warnings from symbolic validators accumulated across phases.",
     )
 
-    raw_fallback_count: int = Field(
+    raw_fallback_count: Annotated[int, operator.add] = Field(
         default=0,
         description="Number of phases that fell back to raw_analysis due to JSON extraction failure.",
     )
@@ -185,14 +204,14 @@ class FinancialAnalysisState(AgentState):
     )
 
     # --- Per-phase planning / execution scratchpad ---
-    phase_tool_plan: Optional[list[dict]] = Field(
-        default=None,
+    phase_tool_plan: Annotated[dict[str, list[dict]], merge_dicts] = Field(
+        default_factory=dict,
         description=(
-            "Tool calls planned for the current financial phase (reset by each phase planner). "
-            "Format: [{'tool': name, 'args': {...}}, ...]"
+            "Tool calls planned for each financial phase. "
+            "Format: {phase_name: [{'tool': name, 'args': {...}}, ...]}"
         ),
     )
-    phase_scratchpad: Optional[str] = Field(
-        default=None,
-        description="Raw tool results for the current financial phase (reset by each phase planner).",
+    phase_scratchpad: Annotated[dict[str, str], merge_dicts] = Field(
+        default_factory=dict,
+        description="Raw tool results for each financial phase. Format: {phase_name: 'results...'}",
     )
