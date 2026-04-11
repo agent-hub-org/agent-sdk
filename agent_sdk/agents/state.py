@@ -1,4 +1,3 @@
-import operator
 from typing import Annotated, Any, Sequence, Optional, Dict
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
@@ -27,13 +26,14 @@ def max_int(left: int, right: int) -> int:
     return max(left, right)
 
 
-def join_strings(left: str | None, right: str | None) -> str:
-    """Reducer that joins strings with double newlines."""
+def join_strings(left: str | None, right: str | None) -> str | None:
+    """Reducer that joins strings with double newlines. Passing None clears the field."""
+    if right is None:
+        return None  # explicit clear
     l = left or ""
-    r = right or ""
-    if l and r:
-        return f"{l}\n\n{r}"
-    return l or r
+    if l and right:
+        return f"{l}\n\n{right}"
+    return l or right or None
 
 
 class AgentState(BaseModel):
@@ -94,35 +94,24 @@ class AgentState(BaseModel):
         ),
     )
 
-    # --- Structured planning / scratchpad ---
-    enable_analytical_path: bool = Field(
-        default=True,
-        description=(
-            "When False, triager_router always routes to llm_call, bypassing the parallel planner "
-            "and synthesizer. Scratchpad is still captured in tool_node. "
-            "Set to False on BaseAgent(analytical_path=False) for lower-latency deployments."
-        ),
-    )
-    query_type: Optional[str] = Field(
-        default=None,
-        description="'opaque' (direct answer) or 'analytical' (multi-step plan). Set by triager.",
-    )
-    execution_plan: Optional[list[list[dict]]] = Field(
-        default=None,
-        description=(
-            "Ordered list of parallel batches produced by parallel_planner. "
-            "Each batch is a list of {'tool': name, 'args': {...}} dicts that run concurrently."
-        ),
-    )
-    current_batch_index: Annotated[int, max_int] = Field(
-        default=0,
-        description="Index into execution_plan pointing to the next batch to execute.",
-    )
+    # --- Scratchpad (execution plan) + running context (work done) ---
     scratchpad: Annotated[Optional[str], join_strings] = Field(
         default=None,
         description=(
-            "Accumulated tool results. Written by stateless_executor (analytical path) and "
-            "tool_node (opaque path). Read by synthesizer and memory_writer."
+            "Execution plan written by the orchestrate node at the start of a request. "
+            "Read by llm_call each ReAct loop iteration so the LLM always sees its plan. "
+            "Cleared as a background task after the response is sent."
+        ),
+    )
+
+    running_context: Annotated[Optional[str], join_strings] = Field(
+        default=None,
+        description=(
+            "Structured summaries of completed work within a single request. "
+            "Standard mode: tool results appended after each tool_node execution. "
+            "Financial mode: each phase executor appends its findings as prose. "
+            "The LLM sees this at every ReAct iteration so it never re-fetches done work. "
+            "Cleared as a background task after the response is sent."
         ),
     )
 
@@ -131,87 +120,39 @@ class FinancialAnalysisState(AgentState):
     """
     Extended state for the financial reasoning cognitive pipeline.
 
-    Adds typed fields for structured findings from each reasoning phase.
-    Each phase reads prior phases' findings and writes its own, creating
-    a structured analytical thread that persists across tool calls.
+    Phases write prose summaries to running_context (inherited from AgentState).
+    The synthesis node reads running_context to generate the final report.
+    No per-phase structured dicts — all inter-phase context flows through running_context.
 
     This state is ONLY used when mode="financial_analyst" is set on BaseAgent.
     Standard agents continue using AgentState unchanged.
     """
 
-    # --- Phase Results (dynamically populated by each phase node) ---
-    query_classification: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Structured output from classify_query_node (query_type, phases_to_run, entities, etc.).",
-    )
-
-    # --- Analysis Findings ---
-    findings: Annotated[Dict[str, Any], merge_dicts] = Field(
-        default_factory=dict,
-        description="Map of phase name to its structured findings (e.g., {'regime_assessment': {...}}).",
-    )
-
     # --- Pipeline Control ---
     current_phase: str = Field(
-        default="query_classification",
+        default="orchestrate",
         description="Current phase in the cognitive pipeline.",
     )
 
     phases_to_run: list[str] = Field(
         default_factory=list,
-        description="Ordered list of phases to execute, determined by query classifier.",
+        description="Ordered list of phases to execute, determined by financial_orchestrate node.",
     )
 
-    validation_warnings: Annotated[list[str], operator.add] = Field(
-        default_factory=list,
-        description="Warnings from symbolic validators accumulated across phases.",
-    )
-
-    raw_fallback_count: Annotated[int, operator.add] = Field(
-        default=0,
-        description="Number of phases that fell back to raw_analysis due to JSON extraction failure.",
-    )
-
-    overall_confidence: Optional[float] = Field(
+    # Query type for synthesis routing (comparative needs different prompt)
+    query_type: Optional[str] = Field(
         default=None,
-        description="Calculated confidence score based on validation warnings and fallbacks.",
+        description="Query type: 'comparative', 'macro_impact', 'company_analysis', etc.",
+    )
+
+    # Entities extracted by orchestrate (used by comparative_analysis_node)
+    entities: list[str] = Field(
+        default_factory=list,
+        description="Tickers, sectors, or other entities identified in the query.",
     )
 
     # --- Context Injection ---
     as_of_date: Optional[str] = Field(
         default=None,
         description="Historical reference date for the analysis (YYYY-MM-DD).",
-    )
-
-    # --- Iteration Budget Control ---
-    phase_iterations: Annotated[dict[str, int], merge_dicts] = Field(
-        default_factory=dict,
-        description="Current iteration count for each phase.",
-    )
-
-    phase_iteration_budgets: dict[str, int] = Field(
-        default_factory=lambda: {
-            "query_classification": 1,
-            "regime_assessment": 2,
-            "causal_analysis": 2,
-            "sector_analysis": 2,
-            "company_analysis": 4,
-            "comparative_analysis": 3,
-            "risk_assessment": 2,
-            "synthesis": 3,
-        },
-        description="Per-phase iteration budgets for the financial cognitive pipeline. Total: 19 iterations.",
-    )
-
-    # --- Per-phase planning / execution scratchpad ---
-    phase_tool_plan: Annotated[dict[str, list[dict]], merge_dicts] = Field(
-        default_factory=dict,
-        description=(
-            "Tool calls planned for each financial phase. "
-            "Format: {phase_name: [{'tool': name, 'args': {...}}, ...]}"
-        ),
-    )
-    phase_scratchpad: Annotated[dict[str, str], merge_dicts] = Field(
-        default_factory=dict,
-        description="Raw tool results for each financial phase. Format: {phase_name: 'results...'}",
     )

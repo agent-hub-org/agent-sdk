@@ -11,10 +11,10 @@ from typing import Literal, Sequence
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
-from agent_sdk.agents.state import AgentState
+from agent_sdk.agents.state import AgentState, FinancialAnalysisState
 from agent_sdk.config import settings
 from agent_sdk.mcp.exceptions import MCPSessionError
-from agent_sdk.metrics import llm_call_duration, tool_call_duration, raw_fallback_total
+from agent_sdk.metrics import llm_call_duration, tool_call_duration
 
 logger = logging.getLogger("agent_sdk.nodes")
 
@@ -77,14 +77,17 @@ async def initialize(state: AgentState) -> dict:
 
     Does not require agent dependencies — stays a plain function.
     """
+    # Clear per-request transient fields at the start of every turn
+    _clear: dict = {"running_context": None, "scratchpad": None}
+
     # If a SystemMessage already exists, check whether it needs updating
     if state.messages and isinstance(state.messages[0], SystemMessage):
         if state.system_prompt and state.messages[0].content != state.system_prompt:
             logger.info("Updating system prompt (%d chars)", len(state.system_prompt))
-            return {"messages": [RemoveMessage(id=state.messages[0].id),
-                                 SystemMessage(content=state.system_prompt)]}
+            return {**_clear, "messages": [RemoveMessage(id=state.messages[0].id),
+                                           SystemMessage(content=state.system_prompt)]}
         logger.debug("System prompt already present, skipping initialization")
-        return {}
+        return _clear
 
     content = state.system_prompt or (
         "You are an autonomous assistant. "
@@ -92,7 +95,7 @@ async def initialize(state: AgentState) -> dict:
         "or respond directly when tools are not needed."
     )
     logger.info("Initialized agent with system prompt (%d chars)", len(content))
-    return {"messages": [SystemMessage(content=content)]}
+    return {**_clear, "messages": [SystemMessage(content=content)]}
 
 
 async def llm_call(agent, state: AgentState) -> dict:
@@ -120,7 +123,7 @@ async def llm_call(agent, state: AgentState) -> dict:
     tools = list(agent.tools_by_name.values())
     llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
 
-    # Build appended context sections (summary + perspective) without mutating state.messages
+    # Build appended context sections (summary + plan + running_context + perspective)
     extra_sections: list[str] = []
 
     if state.summary:
@@ -130,26 +133,19 @@ async def llm_call(agent, state: AgentState) -> dict:
             f"Previous conversation summary: {state.summary}"
         )
 
-    # Inject financial phase outputs if present (financial_analyst mode follow-up queries)
-    _FINANCIAL_PHASE_FIELDS = [
-        ("regime_assessment", "Market Regime"),
-        ("causal_analysis", "Causal Analysis"),
-        ("sector_analysis", "Sector Analysis"),
-        ("company_analysis", "Company Analysis"),
-        ("risk_assessment", "Risk Assessment"),
-    ]
-    phase_parts = []
-    # FinancialAnalysisState stores phase results in state.findings dict
-    findings = getattr(state, "findings", None) or {}
-    for field, label in _FINANCIAL_PHASE_FIELDS:
-        val = findings.get(field)
-        if val:
-            serialized = json.dumps(val, default=str)
-            phase_parts.append(f"**{label}**: {serialized[:800]}")
-    if phase_parts:
+    # Inject the execution plan (scratchpad) so the agent knows what it set out to do
+    plan = getattr(state, "scratchpad", None)
+    if plan:
         extra_sections.append(
-            "PRIOR ANALYSIS CONTEXT (use to answer follow-up questions accurately — "
-            "do not re-fetch data already captured here):\n" + "\n".join(phase_parts)
+            "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
+        )
+
+    # Inject accumulated work done so far this request
+    running_ctx = getattr(state, "running_context", None)
+    if running_ctx:
+        extra_sections.append(
+            "WORK DONE SO FAR (tool results / completed phases — use this, don't re-fetch):\n"
+            + running_ctx
         )
 
     perspective = getattr(state, "perspective_context", None)
@@ -417,18 +413,15 @@ async def tool_node(agent, state: AgentState) -> dict:
     if not results:
         return {"messages": []}
 
-    # Accumulate tool results into scratchpad (zero latency — pure string ops)
+    # Accumulate tool results into running_context (zero latency — pure string ops)
     section = "\n".join(
         f"[{msg.name}] → {msg.content}"
         for msg in results
         if hasattr(msg, "name") and msg.name
     )
-    existing = getattr(state, "scratchpad", None) or ""
-    new_scratchpad = (existing + "\n\n" + section).strip() if existing else section
-    logger.debug("tool_node: scratchpad updated (%d chars total): %.500s",
-                 len(new_scratchpad), new_scratchpad)
+    logger.debug("tool_node: running_context updated (%d chars): %.500s", len(section), section)
 
-    return {"messages": list(results), "scratchpad": new_scratchpad}
+    return {"messages": list(results), "running_context": section}
 
 
 def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
@@ -457,16 +450,16 @@ def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_
     At the start of each conversation turn, check whether the context is already
     large enough to warrant summarization before calling the LLM.
 
-    Uses a looser threshold (80% of max_context_tokens) to act preventively.
-    This catches long conversational sessions that never trigger tool calls
-    and therefore never hit post_tool_router.
+    Uses a fixed 32,768-token threshold so summarization kicks in at the midpoint
+    of the 65,536-token context window regardless of max_context_tokens tuning.
     """
+    _SUMMARIZE_THRESHOLD = 32768
     summary_text = state.summary or ""
     needs_summarization = (
         state.enable_summarization
         and (
             len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages, summary_text) > state.max_context_tokens * 0.8
+            or _estimate_token_count(state.messages, summary_text) > _SUMMARIZE_THRESHOLD
         )
     )
     if needs_summarization:
@@ -532,72 +525,102 @@ def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conver
 
 
 # ============================================================================
-# FINANCIAL REASONING PIPELINE — Phase Nodes
-# ============================================================================
-# These nodes are only used by create_financial_reasoning_graph().
-# They implement the multi-step cognitive pipeline for structured financial
-# analysis. Each node represents one analytical phase with its own system
-# prompt, tool set, and structured output schema.
+# ORCHESTRATION — Standard Mode
 # ============================================================================
 
+_STANDARD_ORCHESTRATOR_PROMPT = """\
+You are a task planner for a financial and research AI assistant.
 
-def _build_phase_return(
-    response,
-    data_key: str,
-    data: dict,
-    state,
-    phase_name: str,
-    extra: dict | None = None,
-) -> dict:
-    """
-    Shared helper for all financial pipeline phase nodes.
+{tool_catalog}
 
-    Builds the standard state-update dict for a completed phase, handling the
-    JSON-fallback pattern that was previously copy-pasted across 5+ nodes.
-    If *data* is falsy the phase fell back to raw text — increment the fallback
-    counter and log a warning so operators can detect degraded analysis.
+Your job: write a clear, numbered execution plan for answering the user's query.
+
+For each step:
+- State what information you need
+- Specify which tool(s) to call and with what exact arguments
+- Group steps that are independent (can run at the same time) on the same line
+
+Be specific: use exact ticker symbols (e.g. RELIANCE.NS), exact search queries (e.g. "RBI repo rate April 2026"), exact function names.
+
+If the query can be answered without tools, write: "Answer directly — no tools needed."
+
+Keep the plan concise — the executor will see it at every step and use it as a checklist.
+"""
+
+
+async def orchestrate(agent, state: AgentState) -> dict:
     """
-    fallback_inc = 0
-    if not data:
-        logger.warning("%s fell back to raw_analysis — LLM did not return parseable JSON", phase_name)
-        fallback_inc = 1
-        raw_fallback_total.labels(phase=phase_name).inc()
-    result: dict = {
-        "messages": [response],
-        data_key: data if data else {"raw_analysis": response.content},
-        "raw_fallback_count": fallback_inc,
-        "iteration": state.iteration + 1,
-        "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
-    }
-    if extra:
-        result.update(extra)
-    return result
+    Orchestrate node for standard mode: writes a tool-specific execution plan to scratchpad.
+    The llm_call ReAct loop reads scratchpad at every iteration so the LLM never re-plans
+    and stops calling tools once the plan is satisfied.
+
+    Trivial queries (≤8 words, single line) skip planning — no latency added.
+    """
+    user_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_query = _strip_context_block(msg.content)
+            break
+
+    if not user_query:
+        return {}
+
+    # Fast exit: trivial queries don't need a plan
+    words = user_query.split()
+    if len(words) <= 8 and "\n" not in user_query:
+        logger.debug("orchestrate: trivial query (%d words) — skipping plan", len(words))
+        return {}
+
+    tools = list(agent.tools_by_name.values())
+    if not tools:
+        return {}
+
+    tool_catalog = _format_tool_catalog(tools)
+    llm = _get_phase_llm(agent, state)
+
+    try:
+        _t0 = time.monotonic()
+        response = await llm.ainvoke([
+            SystemMessage(content=_STANDARD_ORCHESTRATOR_PROMPT.format(tool_catalog=tool_catalog)),
+            HumanMessage(content=f"Query: {user_query}"),
+        ])
+        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+        llm_call_duration.labels(agent="sdk", model=_model_name, phase="orchestrate").observe(
+            time.monotonic() - _t0
+        )
+        plan_text = (response.content or "").strip()
+        if plan_text:
+            logger.info("orchestrate: plan written (%d chars)", len(plan_text))
+            return {"scratchpad": plan_text}
+    except Exception:
+        logger.exception("orchestrate: planning failed — proceeding without plan")
+
+    return {}
+
+
+# ============================================================================
+# FINANCIAL REASONING PIPELINE
+# ============================================================================
+# Phase executors use native tool binding (no JSON-in-text extraction).
+# Every LLM call within a phase sees scratchpad (plan) + running_context (prior work).
+# Phase results are accumulated as prose in running_context.
+# ============================================================================
+
 
 async def financial_initialize(state) -> dict:
-    """Initialize the financial reasoning pipeline."""
-    # Reuse standard initialize for system message setup
-    result = await initialize(state)
-    
-    # Initialize phase_iterations with 0 for all phases
-    result["phase_iterations"] = {
-        "query_classification": 0,
-        "regime_assessment": 0,
-        "causal_analysis": 0,
-        "sector_analysis": 0,
-        "company_analysis": 0,
-        "comparative_analysis": 0,
-        "risk_assessment": 0,
-        "synthesis": 0,
-    }
-    return result
+    """Initialize the financial reasoning pipeline. Delegates to standard initialize."""
+    return await initialize(state)
 
 
-async def classify_query_node(agent, state) -> dict:
+async def financial_orchestrate(agent, state) -> dict:
     """
-    Classify the user's query to determine which pipeline phases to activate.
-    Uses the LLM with a classification-specific prompt.
+    Orchestrate node for financial mode: classifies the query, determines phases,
+    and writes a comprehensive tool-specific plan to scratchpad.
+
+    One LLM call for JSON classification; plan is computed from the classification
+    (no extra LLM call for plan writing). Replaces classify_query_node.
     """
-    from agent_sdk.financial.prompts import QUERY_CLASSIFIER_PROMPT
+    from agent_sdk.financial.prompts import QUERY_CLASSIFIER_PROMPT, FINANCIAL_ORCHESTRATOR_PROMPT
     from agent_sdk.financial.schemas import QueryClassification, QueryType
 
     logger.info("Classifying query for financial reasoning pipeline")
@@ -696,236 +719,246 @@ async def classify_query_node(agent, state) -> dict:
         if phases:
             phases.append("synthesis")
 
-    logger.info("Query classified as %s — phases: %s", qc.query_type.value, phases)
+    entities = list(qc.entities) if hasattr(qc, "entities") and qc.entities else []
+    logger.info("Query classified as %s — phases: %s, entities: %s", qc.query_type.value, phases, entities)
+
+    # Write a comprehensive tool-specific plan for all phases
+    plan_text = ""
+    try:
+        plan_response = await llm.ainvoke([
+            SystemMessage(content=FINANCIAL_ORCHESTRATOR_PROMPT),
+            HumanMessage(content=(
+                f"Query: {clean_query}\n"
+                f"Phases to execute: {', '.join(phases)}\n"
+                f"Entities: {', '.join(entities) if entities else 'none specified'}"
+            )),
+        ])
+        plan_text = (plan_response.content or "").strip()
+        logger.info("financial_orchestrate: plan written (%d chars)", len(plan_text))
+    except Exception:
+        logger.exception("financial_orchestrate: plan writing failed — proceeding without plan")
 
     return {
-        "query_classification": qc.model_dump(),
+        "scratchpad": plan_text if plan_text else None,
         "phases_to_run": phases,
         "current_phase": phases[0] if phases else "done",
+        "query_type": qc.query_type.value,
+        "entities": entities,
         "iteration": state.iteration + 1,
-        "phase_iterations": {"query_classification": 1},
-        "as_of_date": state.as_of_date,  # Persist as_of_date
     }
 
 
-async def regime_assessment_node(agent, state) -> dict:
+# Per-phase iteration budgets (safety cap — LLM self-regulates via plan+running_context)
+_PHASE_BUDGETS: dict[str, int] = {
+    "regime_assessment": 4,
+    "causal_analysis": 4,
+    "sector_analysis": 4,
+    "company_analysis": 6,
+    "risk_assessment": 4,
+}
+
+
+async def financial_phase_executor(phase_name: str, agent, state) -> dict:
     """
-    Regime assessment phase — assess macro/market/monetary regime.
-    Uses regime-specific tools (detect_market_regime) and system prompt.
+    ReAct executor for a single financial pipeline phase.
+
+    Uses native LangChain tool binding (llm.bind_tools). Every LLM iteration sees:
+    - The agent's system prompt (from state.messages[0])
+    - scratchpad: the comprehensive plan written by financial_orchestrate
+    - running_context: all prior phase results accumulated as prose
+
+    Tool results are appended to running_context after each tool call so the LLM
+    self-regulates: once it sees the plan section for this phase is satisfied it stops.
+
+    Phase findings are appended to running_context as a labeled prose block
+    so subsequent phases and synthesis can read them.
     """
-    from agent_sdk.financial.prompts import REGIME_ASSESSMENT_PROMPT
+    from datetime import datetime, timezone
 
-    logger.info("Running regime assessment phase")
-
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "regime_assessment")
-    logger.info("regime_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
-
-    prompt = _build_phase_prompt(state, REGIME_ASSESSMENT_PROMPT)
-    response = await llm_with_tools.ainvoke(prompt)
-
-    # Check if LLM wants to call tools
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if tool_calls:
-        return {
-            "messages": [response], 
-            "iteration": state.iteration + 1,
-            "phase_iterations": {"regime_assessment": state.phase_iterations.get("regime_assessment", 0) + 1}
-        }
-
-    # Phase complete — extract structured regime context from response
-    regime_data = _extract_json(response.content) or {}
-    logger.info("Regime assessment complete: %s", regime_data.get("market_regime", "unknown"))
-    return _build_phase_return(response, "regime_assessment", regime_data, state, "regime_assessment")
-
-
-async def causal_analysis_node(agent, state) -> dict:
-    """
-    Causal analysis phase — trace causal chains from trigger events.
-    Uses causal graph tools and references regime context from prior phase.
-    """
-    from agent_sdk.financial.prompts import CAUSAL_ANALYSIS_PROMPT
-
-    logger.info("Running causal analysis phase")
+    logger.info("financial_phase_executor: starting phase '%s'", phase_name)
+    phase_budget = _PHASE_BUDGETS.get(phase_name, 4)
 
     llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "causal_analysis")
-    logger.info("causal_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
+    tools = _get_phase_tools(agent, phase_name)
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
 
-    # Inject prior phase context into prompt
-    prompt_template = CAUSAL_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.findings.get("regime_assessment")),
-    )
-    prompt = _build_phase_prompt(state, prompt_template)
-    response = await llm_with_tools.ainvoke(prompt)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.as_of_date:
+        year = state.as_of_date[:4]
+        date_context = (
+            f"\n\nTODAY'S DATE: {today}. HISTORICAL REFERENCE DATE: {state.as_of_date}\n"
+            f"Always include the historical year ({year}) in search queries."
+        )
+    else:
+        year = datetime.now(timezone.utc).year
+        date_context = (
+            f"\n\nTODAY'S DATE: {today}\n"
+            f"Always include the current year ({year}) in search queries for up-to-date results."
+        )
 
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if tool_calls:
-        return {
-            "messages": [response], 
-            "iteration": state.iteration + 1,
-            "phase_iterations": {"causal_analysis": state.phase_iterations.get("causal_analysis", 0) + 1}
-        }
+    # Build system content: agent system prompt + phase header + date context + plan + prior results
+    sys_content = ""
+    if state.messages and isinstance(state.messages[0], SystemMessage):
+        sys_content = state.messages[0].content
 
-    causal_data = _extract_json(response.content) or {}
-    return _build_phase_return(response, "causal_analysis", causal_data, state, "causal_analysis")
-
-
-async def sector_analysis_node(agent, state) -> dict:
-    """Sector analysis phase — analyze relevant sectors."""
-    from agent_sdk.financial.prompts import SECTOR_ANALYSIS_PROMPT
-
-    logger.info("Running sector analysis phase")
-
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "sector_analysis")
-    logger.info("sector_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
-
-    prompt_template = SECTOR_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.findings.get("regime_assessment")),
-        causal_analysis=_format_context(state.findings.get("causal_analysis")),
-    )
-    prompt = _build_phase_prompt(state, prompt_template)
-    response = await llm_with_tools.ainvoke(prompt)
-
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if tool_calls:
-        return {
-            "messages": [response], 
-            "iteration": state.iteration + 1,
-            "phase_iterations": {"sector_analysis": state.phase_iterations.get("sector_analysis", 0) + 1}
-        }
-
-    sector_data = _extract_json(response.content) or {}
-    return _build_phase_return(response, "sector_analysis", sector_data, state, "sector_analysis")
-
-
-async def company_analysis_node(agent, state) -> dict:
-    """Company analysis phase — deep fundamental analysis."""
-    from agent_sdk.financial.prompts import COMPANY_ANALYSIS_PROMPT
-
-    logger.info("Running company analysis phase")
-
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "company_analysis")
-    logger.info("company_analysis — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
-
-    prompt_template = COMPANY_ANALYSIS_PROMPT.format(
-        regime_context=_format_context(state.findings.get("regime_assessment")),
-        causal_analysis=_format_context(state.findings.get("causal_analysis")),
-        sector_analysis=_format_context(state.findings.get("sector_analysis")),
-    )
-    prompt = _build_phase_prompt(state, prompt_template)
-    response = await llm_with_tools.ainvoke(prompt)
-
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if tool_calls:
-        return {
-            "messages": [response],
-            "iteration": state.iteration + 1,
-            "phase_iterations": {"company_analysis": state.phase_iterations.get("company_analysis", 0) + 1}
-        }
-
-    company_data = _extract_json(response.content) or {}
-
-    # Run symbolic validation on company analysis so warnings reach the risk phase
-    company_warnings = _run_phase_validation(state)
-
-    return _build_phase_return(
-        response, "company_analysis", company_data, state, "company_analysis",
-        extra={"validation_warnings": state.validation_warnings + company_warnings},
+    phase_header = (
+        f"\n\n=== CURRENT PHASE: {phase_name.upper().replace('_', ' ')} ===\n"
+        f"Focus on the {phase_name.replace('_', ' ')} section of your EXECUTION PLAN. "
+        f"Call the tools needed for this phase. Stop when this phase section is complete."
     )
 
+    plan = getattr(state, "scratchpad", None)
+    running_ctx = getattr(state, "running_context", None)
 
-async def risk_assessment_node(agent, state) -> dict:
-    """Risk assessment phase — stress-test the thesis."""
-    from agent_sdk.financial.prompts import RISK_ASSESSMENT_PROMPT
+    extra_sections: list[str] = []
+    if plan:
+        extra_sections.append(
+            "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
+        )
+    if running_ctx:
+        extra_sections.append(
+            "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + running_ctx
+        )
 
-    logger.info("Running risk assessment phase")
+    def _build_system(extra_ctx_parts: list[str]) -> str:
+        content = sys_content + phase_header + date_context
+        if extra_ctx_parts:
+            content += "\n\n" + "\n\n".join(extra_ctx_parts)
+        return content
 
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "risk_assessment")
-    logger.info("risk_assessment — %d tools available: %s", len(tools), [t.name for t in tools])
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
+    # Only include the current HumanMessage — no prior AI phase outputs (avoids opinion contamination)
+    user_msg = None
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_msg = msg
+            break
 
-    prompt_template = RISK_ASSESSMENT_PROMPT.format(
-        regime_context=_format_context(state.findings.get("regime_assessment")),
-        causal_analysis=_format_context(state.findings.get("causal_analysis")),
-        sector_analysis=_format_context(state.findings.get("sector_analysis")),
-        company_analysis=_format_context(state.findings.get("company_analysis")),
+    phase_messages: list = [
+        SystemMessage(content=_build_system(extra_sections)),
+        *([] if user_msg is None else [user_msg]),
+    ]
+
+    phase_running_ctx_parts: list[str] = []
+    accumulated_running_ctx = running_ctx or ""
+
+    for iteration in range(phase_budget):
+        try:
+            _t0 = time.monotonic()
+            response = await llm_with_tools.ainvoke(phase_messages)
+            _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+            llm_call_duration.labels(agent="sdk", model=_model_name, phase=phase_name).observe(
+                time.monotonic() - _t0
+            )
+        except Exception:
+            logger.exception("financial_phase_executor: LLM call failed in phase '%s'", phase_name)
+            break
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            # LLM produced final prose — phase complete
+            if response.content:
+                phase_running_ctx_parts.append(response.content)
+            break
+
+        logger.info(
+            "financial_phase_executor [%s] iter %d: %d tool call(s): %s",
+            phase_name, iteration, len(tool_calls), [tc["name"] for tc in tool_calls],
+        )
+        phase_messages.append(response)
+
+        # Execute tools
+        tool_results = await _execute_tool_calls(agent, tool_calls, state.tool_timeout, phase_tools=tools)
+
+        for tc, tr in zip(tool_calls, tool_results):
+            phase_messages.append(tr)
+            phase_running_ctx_parts.append(f"[{tc['name']}] → {tr.content}")
+
+        # Rebuild system message so next iteration sees updated context
+        accumulated_running_ctx = (
+            (running_ctx or "")
+            + ("\n" if running_ctx else "")
+            + "\n".join(phase_running_ctx_parts)
+        )
+        updated_extra = []
+        if plan:
+            updated_extra.append(
+                "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
+            )
+        updated_extra.append(
+            "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + accumulated_running_ctx
+        )
+        phase_messages[0] = SystemMessage(content=_build_system(updated_extra))
+    else:
+        logger.warning(
+            "financial_phase_executor: phase '%s' hit budget (%d iterations)", phase_name, phase_budget
+        )
+
+    # Compile phase findings into a labeled block appended to running_context
+    phase_findings = "\n".join(phase_running_ctx_parts) if phase_running_ctx_parts else "(no data retrieved)"
+    phase_block = (
+        f"=== {phase_name.upper().replace('_', ' ')} ===\n"
+        f"{phase_findings}\n"
+        f"=== END {phase_name.upper().replace('_', ' ')} ==="
+    )
+    logger.info(
+        "financial_phase_executor: phase '%s' complete — %d chars added to running_context",
+        phase_name, len(phase_block),
     )
 
-    # Inject validation warnings from company_analysis into this phase's prompt
-    if state.validation_warnings:
-        prompt_template += "\n\nVALIDATION WARNINGS FROM PRIOR PHASES (address these in your risk assessment):\n"
-        for w in state.validation_warnings:
-            prompt_template += f"- {w}\n"
-
-    prompt = _build_phase_prompt(state, prompt_template)
-    response = await llm_with_tools.ainvoke(prompt)
-
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if tool_calls:
-        return {
-            "messages": [response], 
-            "iteration": state.iteration + 1,
-            "phase_iterations": {"risk_assessment": state.phase_iterations.get("risk_assessment", 0) + 1}
-        }
-
-    # Run symbolic validation on the accumulated analysis (adds new warnings from this phase)
-    validation_warnings = _run_phase_validation(state)
-
-    risk_data = _extract_json(response.content) or {}
-    return _build_phase_return(
-        response, "risk_assessment", risk_data, state, "risk_assessment",
-        extra={"validation_warnings": state.validation_warnings + validation_warnings},
-    )
+    return {
+        "running_context": phase_block,
+        "current_phase": phase_name,
+        "iteration": state.iteration + 1,
+    }
 
 
 async def synthesis_node(agent, state) -> dict:
-    """Synthesis phase — combine all phases into final report."""
+    """
+    Synthesis phase — produce the final user-facing report.
+
+    Reads from state.running_context (accumulated prose from all prior phases) and
+    state.query_type (set by financial_orchestrate) to select the right synthesis prompt.
+    No tools — pure LLM reasoning step.
+    """
     from agent_sdk.financial.prompts import SYNTHESIS_PROMPT, COMPARATIVE_SYNTHESIS_PROMPT
+    from datetime import datetime, timezone
 
     logger.info("Running synthesis phase")
-
     llm = _get_phase_llm(agent, state)
-    
-    query_type = state.query_classification.get("query_type") if state.query_classification else None
+
+    running_ctx = getattr(state, "running_context", None) or "(no prior phase results available)"
+    query_type = getattr(state, "query_type", None)
 
     if query_type == "comparative":
-        prompt_template = COMPARATIVE_SYNTHESIS_PROMPT.format(
-            company_analysis=_format_context(state.findings.get("company_analysis"))
-        )
+        synthesis_prompt = COMPARATIVE_SYNTHESIS_PROMPT
     else:
-        prompt_template = SYNTHESIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
-            company_analysis=_format_context(state.findings.get("company_analysis")),
-            risk_assessment=_format_context(state.findings.get("risk_assessment")),
-        )
+        synthesis_prompt = SYNTHESIS_PROMPT
 
-    # Add validation warnings to synthesis
-    if state.validation_warnings:
-        prompt_template += "\n\nVALIDATION WARNINGS (must address in your synthesis):\n"
-        for w in state.validation_warnings:
-            prompt_template += f"- {w}\n"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_context = f"\n\nTODAY'S DATE: {today}"
 
-    if state.raw_fallback_count > 0:
-        prompt_template += (
-            f"\n\nDATA QUALITY NOTE: {state.raw_fallback_count} phase(s) returned unstructured "
-            f"analysis instead of structured data. Some findings above may be less precise — "
-            f"acknowledge any gaps in your synthesis."
-        )
+    # Inject running_context as a labeled block in the system prompt
+    full_system = (
+        synthesis_prompt
+        + date_context
+        + "\n\n=== PRIOR ANALYSIS ===\n"
+        + running_ctx
+        + "\n=== END PRIOR ANALYSIS ==="
+    )
 
-    prompt = _build_phase_prompt(state, prompt_template)
+    # Build message list — only the current HumanMessage (no prior AI phase outputs)
+    user_msg = None
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            user_msg = msg
+            break
 
-    # Synthesis doesn't use tools — it's a pure reasoning step
-    _synthesis_timeout = state.tool_timeout  # 120s default
+    prompt = [
+        SystemMessage(content=full_system),
+        *([] if user_msg is None else [user_msg]),
+    ]
+
+    _synthesis_timeout = state.tool_timeout
     try:
         response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=_synthesis_timeout)
     except asyncio.TimeoutError:
@@ -933,54 +966,23 @@ async def synthesis_node(agent, state) -> dict:
         fallback_content = "Analysis timed out during synthesis. Please try a simpler or more specific query."
         return {
             "messages": [AIMessage(content=fallback_content)],
-            "synthesis_report": {"full_report": fallback_content},
-            "overall_confidence": 1.0,
             "iteration": state.iteration + 1,
-            "phase_iterations": {"synthesis": state.phase_iterations.get("synthesis", 0) + 1},
         }
 
     synthesis_data = _extract_json(response.content) or {}
-    
-    base_confidence = 10.0
-    penalty = (
-        len(state.validation_warnings) * settings.confidence_penalty_per_warning
-        + state.raw_fallback_count * settings.confidence_penalty_per_fallback
-    )
-    confidence_score = max(1.0, round(base_confidence - penalty, 1))
 
-    factors = []
-    if state.validation_warnings:
-        factors.append(f"{len(state.validation_warnings)} validation issue(s)")
-    if state.raw_fallback_count > 0:
-        factors.append(f"{state.raw_fallback_count} data fallback(s)")
-    
-    factors_str = ", ".join(factors) if factors else "All data validated"
-    confidence_text = f"\n\n### Analysis Confidence: {confidence_score}/10 — {factors_str}"
-
-    # Ensure the message added to state contains a user-facing narrative,
-    # not raw JSON.  If the LLM returned structured JSON with a full_report
-    # field, use that as the message content.
     if synthesis_data and "full_report" in synthesis_data:
-        synthesis_data["full_report"] += confidence_text
         report_msg = AIMessage(content=synthesis_data["full_report"])
     else:
         logger.warning(
-            "Synthesis did not return structured JSON; falling back to raw content (%d chars). "
-            "First 200 chars: %s",
-            len(response.content),
-            response.content[:200],
+            "Synthesis did not return structured JSON; using raw content (%d chars). First 200: %s",
+            len(response.content), response.content[:200],
         )
-        content_with_confidence = response.content + confidence_text
-        report_msg = AIMessage(content=content_with_confidence)
-        if not synthesis_data:
-            synthesis_data = {"full_report": content_with_confidence}
+        report_msg = AIMessage(content=response.content)
 
     return {
         "messages": [report_msg],
-        "synthesis_report": synthesis_data,
-        "overall_confidence": confidence_score,
         "iteration": state.iteration + 1,
-        "phase_iterations": {"synthesis": state.phase_iterations.get("synthesis", 0) + 1}
     }
 
 
@@ -1010,91 +1012,6 @@ def phase_advance(state) -> dict:
     }
 
 
-async def financial_tool_node(agent, state) -> dict:
-    """
-    Execute tool calls within the financial reasoning pipeline.
-    Temporarily registers phase-specific financial tools so tool_node can find them.
-    Always emits a ToolMessage for every pending tool_call_id — even on failure —
-    so state.messages never contains an orphaned AIMessage(tool_calls).
-    """
-    phase_tools = _get_phase_tools(agent, state.current_phase)
-    # Save original so we can restore after this node finishes.
-    # NOTE: agent.tools_by_name is mutated temporarily. This is safe because
-    # LangGraph nodes execute sequentially within a step — no concurrent access.
-    original_tools_by_name = dict(agent.tools_by_name)
-
-    for t in phase_tools:
-        if t.name not in agent.tools_by_name:
-            agent.tools_by_name[t.name] = t
-
-    try:
-        return await tool_node(agent, state)
-    except Exception as e:
-        # tool_node raised — build error ToolMessages for every pending tool_call_id
-        # so the message history stays valid for the next LLM call.
-        last_message = state.messages[-1]
-        tool_calls = getattr(last_message, "tool_calls", None) or []
-        error_messages = [
-            ToolMessage(
-                content=f"Tool execution failed: {e}",
-                tool_call_id=tc["id"],
-            )
-            for tc in tool_calls
-        ]
-        if error_messages:
-            logger.warning(
-                "financial_tool_node: tool_node raised %s — emitting %d error ToolMessage(s) to keep history valid",
-                e, len(error_messages),
-            )
-            return {"messages": error_messages}
-        raise  # no tool_calls to recover from — propagate
-    finally:
-        agent.tools_by_name = original_tools_by_name
-
-
-def financial_should_continue(phase_name: str, state) -> str:
-    """
-    Routing function for financial phase nodes.
-    If the LLM requested tools, route to financial_tool_node.
-    Otherwise, phase is complete — route to phase_advance.
-    
-    Supports per-phase iteration budgets via phase_iteration_budgets dict.
-    Falls back to global max_iterations if not configured.
-    """
-    last_message = state.messages[-1]
-    has_tool_calls = bool(getattr(last_message, "tool_calls", None))
-    
-    # Check per-phase budget first
-    phase_budgets = state.phase_iteration_budgets
-    phase_count = state.phase_iterations.get(phase_name, 0)
-    
-    if phase_budgets:
-        phase_limit = phase_budgets.get(phase_name, 3)
-        if phase_count >= phase_limit:
-            logger.warning("Iteration limit reached in phase %s (per-phase budget: %d, used: %d)", phase_name, phase_limit, phase_count)
-            if has_tool_calls:
-                logger.warning(
-                    "Phase %s hit iteration limit with pending tool_calls — routing to tool_node to clear them",
-                    phase_name,
-                )
-                return "financial_tool_node"
-            return "phase_advance"
-    
-    # Global safety check (fallback)
-    if state.iteration >= state.max_iterations:
-        logger.warning("Global iteration limit reached in phase %s (global budget: %d)", phase_name, state.max_iterations)
-        if has_tool_calls:
-            logger.warning(
-                "Phase %s hit global iteration limit with pending tool_calls — routing to tool_node to clear them",
-                phase_name,
-            )
-            return "financial_tool_node"
-        return "phase_advance"
-
-    if has_tool_calls:
-        return "financial_tool_node"
-
-    return "phase_advance"
 
 
 # ---------------------------------------------------------------------------
@@ -1373,342 +1290,123 @@ def _normalize_classification(raw: dict) -> dict:
     return {k: v for k, v in normalized.items() if k in valid_keys}
 
 
-def _run_phase_validation(state) -> list[str]:
-    """
-    Run symbolic validators on accumulated analysis state.
-    Returns list of warning messages.
-    """
-    from agent_sdk.financial.validators import validate_logical_consistency, validate_confidence
-
-    warnings = []
-
-    # Validate company analysis if available
-    ca = state.findings.get("company_analysis")
-    if ca and isinstance(ca, dict):
-        # Extract metrics for validation
-        val = ca.get("valuation", {})
-        fund = ca.get("fundamentals", {})
-
-        results = validate_logical_consistency(
-            valuation_assessment=ca.get("valuation_assessment"),
-            recommendation=ca.get("recommendation"),
-            pe=val.get("pe_trailing"),
-            roe=fund.get("roe"),
-            debt_to_equity=fund.get("debt_to_equity"),
-            interest_coverage=fund.get("interest_coverage"),
-        )
-
-        for r in results:
-            if not r.passed:
-                warnings.append(r.message)
-
-    # Validate confidence calibration
-    regime = state.findings.get("regime_assessment")
-    if regime and isinstance(regime, dict):
-        conf = regime.get("confidence", 0.5)
-        data_points = len([v for v in regime.values() if v is not None and v != ""])
-        result = validate_confidence(
-            stated_confidence=conf,
-            data_points_available=data_points,
-        )
-        if not result.passed:
-            warnings.append(result.message)
-
-    return warnings
-
-
-
-_LARGE_RESULT_THRESHOLD = settings.large_result_threshold  # chars; results larger than this are distilled immediately
-
-
-async def _summarize_large_tool_result(agent, tool_result, tool_name: str, entity: str, timeout: float):
-    """
-    Distill a single large tool result to key financial facts right after it arrives,
-    before it is appended to the message history. This keeps per-iteration context
-    bounded so the global compressor never receives an input that exceeds model limits.
-    All numerical values are explicitly preserved in the summariser prompt.
-    """
-    import asyncio
-    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-
-    content = tool_result.content if hasattr(tool_result, "content") else ""
-    content = content or ""
-    if len(content) < _LARGE_RESULT_THRESHOLD:
-        return tool_result
-
-    summarizer = agent.summarizer or agent.llm
-    prompt = [
-        SystemMessage(content=(
-            f"The following is raw financial data for {entity} retrieved via '{tool_name}'. "
-            "Extract and preserve ALL key metrics verbatim: revenue, profit, margins (OPM/NPM/EBITDA%), "
-            "P/E, P/B, EV/EBITDA, ROE, ROCE, debt/equity, FCF, promoter holding%, pledge%, "
-            "dividend yield, capex, working capital, and any guidance or commentary. "
-            "Format as a structured bullet-point summary. Do NOT drop any numerical values."
-        )),
-        HumanMessage(content=content),
-    ]
-    try:
-        resp = await asyncio.wait_for(summarizer.ainvoke(prompt), timeout=timeout)
-        summary = resp.content if hasattr(resp, "content") else str(resp)
-        logger.info(
-            "Pre-compressed large tool result '%s' for '%s': %d → %d chars",
-            tool_name, entity, len(content), len(summary),
-        )
-        return ToolMessage(content=summary, tool_call_id=tool_result.tool_call_id)
-    except Exception:
-        logger.warning(
-            "Pre-compression failed for tool '%s' / entity '%s' — using original result",
-            tool_name, entity,
-        )
-        return tool_result
-
-
-async def _compress_entity_messages(agent, messages: list, entity: str, timeout: float) -> list:
-    """
-    Summarize intermediate tool results in the analyze_entity message list to prevent
-    context window overflow. Always preserves the leading SystemMessage and the most
-    recent AI+tool round so the LLM retains fresh context.
-    """
-    from langchain_core.messages import SystemMessage, HumanMessage
-    import asyncio
-
-    has_system = messages and isinstance(messages[0], SystemMessage)
-    system_msg = messages[0] if has_system else None
-    body = messages[1:] if has_system else list(messages)
-
-    # Need at least 2 rounds (AI msg + tools) before compression makes sense
-    if len(body) < 4:
-        return messages
-
-    # Keep the 4 most recent messages (≈1 full AI+tool round) verbatim
-    keep_tail = min(4, len(body))
-    to_summarize = body[:-keep_tail]
-    tail = body[-keep_tail:]
-
-    if not to_summarize:
-        return messages
-
-    summarizer = agent.summarizer or agent.llm
-    summarizer_input = [
-        SystemMessage(content=(
-            f"The following are financial data retrieval results for {entity}. "
-            "Extract and preserve ALL key financial metrics, ratios, figures, dates, and facts verbatim. "
-            "Be comprehensive — do not drop any numerical data. Format as a structured bullet-point summary."
-        )),
-        *to_summarize,
-        SystemMessage(content="Provide the structured financial data summary now."),
-    ]
-
-    try:
-        if hasattr(summarizer, "ainvoke"):
-            resp = await asyncio.wait_for(summarizer.ainvoke(summarizer_input), timeout=timeout)
-        else:
-            resp = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, summarizer.invoke, summarizer_input),
-                timeout=timeout,
-            )
-        summary_text = resp.content if hasattr(resp, "content") else str(resp)
-        logger.info(
-            "Compressed %d messages for entity '%s' → summary (%d chars)",
-            len(to_summarize), entity, len(summary_text),
-        )
-        compressed = []
-        if system_msg:
-            compressed.append(system_msg)
-        compressed.append(HumanMessage(content=f"[Previously retrieved data for {entity}]\n{summary_text}"))
-        compressed.extend(tail)
-        return compressed
-    except Exception:
-        logger.warning(
-            "Context compression failed for entity '%s' — hard-truncating to last 3 rounds",
-            entity,
-        )
-        # Keep SystemMessage + last 3 AI+tool rounds (≈12 messages) to stay within limits
-        keep = body[-12:]
-        if has_system:
-            return [system_msg] + keep
-        return keep
 
 
 async def comparative_analysis_node(agent, state) -> dict:
-    from agent_sdk.financial.prompts import COMPANY_ANALYSIS_PROMPT
-    from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
-    import asyncio
+    """
+    Comparative analysis phase — run isolated ReAct loops per entity in parallel
+    and append the combined results to running_context for synthesis to consume.
+    """
+    from datetime import datetime, timezone
 
     logger.info("Running comparative analysis phase for multiple entities")
-    entities = state.query_classification.get("entities", [])
+    entities = getattr(state, "entities", []) or []
     if not entities:
         logger.warning("No entities found for comparative analysis, falling back to synthesis")
         return {
-            "current_phase": "synthesis", 
+            "current_phase": "synthesis",
             "iteration": state.iteration + 1,
-            "phase_iterations": {"comparative_analysis": state.phase_iterations.get("comparative_analysis", 0) + 1}
         }
-        
+
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=True) if tools else llm
+    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
 
-    async def analyze_entity(entity: str):
-        prompt_template = COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
+    # Build base system content (agent prompt + prior context)
+    sys_content = ""
+    if state.messages and isinstance(state.messages[0], SystemMessage):
+        sys_content = state.messages[0].content
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_ctx = f"\n\nTODAY'S DATE: {today}. Include the current year in search queries."
+
+    running_ctx = getattr(state, "running_context", None)
+    plan = getattr(state, "scratchpad", None)
+    extra: list[str] = []
+    if plan:
+        extra.append("EXECUTION PLAN:\n" + plan)
+    if running_ctx:
+        extra.append("PRIOR PHASE RESULTS:\n" + running_ctx)
+
+    base_system = sys_content + date_ctx
+    if extra:
+        base_system += "\n\n" + "\n\n".join(extra)
+
+    async def analyze_entity(entity: str) -> str:
+        entity_system = (
+            base_system
+            + f"\n\n=== FOCUS ENTITY: {entity} ===\n"
+            f"Perform a thorough company analysis for {entity}. "
+            f"Retrieve fundamentals, valuation, recent performance, and key risks."
         )
-        prompt_template += f"\n\nFOCUS ENTITY: {entity}. Follow all standard company analysis instructions for this specific entity."
-        
-        messages = [SystemMessage(content=prompt_template)]
-        
-        # Isolated tool loop for this entity
+        messages: list = [SystemMessage(content=entity_system)]
+
+        # Include the current user query
+        for msg in reversed(state.messages):
+            if isinstance(msg, HumanMessage):
+                messages.append(msg)
+                break
+
         llm_timeout = state.tool_timeout
-        seen_tool_calls: dict[tuple, str] = {}  # (name, args_key) → cached result
-        compression_failures = 0
+        seen_calls: dict[tuple, str] = {}
 
         for _ in range(5):
             try:
                 response = await asyncio.wait_for(
-                    llm_with_tools.ainvoke(messages),
-                    timeout=llm_timeout,
+                    llm_with_tools.ainvoke(messages), timeout=llm_timeout
                 )
             except asyncio.TimeoutError:
-                logger.warning("LLM call timed out after %.0fs in analyze_entity for '%s'", llm_timeout, entity)
+                logger.warning("LLM timed out for entity '%s'", entity)
                 return f"Analysis timed out for {entity}"
 
             if not getattr(response, "tool_calls", None):
-                return response.content
+                return response.content or f"(no analysis produced for {entity})"
 
             messages.append(response)
 
-            # Deduplicate tool calls — return cached result for identical (name, args) pairs
-            tool_timeout = state.tool_timeout
             deduped_calls, cached_msgs = [], []
             for tc in response.tool_calls:
                 key = (tc["name"], str(sorted(tc.get("args", {}).items())))
-                if key in seen_tool_calls:
-                    logger.info("Skipping duplicate tool call '%s' — returning cached result", tc["name"])
-                    cached_msgs.append(ToolMessage(content=seen_tool_calls[key], tool_call_id=tc["id"]))
+                if key in seen_calls:
+                    logger.info("Skipping duplicate tool '%s' for entity '%s'", tc["name"], entity)
+                    cached_msgs.append(ToolMessage(content=seen_calls[key], tool_call_id=tc["id"]))
                 else:
                     deduped_calls.append(tc)
 
-            fresh_results: list = []
             if deduped_calls:
-                raw_results = await _execute_tool_calls(agent, deduped_calls, tool_timeout, phase_tools=tools)
-                # Distill large results immediately to prevent context bloat
-                fresh_results = list(await asyncio.gather(*(
-                    _summarize_large_tool_result(agent, tr, tc["name"], entity, llm_timeout)
-                    for tc, tr in zip(deduped_calls, raw_results)
-                )))
-                for tc, tr in zip(deduped_calls, fresh_results):
+                fresh = await _execute_tool_calls(agent, deduped_calls, llm_timeout, phase_tools=tools)
+                for tc, tr in zip(deduped_calls, fresh):
                     key = (tc["name"], str(sorted(tc.get("args", {}).items())))
-                    seen_tool_calls[key] = tr.content
+                    seen_calls[key] = tr.content
+                messages.extend(fresh)
 
-            messages.extend(fresh_results + cached_msgs)
+            messages.extend(cached_msgs)
 
-            # Compress if context is still approaching the model's limit (safety net)
-            phase_token_limit = int(state.max_context_tokens * 0.70)
-            if _estimate_token_count(messages) > phase_token_limit:
-                before_len = len(messages)
-                logger.info(
-                    "Entity '%s' context approaching limit (%d est. tokens) — compressing",
-                    entity, _estimate_token_count(messages),
-                )
-                messages = await _compress_entity_messages(agent, messages, entity, llm_timeout)
-                if len(messages) >= before_len:
-                    compression_failures += 1
-                    if compression_failures >= 2:
-                        logger.warning(
-                            "Entity '%s' — breaking loop after %d consecutive compression failures",
-                            entity, compression_failures,
-                        )
-                        for msg in reversed(messages):
-                            if (hasattr(msg, "content") and msg.content
-                                    and not getattr(msg, "tool_calls", None)):
-                                return msg.content
-                        return f"Analysis partial — context limit reached for {entity}"
-                else:
-                    compression_failures = 0
+        return "Analysis incomplete (iteration budget reached)"
 
-        return "Analysis incomplete (exceeded iterations)"
+    _entity_budget = state.tool_timeout * 1.5
 
-    # Execute entity analyses in parallel with a wall-clock budget per entity
-    _entity_budget = state.tool_timeout * 1.5  # e.g. 120s × 1.5 = 180s per entity
-
-    async def _bounded_analyze(e: str) -> str:
+    async def _bounded(e: str) -> str:
         try:
             return await asyncio.wait_for(analyze_entity(e), timeout=_entity_budget)
         except asyncio.TimeoutError:
-            logger.warning(
-                "Entity '%s' hit wall-clock budget (%.0fs) — returning partial analysis", e, _entity_budget
-            )
+            logger.warning("Entity '%s' hit wall-clock budget (%.0fs)", e, _entity_budget)
             return f"Analysis budget exceeded for {e} — partial data only."
 
-    results = await asyncio.gather(*(_bounded_analyze(e) for e in entities))
+    results = await asyncio.gather(*(_bounded(e) for e in entities))
     logger.info("Comparative analysis complete — %d entities processed", len(entities))
-    
-    combined_content = ""
-    for entity, res in zip(entities, results):
-        combined_content += f"\n\n## {entity}\n{res}\n---\n"
-        
-    # Set fallback count for transparency
-    state_fallback_count = state.raw_fallback_count
-    
+
+    combined = "\n".join(f"## {e}\n{r}\n---" for e, r in zip(entities, results))
+    phase_block = (
+        "=== COMPARATIVE ANALYSIS ===\n"
+        + combined
+        + "\n=== END COMPARATIVE ANALYSIS ==="
+    )
+
     return {
-        "messages": [AIMessage(content=combined_content)],
-        "company_analysis": {"raw_analysis": combined_content},  # We inject into company_analysis so synthesis sees it
-        "raw_fallback_count": state_fallback_count,
+        "running_context": phase_block,
         "iteration": state.iteration + 1,
-        "phase_iterations": {"comparative_analysis": state.phase_iterations.get("comparative_analysis", 0) + 1}
     }
-
-
-# ============================================================================
-# STRUCTURED PLANNING — Standard Mode Nodes
-# ============================================================================
-# These nodes implement the 4-phase Triager → Parallel Planner →
-# Stateless Executor → Synthesizer flow for mode="standard".
-# Simple ("opaque") queries skip planning and go directly to llm_call.
-# Complex ("analytical") queries are broken into parallel tool batches,
-# executed without any LLM involvement, then synthesized in one final call.
-# ============================================================================
-
-_TRIAGER_SYSTEM_PROMPT = """\
-Classify the user query as either "opaque" or "analytical".
-
-opaque: Can be answered directly or with at most one tool call.
-  Examples: math, greetings, factual single-entity lookups, simple follow-ups.
-
-analytical: Requires multiple distinct tool calls, comparing sources, or multi-step research.
-  Examples: "Compare X and Y", "Research A, B, and C and summarize", "Analyze X in depth".
-
-Output ONLY valid JSON — no explanation, no markdown:
-{"type": "opaque"}
-OR
-{"type": "analytical"}
-"""
-
-_PLANNER_SYSTEM_PROMPT = """\
-You are a task planner. Break the user query into ordered batches of tool calls.
-
-{tool_catalog}
-
-RULES:
-- Group tool calls that are INDEPENDENT into the same batch — they run in parallel.
-- Batches are sequential — later batches may depend on earlier results.
-- Each call must use a tool name from the catalog above with exact argument names.
-- Maximum 4 batches. Maximum 6 calls per batch.
-- Do NOT include reasoning or synthesis steps — only tool calls.
-
-Output ONLY valid JSON:
-{{"batches": [[{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...], ...]}}
-"""
-
-_SYNTHESIZER_SYSTEM_PROMPT = """\
-You are a synthesis assistant. Based on the tool findings below, answer the user's question clearly and accurately.
-Do not reference tool names, internal steps, or JSON structure — respond naturally and directly.
-
-TOOL FINDINGS:
-{scratchpad}
-"""
 
 
 def _format_tool_catalog(tools: list) -> str:
@@ -1732,632 +1430,8 @@ def _format_tool_catalog(tools: list) -> str:
     return "\n".join(lines)
 
 
-async def triager(agent, state: AgentState) -> dict:
-    """
-    Classify the incoming query as 'opaque' (answer directly / single tool call)
-    or 'analytical' (multi-step plan + parallel tool execution).
 
-    A heuristic fast-exit skips the LLM call for trivially short messages to
-    avoid unnecessary latency on greetings and simple follow-ups.
-    """
-    user_query = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_query = _strip_context_block(msg.content)
-            break
 
-    if not user_query:
-        return {"query_type": "opaque"}
-
-    # Heuristic: short, single-line messages without complex interrogatives → skip LLM
-    words = user_query.split()
-    if len(words) <= 8 and "\n" not in user_query:
-        logger.debug("triager: heuristic fast-exit → opaque (%d words)", len(words))
-        return {"query_type": "opaque"}
-
-    llm = agent.llm
-    if state.model_id:
-        from agent_sdk.llm_services.model_registry import get_llm
-        llm = get_llm(state.model_id)
-
-    try:
-        _t0 = time.monotonic()
-        response = await llm.ainvoke([
-            SystemMessage(content=_TRIAGER_SYSTEM_PROMPT),
-            HumanMessage(content=f"Query: {user_query}"),
-        ])
-        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-        llm_call_duration.labels(agent="sdk", model=_model_name, phase="triager").observe(
-            time.monotonic() - _t0
-        )
-        result = _extract_json(response.content)
-        query_type = (result or {}).get("type", "opaque")
-        if query_type not in ("opaque", "analytical"):
-            query_type = "opaque"
-    except Exception:
-        logger.exception("triager: classification failed — defaulting to opaque")
-        query_type = "opaque"
-
-    logger.info("triager: query_type=%s", query_type)
-    return {"query_type": query_type}
-
-
-def triager_router(state: AgentState) -> Literal["llm_call", "parallel_planner"]:
-    """Route after triager: opaque → llm_call (existing ReAct loop), analytical → parallel_planner.
-
-    When enable_analytical_path is False the planner is bypassed entirely —
-    all queries use the fast opaque path (scratchpad still captured in tool_node).
-    """
-    if not getattr(state, "enable_analytical_path", True):
-        return "llm_call"
-    qt = getattr(state, "query_type", None)
-    if qt == "analytical":
-        return "parallel_planner"
-    return "llm_call"
-
-
-async def parallel_planner(agent, state: AgentState) -> dict:
-    """
-    For analytical queries: generate an ordered plan of parallel tool-call batches.
-
-    Each batch groups independent calls that can run concurrently via asyncio.gather.
-    Later batches may depend on earlier results. The plan is stored in state.execution_plan
-    and executed by stateless_executor without any further LLM involvement.
-
-    Falls back to query_type='opaque' (standard llm_call loop) on any parse error.
-    """
-    tools = list(agent.tools_by_name.values())
-    tool_catalog = _format_tool_catalog(tools) if tools else "No tools available."
-
-    user_query = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_query = _strip_context_block(msg.content)
-            break
-
-    llm = agent.llm
-    if state.model_id:
-        from agent_sdk.llm_services.model_registry import get_llm
-        llm = get_llm(state.model_id)
-
-    planner_prompt = _PLANNER_SYSTEM_PROMPT.format(tool_catalog=tool_catalog)
-
-    try:
-        _t0 = time.monotonic()
-        response = await llm.ainvoke([
-            SystemMessage(content=planner_prompt),
-            HumanMessage(content=f"Query: {user_query}"),
-        ])
-        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-        llm_call_duration.labels(agent="sdk", model=_model_name, phase="parallel_planner").observe(
-            time.monotonic() - _t0
-        )
-        result = _extract_json(response.content)
-        batches = (result or {}).get("batches")
-        if not batches or not isinstance(batches, list):
-            raise ValueError(f"Invalid batches from planner: {result}")
-        # Validate each entry has 'tool' and 'args'
-        for batch in batches:
-            for call in batch:
-                if "tool" not in call:
-                    raise ValueError(f"Missing 'tool' key in call: {call}")
-                if call["tool"] not in agent.tools_by_name:
-                    logger.warning("parallel_planner: unknown tool '%s' in plan — removing", call["tool"])
-        # Filter out unknown tools
-        batches = [
-            [c for c in batch if c.get("tool") in agent.tools_by_name]
-            for batch in batches
-        ]
-        batches = [b for b in batches if b]  # remove empty batches
-        if not batches:
-            raise ValueError("No valid tool calls in plan after filtering")
-        logger.info("parallel_planner: %d batches, %d total calls",
-                    len(batches), sum(len(b) for b in batches))
-        return {"execution_plan": batches, "current_batch_index": 0}
-    except Exception:
-        logger.exception("parallel_planner: failed — falling back to opaque (standard llm_call)")
-        return {"query_type": "opaque", "execution_plan": None, "current_batch_index": 0}
-
-
-async def stateless_executor(agent, state: AgentState) -> dict:
-    """
-    Execute the current batch of tool calls in parallel (asyncio.gather).
-
-    NO LLM involvement — pure concurrent tool dispatch using the agent's
-    existing tool registry and circuit-breaker infrastructure.
-    Results are appended to state.scratchpad and current_batch_index is advanced.
-    """
-    plan = getattr(state, "execution_plan", None) or []
-    idx = getattr(state, "current_batch_index", 0)
-
-    if idx >= len(plan):
-        logger.warning("stateless_executor: called with no remaining batches (idx=%d, plan len=%d)", idx, len(plan))
-        return {"current_batch_index": idx}
-
-    batch = plan[idx]
-    timeout = state.tool_timeout
-
-    # Normalize inputs: handle lists fanned out by LLM where strings were expected
-    batch = _normalize_tool_calls(batch, agent.tools_by_name)
-
-    async def run_one(call: dict) -> str:
-        tool_name = call.get("tool", "")
-        args = call.get("args", {})
-        tool = agent.tools_by_name.get(tool_name)
-        if tool is None:
-            return f"[{tool_name}] ERROR: tool not found"
-
-        breaker = agent._get_breaker(tool_name)
-        if breaker.is_open:
-            return f"[{tool_name}] SKIPPED: circuit breaker open"
-
-        try:
-            _t0 = time.monotonic()
-            if hasattr(tool, "ainvoke"):
-                result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
-            else:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(tool.invoke if hasattr(tool, "invoke") else tool.run, args),
-                    timeout=timeout,
-                )
-            breaker.record_success()
-            tool_call_duration.labels(agent="sdk", tool_name=tool_name).observe(time.monotonic() - _t0)
-            logger.info("stateless_executor: '%s' completed (%d chars)", tool_name, len(str(result)))
-            return f"[{tool_name}({args})] → {result}"
-        except asyncio.TimeoutError:
-            breaker.record_failure(tool_name)
-            return f"[{tool_name}] TIMEOUT after {timeout:.0f}s"
-        except Exception as e:
-            breaker.record_failure(tool_name)
-            logger.exception("stateless_executor: tool '%s' failed", tool_name)
-            return f"[{tool_name}] ERROR: {e}"
-
-    logger.info("stateless_executor: batch %d/%d — %d parallel calls: %s",
-                idx + 1, len(plan), len(batch), [c.get("tool") for c in batch])
-
-    results = await asyncio.gather(*[run_one(c) for c in batch])
-
-    batch_section = f"\n\n--- Batch {idx + 1} ---\n" + "\n\n".join(results)
-    existing_scratchpad = getattr(state, "scratchpad", None) or ""
-
-    return {
-        "scratchpad": existing_scratchpad + batch_section,
-        "current_batch_index": idx + 1,
-    }
-
-
-def _normalize_tool_calls(calls: list[dict], tools_by_name: dict) -> list[dict]:
-    """
-    Handle tool calls where the LLM provided a list for an argument that expects a string.
-    If a list has multiple elements, the call is split into multiple parallel calls (multi-dispatch).
-    If a list has a single element, it is flattened to a string.
-    """
-    normalized = []
-    for call in calls:
-        tool_name = call.get("tool")
-        args = call.get("args", {})
-        tool = tools_by_name.get(tool_name)
-
-        if not tool or not hasattr(tool, "args_schema") or not hasattr(tool.args_schema, "model_json_schema"):
-            normalized.append(call)
-            continue
-
-        try:
-            schema = tool.args_schema.model_json_schema().get("properties", {})
-        except Exception:
-            normalized.append(call)
-            continue
-
-        # Detect fanned-out list arguments
-        fanned_arg = None
-        fanned_values = []
-
-        # We only fan out on the FIRST encountered list argument that should be a string.
-        # This covers 99% of LLM planning mistakes.
-        current_args = dict(args)
-        for arg_name, arg_val in current_args.items():
-            if isinstance(arg_val, list) and arg_name in schema:
-                arg_def = schema[arg_name]
-                # If the schema says it should be a string, but we got a list...
-                if arg_def.get("type") == "string":
-                    if len(arg_val) == 1:
-                        # Simple wrapping: ["item"] -> "item"
-                        current_args[arg_name] = arg_val[0]
-                    else:
-                        # Multi-dispatch: split this one call into many
-                        fanned_arg = arg_name
-                        fanned_values = arg_val
-                        break
-
-        if fanned_arg:
-            for val in fanned_values:
-                new_args = current_args.copy()
-                new_args[fanned_arg] = val
-                normalized.append({"tool": tool_name, "args": new_args})
-        else:
-            normalized.append({"tool": tool_name, "args": current_args})
-
-    return normalized
-
-
-def after_planner_router(state: AgentState) -> Literal["stateless_executor", "llm_call"]:
-    """
-    After parallel_planner: if the plan is valid route to stateless_executor,
-    otherwise fall back to the standard llm_call loop (e.g. if planner failed).
-    """
-    plan = getattr(state, "execution_plan", None)
-    if plan:
-        return "stateless_executor"
-    logger.info("after_planner_router: no valid plan — falling back to llm_call")
-    return "llm_call"
-
-
-def batch_check(state: AgentState) -> Literal["stateless_executor", "synthesizer"]:
-    """After each executor run: proceed to next batch or move to synthesis."""
-    plan = getattr(state, "execution_plan", None) or []
-    idx = getattr(state, "current_batch_index", 0)
-    if idx < len(plan):
-        logger.debug("batch_check: more batches remaining (%d/%d)", idx + 1, len(plan))
-        return "stateless_executor"
-    logger.debug("batch_check: all batches done — routing to synthesizer")
-    return "synthesizer"
-
-
-async def synthesizer(agent, state: AgentState) -> dict:
-    """
-    Final synthesis: one LLM call (no tools) that turns the scratchpad into
-    a user-facing response. Streamed to the client.
-    """
-    scratchpad = getattr(state, "scratchpad", None) or "(no tool results)"
-
-    # Find the user's original query
-    user_query = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_query = _strip_context_block(msg.content)
-            break
-
-    # Include agent system prompt so synthesizer maintains agent persona
-    system_content = state.system_prompt or "You are a helpful assistant."
-    if state.summary:
-        system_content += (
-            f"\n\nCONVERSATION CONTEXT: {state.summary}"
-        )
-
-    synthesis_system = system_content + "\n\n" + _SYNTHESIZER_SYSTEM_PROMPT.format(
-        scratchpad=scratchpad
-    )
-
-    llm = agent.llm
-    if state.model_id:
-        from agent_sdk.llm_services.model_registry import get_llm
-        llm = get_llm(state.model_id)
-
-    try:
-        _t0 = time.monotonic()
-        response = await llm.ainvoke([
-            SystemMessage(content=synthesis_system),
-            HumanMessage(content=user_query),
-        ])
-        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-        llm_call_duration.labels(agent="sdk", model=_model_name, phase="synthesizer").observe(
-            time.monotonic() - _t0
-        )
-    except Exception:
-        logger.exception("synthesizer: LLM call failed")
-        response = AIMessage(content="I encountered an error synthesizing the results. Please try again.")
-
-    logger.info("synthesizer: response (%d chars)", len(getattr(response, "content", "")))
-    return {
-        "messages": [response],
-        "iteration": state.iteration + 1,
-    }
-
-
-# ============================================================================
-# STRUCTURED PLANNING — Financial Mode Nodes
-# ============================================================================
-# Each financial phase node is split into three sub-nodes:
-#   1. {phase}_plan  — 1 LLM call: output a list of tool calls needed
-#   2. financial_stateless_executor_node  — 0 LLM calls: run them all in parallel
-#   3. {phase}_synth — 1 LLM call: synthesize results into structured phase output
-#
-# comparative_analysis and synthesis phases are unchanged (they have their own
-# parallel entity logic and no tools respectively).
-# ============================================================================
-
-_FINANCIAL_PHASE_PLANNER_PREFIX = """\
-PLANNING STEP — DO NOT ANALYZE YET. DO NOT write explanations, markdown, or ask questions.
-
-Your ONLY task is to output a JSON list of tool calls needed for this phase.
-The calls will be executed in parallel and their results returned to you for synthesis.
-
-AUTONOMY RULE: Make all decisions yourself — never ask the user for clarification.
-- For Indian companies where NSE/BSE is not specified, default to NSE (ticker.NS suffix).
-- If a ticker is ambiguous, pick the most likely one and proceed.
-
-{tool_catalog}
-
-REQUIRED ARGS RULE: Args marked with * are REQUIRED. You MUST provide a concrete, non-empty value
-for every required arg. Never output an empty string "", null, or {{}} for a required field.
-Example of a CORRECT call:
-  {{"tool": "tavily_quick_search", "args": {{"query": "RBI rate cut impact on Indian NBFCs 2026"}}}}
-Example of an INVALID call (will be rejected):
-  {{"tool": "tavily_quick_search", "args": {{}}}}
-
-OUTPUT RULE (overrides any other format instruction): Output ONLY valid JSON — no explanation, no markdown:
-{{"calls": [{{"tool": "<name>", "args": {{<key>: <value>}}}}, ...]}}
-
-If no tool calls are needed, output: {{"calls": []}}
-"""
-
-# Maps phase name → state field that stores its structured output
-_PHASE_STATE_KEY: dict[str, str] = {
-    "regime_assessment": "regime_assessment",
-    "causal_analysis": "causal_analysis",
-    "sector_analysis": "sector_analysis",
-    "company_analysis": "company_analysis",
-    "risk_assessment": "risk_assessment",
-}
-
-
-async def financial_phase_planner(phase_name: str, agent, state) -> dict:
-    """
-    Planning sub-node for a financial pipeline phase.
-    Calls the LLM once to produce a list of tool calls needed for this phase.
-    Tool calls are stored in state.phase_tool_plan; phase_scratchpad is reset.
-    """
-    from agent_sdk.financial.prompts import (
-        REGIME_ASSESSMENT_PROMPT, CAUSAL_ANALYSIS_PROMPT,
-        SECTOR_ANALYSIS_PROMPT, COMPANY_ANALYSIS_PROMPT, RISK_ASSESSMENT_PROMPT,
-    )
-
-    # Deterministic phases bypass the planner and go straight to execution
-    # These are phases where the tool set is effectively constant or handled by a specific logic
-    if phase_name == "query_classification":
-        # We simulate a plan for the classifier tool
-        return {
-            "phase_tool_plan": [{"tool": "classify_query", "args": {}}],
-            "phase_scratchpad": "",
-            "iteration": state.iteration + 1,
-            "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
-        }
-
-    _phase_prompts = {
-        "regime_assessment": REGIME_ASSESSMENT_PROMPT,
-        "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment"))
-        ),
-        "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-        ),
-        "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
-        ),
-        "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
-            company_analysis=_format_context(state.findings.get("company_analysis")),
-        ),
-    }
-
-    phase_prompt = _phase_prompts.get(phase_name, "")
-    tools = _get_phase_tools(agent, phase_name)
-    tool_catalog = _format_tool_catalog(tools) if tools else "No tools available for this phase."
-
-    planning_prompt = _FINANCIAL_PHASE_PLANNER_PREFIX.format(tool_catalog=tool_catalog)
-
-    llm = _get_phase_llm(agent, state)
-    prompt = _build_phase_prompt(state, phase_prompt)
-    # Phase prompt first, then planning constraints last so JSON-only rule takes precedence
-    prompt[0] = SystemMessage(content=phase_prompt + "\n\n" + planning_prompt)
-
-    logger.info("financial_phase_planner: planning %s phase", phase_name)
-    try:
-        _t0 = time.monotonic()
-        response = await llm.ainvoke(prompt)
-        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-        llm_call_duration.labels(agent="sdk", model=_model_name, phase=f"{phase_name}_plan").observe(
-            time.monotonic() - _t0
-        )
-        result = _extract_json(response.content)
-        calls = (result or {}).get("calls", [])
-        # Filter to known tools only
-        known_names = {t.name for t in tools}
-        valid_calls = [c for c in calls if c.get("tool") in known_names]
-        if len(valid_calls) != len(calls):
-            logger.warning(
-                "financial_phase_planner: dropped %d unknown tool(s) from %s plan",
-                len(calls) - len(valid_calls), phase_name,
-            )
-        # Guard: drop calls with missing required args (e.g. tavily_quick_search with empty args)
-        tools_by_name_map = {t.name: t for t in tools}
-
-        def _args_complete(call: dict) -> bool:
-            tool = tools_by_name_map.get(call.get("tool", ""))
-            if not tool:
-                return False
-            try:
-                schema = tool.get_input_schema().model_json_schema() if hasattr(tool, "get_input_schema") else {}
-                required = set(schema.get("required", []))
-                args = call.get("args") or {}
-                return all(k in args and args[k] not in (None, "", {}, []) for k in required)
-            except Exception:
-                return True  # can't introspect schema — let it through
-
-        complete_calls = [c for c in valid_calls if _args_complete(c)]
-        if len(complete_calls) != len(valid_calls):
-            dropped = [c.get("tool") for c in valid_calls if not _args_complete(c)]
-            logger.warning(
-                "financial_phase_planner: dropped %d call(s) with missing required args from %s plan: %s",
-                len(valid_calls) - len(complete_calls), phase_name, dropped,
-            )
-        valid_calls = complete_calls
-        logger.info("financial_phase_planner: %s → %d tool call(s)", phase_name, len(valid_calls))
-    except Exception:
-        logger.exception("financial_phase_planner: %s planning failed — empty plan", phase_name)
-        valid_calls = []
-
-    return {
-        "phase_tool_plan": {phase_name: valid_calls},
-        "phase_scratchpad": {phase_name: ""},
-        "iteration": state.iteration + 1,
-        "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
-    }
-async def financial_stateless_executor_node(phase_name: str, agent, state) -> dict:
-    """
-    Stateless executor for a financial pipeline phase.
-    Runs all calls from state.phase_tool_plan in parallel using asyncio.gather.
-    Results are stored in state.phase_scratchpad. No LLM call.
-    """
-    calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
-    if not calls:
-        logger.info("financial_stateless_executor: %s — no tool calls planned, skipping", phase_name)
-        return {"phase_scratchpad": {phase_name: "(no tool calls)"}}
-
-    tools = _get_phase_tools(agent, phase_name)
-    tools_by_name = {t.name: t for t in tools}
-    # Also include agent tools
-    tools_by_name.update(agent.tools_by_name)
-    
-    # Normalize inputs: handle lists fanned out by LLM where strings were expected
-    calls = _normalize_tool_calls(calls, tools_by_name)
-    
-    timeout = state.tool_timeout
-
-    async def run_one(call: dict) -> str:
-        tool_name = call.get("tool", "")
-        args = call.get("args", {})
-        tool = tools_by_name.get(tool_name)
-        if tool is None:
-            return f"[{tool_name}] ERROR: tool not found"
-
-        breaker = agent._get_breaker(tool_name)
-        if breaker.is_open:
-            return f"[{tool_name}] SKIPPED: circuit breaker open"
-
-        try:
-            _t0 = time.monotonic()
-            if hasattr(tool, "ainvoke"):
-                result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
-            else:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(tool.invoke if hasattr(tool, "invoke") else tool.run, args),
-                    timeout=timeout,
-                )
-            breaker.record_success()
-            tool_call_duration.labels(agent="sdk", tool_name=tool_name).observe(time.monotonic() - _t0)
-            return f"[{tool_name}] → {result}"
-        except asyncio.TimeoutError:
-            breaker.record_failure(tool_name)
-            return f"[{tool_name}] TIMEOUT after {timeout:.0f}s"
-        except Exception as e:
-            breaker.record_failure(tool_name)
-            logger.exception("financial_stateless_executor: tool '%s' failed", tool_name)
-            return f"[{tool_name}] ERROR: {e}"
-
-    logger.info("financial_stateless_executor: %s — %d parallel calls (normalized): %s",
-                phase_name, len(calls), [c.get("tool") for c in calls])
-
-    results = await asyncio.gather(*[run_one(c) for c in calls])
-    combined_scratchpad = "\n\n".join(results)
-    return {"phase_scratchpad": {phase_name: combined_scratchpad}}
-
-
-async def financial_phase_synthesizer(phase_name: str, agent, state) -> dict:
-    """
-    Synthesis sub-node for a financial pipeline phase.
-    Calls the LLM once with the phase system prompt + tool results from phase_scratchpad
-    to produce the structured phase output (regime_context, causal_analysis, etc.).
-    """
-    from agent_sdk.financial.prompts import (
-        REGIME_ASSESSMENT_PROMPT, CAUSAL_ANALYSIS_PROMPT,
-        SECTOR_ANALYSIS_PROMPT, COMPANY_ANALYSIS_PROMPT, RISK_ASSESSMENT_PROMPT,
-    )
-
-    _phase_prompts = {
-        "regime_assessment": REGIME_ASSESSMENT_PROMPT,
-        "causal_analysis": CAUSAL_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment"))
-        ),
-        "sector_analysis": SECTOR_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-        ),
-        "company_analysis": COMPANY_ANALYSIS_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
-        ),
-        "risk_assessment": RISK_ASSESSMENT_PROMPT.format(
-            regime_context=_format_context(state.findings.get("regime_assessment")),
-            causal_analysis=_format_context(state.findings.get("causal_analysis")),
-            sector_analysis=_format_context(state.findings.get("sector_analysis")),
-            company_analysis=_format_context(state.findings.get("company_analysis")),
-        ),
-    }
-
-    phase_prompt = _phase_prompts.get(phase_name, "")
-    phase_scratchpad = (getattr(state, "phase_scratchpad", None) or {}).get(phase_name, "(no tool results retrieved)")
-
-    # Inject tool results into the system prompt
-    synthesis_prefix = (
-        f"TOOL RESULTS FOR THIS PHASE:\n{phase_scratchpad}\n\n"
-        "Now synthesize the above results into the required structured output. "
-        "Output the structured JSON as specified in your instructions."
-    )
-
-    # Add validation warnings for risk_assessment
-    if phase_name == "risk_assessment" and state.validation_warnings:
-        synthesis_prefix += "\n\nVALIDATION WARNINGS FROM PRIOR PHASES (address these):\n"
-        for w in state.validation_warnings:
-            synthesis_prefix += f"- {w}\n"
-
-    llm = _get_phase_llm(agent, state)
-    prompt = _build_phase_prompt(state, phase_prompt)
-    # Append tool results before handing to LLM (inject into system message)
-    prompt[0] = SystemMessage(content=f"{phase_prompt}\n\n{synthesis_prefix}")
-
-    logger.info("financial_phase_synthesizer: synthesizing %s phase", phase_name)
-    try:
-        _t0 = time.monotonic()
-        response = await llm.ainvoke(prompt)
-        _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-        llm_call_duration.labels(agent="sdk", model=_model_name, phase=f"{phase_name}_synth").observe(
-            time.monotonic() - _t0
-        )
-    except Exception:
-        logger.exception("financial_phase_synthesizer: %s synthesis LLM call failed", phase_name)
-        response = AIMessage(content=f"{{\"error\": \"synthesis failed for {phase_name}\"}}")
-
-    data_key = phase_name
-    phase_data = _extract_json(response.content) or {}
-
-    result = _build_phase_return(response, data_key, phase_data, state, phase_name)
-    result["findings"] = {phase_name: phase_data}
-
-    # Run symbolic validation for phases that accumulate warnings
-    if phase_name in ("company_analysis", "risk_assessment"):
-        new_warnings = _run_phase_validation(state)
-        result["validation_warnings"] = new_warnings
-
-    return result
-
-
-def _financial_after_plan(phase_name: str, state) -> str:
-    """
-    Conditional edge from a financial phase planner node.
-    Routes to executor if there are tool calls, otherwise directly to synthesizer.
-    """
-    calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
-    if calls:
-        return f"{phase_name}_exec"
-    logger.info("_financial_after_plan: %s has no tool calls — skipping executor", phase_name)
-    return f"{phase_name}_synth"
 
 
 # ============================================================================

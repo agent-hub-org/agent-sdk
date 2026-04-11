@@ -13,49 +13,29 @@ from ..mcp.circuit_breaker import CircuitBreaker
 logger = logging.getLogger("agent_sdk.agent")
 
 # Nodes that produce user-facing LLM output and should be streamed to the client.
-# Covers both the standard graph ("llm_call") and the financial reasoning graph.
 DEFAULT_STREAMING_NODES = frozenset({
-    "llm_call",       # standard mode flat loop
-    "synthesizer",    # standard mode synthesizer
-    "synthesis",      # financial_analyst mode — final user-facing output only
+    "llm_call",   # standard mode ReAct loop
+    "synthesis",  # financial_analyst mode — final user-facing output only
 })
 
 # Human-readable labels shown as progress markers while nodes run silently.
 _PHASE_PROGRESS_LABELS: dict[str, str] = {
     # Memory nodes (both modes)
-    "load_user_context":          "Loading user context...",
-    "memory_writer":              "Saving memory...",
+    "load_user_context":       "Loading user context...",
+    "memory_writer":           "Saving memory...",
     # Standard mode
-    "triager":                    "Analyzing query...",
-    "parallel_planner":           "Building execution plan...",
-    "stateless_executor":         "Fetching data in parallel...",
-    "synthesizer":                "Synthesizing response...",
-    # Financial mode — classification
-    "classify_query":             "🔎 Classifying query...",
-    # Financial mode — regime
-    "regime_assessment":          "🌐 Planning regime assessment...",
-    "regime_assessment_exec":     "🌐 Fetching macro data in parallel...",
-    "regime_assessment_synth":    "🌐 Analyzing macro regime & market environment...",
-    # Financial mode — causal
-    "causal_analysis":            "🔗 Planning causal analysis...",
-    "causal_analysis_exec":       "🔗 Fetching causal data in parallel...",
-    "causal_analysis_synth":      "🔗 Mapping causal transmission chains...",
-    # Financial mode — sector
-    "sector_analysis":            "📊 Planning sector analysis...",
-    "sector_analysis_exec":       "📊 Fetching sector data in parallel...",
-    "sector_analysis_synth":      "📊 Evaluating sector positioning...",
-    # Financial mode — company
-    "company_analysis":           "🏢 Planning company analysis...",
-    "company_analysis_exec":      "🏢 Fetching company data in parallel...",
-    "company_analysis_synth":     "🏢 Running company fundamental analysis...",
-    # Financial mode — comparative
-    "comparative_analysis":       "⚖️ Running comparative analysis...",
-    # Financial mode — risk
-    "risk_assessment":            "⚠️ Planning risk assessment...",
-    "risk_assessment_exec":       "⚠️ Fetching risk data in parallel...",
-    "risk_assessment_synth":      "⚠️ Stress-testing scenarios & risks...",
+    "orchestrate":             "Planning approach...",
+    # Financial mode — orchestration
+    "financial_orchestrate":  "🔎 Classifying query & building plan...",
+    # Financial mode — phases (all use financial_phase_executor)
+    "regime_assessment":      "🌐 Assessing macro regime & market environment...",
+    "causal_analysis":        "🔗 Mapping causal transmission chains...",
+    "sector_analysis":        "📊 Evaluating sector positioning...",
+    "company_analysis":       "🏢 Running fundamental company analysis...",
+    "comparative_analysis":   "⚖️ Running comparative analysis...",
+    "risk_assessment":        "⚠️ Stress-testing scenarios & risks...",
     # Financial mode — synthesis
-    "synthesis":                  "✍️ Synthesizing final report...",
+    "synthesis":              "✍️ Synthesizing final report...",
 }
 
 
@@ -79,7 +59,7 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
                  mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None,
-                 memory_manager=None, analytical_path: bool = True):
+                 memory_manager=None):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
@@ -109,7 +89,6 @@ class BaseAgent:
             "or respond directly when tools are not needed."
         )
 
-        self.analytical_path = analytical_path
         self._mcp_servers = mcp_servers
         self._mcp_manager = None
         self._initialized = False
@@ -200,7 +179,6 @@ class BaseAgent:
             "system_prompt": system_prompt or self.system_prompt,
             "iteration": 0,
             "session_id": session_id,
-            "enable_analytical_path": self.analytical_path,
             "scratchpad": None,
         }
         if model_id:
@@ -208,34 +186,13 @@ class BaseAgent:
 
         # Merge any extra state fields (e.g. as_of_date, user_id)
         invoke_input.update(kwargs)
-        
-        # For financial_analyst mode, set up per-phase iteration budgets
-        if self.mode == "financial_analyst":
-            invoke_input["phase_iteration_budgets"] = {
-                "query_classification": 1,
-                "regime_assessment": 2,
-                "causal_analysis": 2,
-                "sector_analysis": 2,
-                "company_analysis": 4,
-                "risk_assessment": 2,
-                "synthesis": 3,
-            }
 
         result = await self.graph.ainvoke(
             invoke_input,
             config={"recursion_limit": 100, "configurable": {"thread_id": session_id}},
         )
 
-        # For financial_analyst mode, prefer the structured synthesis report
-        if self.mode == "financial_analyst":
-            synthesis = result.get("synthesis_report") or {}
-            raw = synthesis.get("full_report", "")
-        else:
-            raw = ""
-
-        # Fallback to last message content
-        if not raw:
-            raw = result["messages"][-1].content
+        raw = result["messages"][-1].content
 
         if isinstance(raw, list):
             response = "".join(
@@ -272,10 +229,7 @@ class BaseAgent:
 
         logger.info("Agent run completed — session='%s', response length: %d chars, steps: %d",
                     session_id, len(response), len(steps))
-        # Include structured synthesis (if available) so callers can render rich UI.
-        # Only exposed for financial_analyst mode to avoid unexpected payload bloat elsewhere.
-        structured = result.get("synthesis_report") if self.mode == "financial_analyst" else None
-        return {"response": response, "steps": steps, "synthesis_report": structured}
+        return {"response": response, "steps": steps}
 
     def astream(self, query: str, session_id: str = "default",
                 system_prompt: str | None = None, model_id: str | None = None,
@@ -325,7 +279,6 @@ class StreamResult:
             "system_prompt": self._system_prompt,
             "iteration": 0,
             "session_id": self._session_id,
-            "enable_analytical_path": self._agent.analytical_path,
             "scratchpad": None,
         }
         if self._model_id:
@@ -333,18 +286,6 @@ class StreamResult:
 
         # Merge any extra state fields (e.g. as_of_date, user_id)
         stream_input.update(self._extra_fields)
-
-        # For financial_analyst mode, set up per-phase iteration budgets
-        if self._agent.mode == "financial_analyst":
-            stream_input["phase_iteration_budgets"] = {
-                "query_classification": 1,
-                "regime_assessment": 2,
-                "causal_analysis": 2,
-                "sector_analysis": 2,
-                "company_analysis": 4,
-                "risk_assessment": 2,
-                "synthesis": 3,
-            }
 
         _phases_announced: set[str] = set()
 

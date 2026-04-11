@@ -15,7 +15,7 @@ class AgentSDKSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENT_SDK_", case_sensitive=False)
 
     # ── Conversation / context limits ──────────────────────────────────────────
-    max_context_tokens: int = 32768
+    max_context_tokens: int = 65536
     keep_last_n_messages: int = 15
     max_iterations: int = 10
     tool_timeout: float = 180.0
