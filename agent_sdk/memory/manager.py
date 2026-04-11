@@ -24,12 +24,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional, Any
 
 from agent_sdk.memory.backend import MemoryBackend
 
 logger = logging.getLogger("agent_sdk.memory.manager")
+
+_PERSPECTIVE_CACHE: dict[str, tuple[Optional[str], float]] = {}
+_PERSPECTIVE_CACHE_TTL = 300.0  # seconds
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -162,8 +166,16 @@ class MemoryManager:
 
     async def get_perspective(self, user_id: str) -> Optional[str]:
         """Retrieve the current perspective memory for injection into the system prompt."""
+        cached_result, fetched_at = _PERSPECTIVE_CACHE.get(user_id, (None, 0))
+        if cached_result and time.monotonic() - fetched_at < _PERSPECTIVE_CACHE_TTL:
+            return cached_result
+
         try:
-            return await self.backend.get_perspective(user_id)
+            result = await self.backend.get_perspective(user_id)
+            if len(_PERSPECTIVE_CACHE) > 1000:
+                _PERSPECTIVE_CACHE.clear()  # simple bound
+            _PERSPECTIVE_CACHE[user_id] = (result, time.monotonic())
+            return result
         except Exception:
             logger.exception("MemoryManager.get_perspective: error reading perspective for user=%s", user_id)
             return None
@@ -266,6 +278,7 @@ class MemoryManager:
             resp = await asyncio.wait_for(llm.ainvoke(prompt), timeout=30.0)
             perspective = resp.content if hasattr(resp, "content") else str(resp)
             await self.backend.save_perspective(user_id, perspective)
+            _PERSPECTIVE_CACHE[user_id] = (perspective, time.monotonic())
             logger.info("MemoryManager: perspective memory updated for user=%s (%d chars)",
                         user_id, len(perspective))
         except Exception:

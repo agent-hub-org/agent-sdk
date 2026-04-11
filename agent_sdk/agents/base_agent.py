@@ -93,18 +93,50 @@ class BaseAgent:
         self._mcp_manager = None
         self._initialized = False
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._init_lock = None
+        self._tool_catalog_cache = {}
+        self._bound_llm_cache = {}
 
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered
             self.graph = None
             logger.info("BaseAgent created with %d local tool(s) + %d MCP server(s) — graph deferred (mode=%s)",
                         len(self.tools), len(mcp_servers), mode)
+            
+            # Eager MCP init via background task if an event loop is running
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._ensure_initialized())
+            except RuntimeError:
+                pass
         else:
             # No MCP — build graph immediately (backward compatible)
             self.graph = self._build_graph()
             self._initialized = True
             logger.info("BaseAgent initialized with %d tool(s) (mode=%s): %s",
                         len(self.tools), mode, list(self.tools_by_name.keys()))
+
+    @property
+    def _lock(self):
+        if self._init_lock is None:
+            import asyncio
+            self._init_lock = asyncio.Lock()
+        return self._init_lock
+
+    def get_tool_catalog(self) -> str:
+        key = frozenset(t.name for t in self.tools)
+        if key not in self._tool_catalog_cache:
+            from .nodes import _format_tool_catalog
+            self._tool_catalog_cache[key] = _format_tool_catalog(self.tools)
+        return self._tool_catalog_cache[key]
+
+    def get_bound_llm(self, llm_instance: Any, tools: list) -> Any:
+        key = frozenset(t.name for t in tools)
+        cache_key = (id(llm_instance), key)
+        if cache_key not in self._bound_llm_cache:
+            self._bound_llm_cache[cache_key] = llm_instance.bind_tools(tools, parallel_tool_calls=False) if tools else llm_instance
+        return self._bound_llm_cache[cache_key]
 
     def _get_breaker(self, name: str) -> CircuitBreaker:
         """Return the per-tool circuit breaker, creating one on first access."""
@@ -131,30 +163,34 @@ class BaseAgent:
         if self._initialized:
             return
 
-        if self._mcp_servers:
-            from ..mcp.client import MCPConnectionManager
-            self._mcp_manager = MCPConnectionManager()
+        async with self._lock:
+            if self._initialized:
+                return
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        logger.error("MCP initialization failed after %d attempts: %s", max_retries, e)
-                        raise
-                    backoff = 2 ** attempt
-                    logger.warning("MCP connection attempt %d failed: %s — retrying in %ds", attempt + 1, e, backoff)
-                    import asyncio
-                    await asyncio.sleep(backoff)
+            if self._mcp_servers:
+                from ..mcp.client import MCPConnectionManager
+                self._mcp_manager = MCPConnectionManager()
 
-            # Merge MCP tools with any local tools
-            self.tools.extend(mcp_tools)
-            for t in mcp_tools:
-                self.tools_by_name[t.name] = t
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            logger.error("MCP initialization failed after %d attempts: %s", max_retries, e)
+                            raise
+                        backoff = 2 ** attempt
+                        logger.warning("MCP connection attempt %d failed: %s — retrying in %ds", attempt + 1, e, backoff)
+                        import asyncio
+                        await asyncio.sleep(backoff)
 
-            logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
+                # Merge MCP tools with any local tools
+                self.tools.extend(mcp_tools)
+                for t in mcp_tools:
+                    self.tools_by_name[t.name] = t
+
+                logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
 
         self.graph = self._build_graph()
         self._initialized = True

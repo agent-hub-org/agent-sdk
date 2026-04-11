@@ -121,7 +121,7 @@ async def llm_call(agent, state: AgentState) -> dict:
         llm = agent.llm
 
     tools = list(agent.tools_by_name.values())
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = agent.get_bound_llm(llm, tools)
 
     # Build appended context sections (summary + plan + running_context + perspective)
     extra_sections: list[str] = []
@@ -585,7 +585,7 @@ async def orchestrate(agent, state: AgentState) -> dict:
     if not tools:
         return {}
 
-    tool_catalog = _format_tool_catalog(tools)
+    tool_catalog = agent.get_tool_catalog()
     llm = _get_phase_llm(agent, state)
 
     try:
@@ -790,7 +790,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, phase_name)
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = agent.get_bound_llm(llm, tools)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.as_of_date:
@@ -1338,7 +1338,7 @@ async def comparative_analysis_node(agent, state) -> dict:
 
     llm = _get_phase_llm(agent, state)
     tools = _get_phase_tools(agent, "company_analysis")
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False) if tools else llm
+    llm_with_tools = agent.get_bound_llm(llm, tools)
 
     # Build base system content (agent prompt + prior context)
     sys_content = ""

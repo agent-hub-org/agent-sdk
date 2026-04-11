@@ -7,8 +7,13 @@ Set `hidden: True` on entries that are internal pipeline slots and must not appe
 """
 import os
 import logging
+import threading
+import httpx
 
 logger = logging.getLogger("agent_sdk.model_registry")
+
+_LLM_CACHE = {}
+_LLM_CACHE_LOCK = threading.Lock()
 
 MODEL_CATALOG = {
     # Azure AI Foundry — primary model
@@ -77,15 +82,27 @@ def get_llm(model_id: str, temperature: float = 0.7):
         )
         config = MODEL_CATALOG[_DEFAULT_MODEL_ID]
 
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(
-        base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
-        api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
-        model=config["model"],
-        temperature=temperature,
-        timeout=float(os.getenv("AGENT_LLM_TIMEOUT", "120.0")),
-        max_retries=int(os.getenv("AGENT_LLM_MAX_RETRIES", "3")),
-    )
+    cache_key = (model_id, temperature)
+    with _LLM_CACHE_LOCK:
+        if cache_key not in _LLM_CACHE:
+            from langchain_openai import ChatOpenAI
+            
+            # Using custom http_async_client to prevent connection pool exhaustion across sessions
+            http_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
+            )
+
+            _LLM_CACHE[cache_key] = ChatOpenAI(
+                base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+                api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+                model=config["model"],
+                temperature=temperature,
+                timeout=float(os.getenv("AGENT_LLM_TIMEOUT", "120.0")),
+                max_retries=int(os.getenv("AGENT_LLM_MAX_RETRIES", "3")),
+                http_async_client=http_client,
+            )
+
+        return _LLM_CACHE[cache_key]
 
 
 def list_models() -> list[dict]:

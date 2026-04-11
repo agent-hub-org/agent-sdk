@@ -23,6 +23,10 @@ from agent_sdk.agents.nodes import (
     memory_writer,
 )
 
+def merge_context(state) -> dict:
+    """Dummy node to fan-in parallel branches."""
+    return {}
+
 
 def create_graph(agent, checkpointer: Optional[Any] = None):
     """
@@ -50,11 +54,13 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_node("tool_node", partial(tool_node, agent))
     graph.add_node("summarize_conversation", partial(summarize_conversation, agent))
     graph.add_node("memory_writer", partial(memory_writer, agent))
+    graph.add_node("merge_context", merge_context)
 
     graph.add_edge(START, "initialize")
     graph.add_edge("initialize", "load_user_context")
-    graph.add_edge("load_user_context", "orchestrate")
-    graph.add_conditional_edges("orchestrate", pre_llm_router, {
+    graph.add_edge("initialize", "orchestrate")
+    graph.add_edge(["load_user_context", "orchestrate"], "merge_context")
+    graph.add_conditional_edges("merge_context", pre_llm_router, {
         "llm_call": "llm_call",
         "summarize_conversation": "summarize_conversation",
     })
@@ -131,10 +137,12 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_node("synthesis", partial(synthesis_node, agent))
 
     # --- Edges ---
+    graph.add_node("merge_context", merge_context)
     graph.add_edge(START, "initialize")
     graph.add_edge("initialize", "load_user_context")
-    graph.add_edge("load_user_context", "financial_orchestrate")
-    graph.add_edge("financial_orchestrate", "phase_router")
+    graph.add_edge("initialize", "financial_orchestrate")
+    graph.add_edge(["load_user_context", "financial_orchestrate"], "merge_context")
+    graph.add_edge("merge_context", "phase_router")
 
     # Phase router → entry node of each phase
     _phase_route_map = {
