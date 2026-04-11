@@ -338,10 +338,13 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
             breaker.record_success()
             tool_call_duration.labels(agent="sdk", tool_name=name).observe(time.monotonic() - _tool_t0)
             logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
-        except Exception:
+        except Exception as exc:
             breaker.record_failure(name)
             logger.exception("Tool '%s' failed", name)
-            raise
+            return ToolMessage(
+                content=f"Tool '{name}' failed: {exc}. Check the tool schema and retry with correct arguments.",
+                tool_call_id=tool_call["id"],
+            )
 
         return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
@@ -385,7 +388,14 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                 else:
                     raise
             else:
-                raise
+                logger.error("Unhandled exception in tool execution — returning error messages", exc_info=True)
+                results = [
+                    ToolMessage(
+                        content=f"Tool execution failed: {e}",
+                        tool_call_id=tc["id"],
+                    )
+                    for tc in tool_calls
+                ]
 
     return list(results)
 

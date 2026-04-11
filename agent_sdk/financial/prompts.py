@@ -54,17 +54,18 @@ Your job: write a concrete, tool-specific execution plan that the phase executor
 Each phase executor runs a mini ReAct loop — it WILL see this plan and use it to decide which tools to call.
 
 AVAILABLE TOOLS BY PHASE:
-- regime_assessment: get_macro_indicators(), get_fii_dii_flows(days=30), detect_market_regime(nifty_pe, india_vix, gsec_10y, repo_rate, cpi_yoy, credit_growth, fii_net_30d, usd_inr, crude_brent), tavily_quick_search(query)
+- regime_assessment: get_regime_inputs() → THEN detect_market_regime(<fields from get_regime_inputs>) — call get_regime_inputs first to get live values for india_vix/usd_inr/crude_brent/fii_net_30d/nifty_pe; use tavily_quick_search for repo_rate/cpi_yoy/credit_growth/gsec_10y as indicated in get_regime_inputs.needs_search; get_fii_dii_flows(days=30), tavily_quick_search(query)
 - causal_analysis: traverse_causal_chain(source, target), get_affected_entities(event_type), get_transmission_path(source, target), run_scenario_simulation(macro_changes), tavily_quick_search(query)
 - sector_analysis: get_fii_dii_flows(days=30), get_sector_norms(sector), interpret_metric(metric, value, sector), tavily_quick_search(query)
-- company_analysis: get_ticker_data(ticker), get_bse_nse_reports(ticker), get_historical_ohlcv(ticker, period), run_dcf(ticker, assumptions), run_comparable_valuation(target_ticker, target_metrics, peers), calculate_risk_metrics(prices), interpret_metric(metric, value, sector), firecrawl_deep_scrape(url), tavily_quick_search(query)
-- risk_assessment: get_historical_ohlcv(ticker, period), calculate_risk_metrics(prices), run_scenario_simulation(macro_changes), tavily_quick_search(query)
+- company_analysis: get_ticker_data(ticker), get_bse_nse_reports(ticker), get_historical_ohlcv(ticker, period) [for human-readable trend summary only], get_price_series(ticker) → use closes list for calculate_technical_signals(prices=closes) and calculate_risk_metrics(prices=closes) — NEVER extract prices manually from get_historical_ohlcv markdown, get_dcf_inputs(ticker) → THEN run_dcf(<fields from get_dcf_inputs>) — NEVER pass hardcoded or guessed values, get_comparable_metrics([target_ticker, peer1, peer2]) → THEN run_comparable_valuation(target_ticker, target_metrics, peers) — NEVER manually compose metric dicts, interpret_metric(metric, value, sector), firecrawl_deep_scrape(url), tavily_quick_search(query)
+- risk_assessment: get_price_series(ticker) → use closes for calculate_risk_metrics(prices=closes) and calculate_technical_signals(prices=closes), run_scenario_simulation(macro_changes), tavily_quick_search(query)
 
 RULES:
 - Be specific: name the exact tools and query strings (not "search for X" but tavily_quick_search(query="X 2026"))
 - For Indian stocks: default to NSE suffix (.NS) unless BSE specified (.BO)
 - For mutual funds: use tavily_quick_search for category data; no ticker_data needed
 - Reference what each phase should accomplish, not just which tools to call
+- Data-first rule: every numeric argument passed to a computational tool must come from the output of a data-fetching tool in the same session — no hardcoded or invented values
 
 Write the plan as a structured, numbered list. Start with: "FINANCIAL ANALYSIS PLAN:"
 """
