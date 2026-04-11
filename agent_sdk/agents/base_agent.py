@@ -227,9 +227,12 @@ class BaseAgent:
                     "result_preview": content[:500] if len(content) > 500 else content,
                 })
 
+        # Financial mode: tool calls live in tool_calls_log (not state.messages)
+        steps.extend(result.get("tool_calls_log", []))
+
         logger.info("Agent run completed — session='%s', response length: %d chars, steps: %d",
                     session_id, len(response), len(steps))
-        return {"response": response, "steps": steps}
+        return {"response": response, "steps": steps, "plan": result.get("scratchpad")}
 
     def astream(self, query: str, session_id: str = "default",
                 system_prompt: str | None = None, model_id: str | None = None,
@@ -257,6 +260,7 @@ class StreamResult:
         self._model_id = model_id
         self._extra_fields = kwargs
         self.steps: list[dict] = []
+        self.plan: str | None = None
 
     def __aiter__(self):
         return self._stream()
@@ -385,6 +389,22 @@ class StreamResult:
                         "result_length": len(content),
                         "result_preview": content[:500] if len(content) > 500 else content,
                     })
+
+        # Read final graph state from checkpoint to capture:
+        # - tool_calls_log: financial phase tool calls (not in messages)
+        # - scratchpad: the orchestrator's execution plan
+        try:
+            snapshot = await self._agent.graph.aget_state(
+                {"configurable": {"thread_id": self._session_id}}
+            )
+            if snapshot:
+                log = snapshot.values.get("tool_calls_log") or []
+                if log:
+                    # State-tracked log is authoritative for financial mode
+                    self.steps = log
+                self.plan = snapshot.values.get("scratchpad")
+        except Exception:
+            pass  # best-effort; existing event-derived steps are still valid
 
         # Fallback: if no streaming chunks were yielded, emit the full response
         if not chunks_yielded and last_full_response:

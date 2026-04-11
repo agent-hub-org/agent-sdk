@@ -850,6 +850,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
 
     phase_running_ctx_parts: list[str] = []
     accumulated_running_ctx = running_ctx or ""
+    phase_tool_calls_log: list[dict] = []
 
     for iteration in range(phase_budget):
         try:
@@ -876,12 +877,28 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
         )
         phase_messages.append(response)
 
+        # Record tool calls for the execution trace
+        for tc in tool_calls:
+            phase_tool_calls_log.append({
+                "action": "tool_call",
+                "phase": phase_name,
+                "tool": tc["name"],
+                "args": tc.get("args", {}),
+            })
+
         # Execute tools
         tool_results = await _execute_tool_calls(agent, tool_calls, state.tool_timeout, phase_tools=tools)
 
         for tc, tr in zip(tool_calls, tool_results):
             phase_messages.append(tr)
             phase_running_ctx_parts.append(f"[{tc['name']}] → {tr.content}")
+            phase_tool_calls_log.append({
+                "action": "tool_result",
+                "phase": phase_name,
+                "tool": tc["name"],
+                "result_length": len(tr.content),
+                "result_preview": tr.content[:500] if len(tr.content) > 500 else tr.content,
+            })
 
         # Rebuild system message so next iteration sees updated context
         accumulated_running_ctx = (
@@ -919,6 +936,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
         "running_context": phase_block,
         "current_phase": phase_name,
         "iteration": state.iteration + 1,
+        "tool_calls_log": phase_tool_calls_log,
     }
 
 

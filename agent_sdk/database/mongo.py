@@ -43,6 +43,7 @@ class BaseMongoDatabase:
         response: str,
         steps: list[dict] | None = None,
         user_id: str | None = None,
+        plan: str | None = None,
     ) -> str:
         doc = {
             "session_id": session_id,
@@ -55,6 +56,8 @@ class BaseMongoDatabase:
         }
         if user_id:
             doc["user_id"] = user_id
+        if plan:
+            doc["orchestrator_plan"] = plan
         result = await cls._conversations().insert_one(doc)
         logger.info(
             "Saved conversation — session='%s', user='%s', doc_id='%s'",

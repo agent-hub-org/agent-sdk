@@ -1,3 +1,4 @@
+import operator
 from typing import Annotated, Any, Sequence, Optional, Dict
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
@@ -155,4 +156,14 @@ class FinancialAnalysisState(AgentState):
     as_of_date: Optional[str] = Field(
         default=None,
         description="Historical reference date for the analysis (YYYY-MM-DD).",
+    )
+
+    # --- Execution trace (tool calls across all phases) ---
+    tool_calls_log: Annotated[list[dict], operator.add] = Field(
+        default_factory=list,
+        description=(
+            "Flat log of every tool call made across all financial pipeline phases. "
+            "Each entry: {action, phase, tool, args}. Accumulated with operator.add "
+            "so each phase appends without overwriting prior phases."
+        ),
     )
