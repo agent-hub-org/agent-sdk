@@ -2208,8 +2208,12 @@ async def financial_phase_planner(phase_name: str, agent, state) -> dict:
         "iteration": state.iteration + 1,
         "phase_iterations": {phase_name: state.phase_iterations.get(phase_name, 0) + 1},
     }
-
-
+async def financial_stateless_executor_node(phase_name: str, agent, state) -> dict:
+    """
+    Stateless executor for a financial pipeline phase.
+    Runs all calls from state.phase_tool_plan in parallel using asyncio.gather.
+    Results are stored in state.phase_scratchpad. No LLM call.
+    """
     calls = (getattr(state, "phase_tool_plan", None) or {}).get(phase_name, [])
     if not calls:
         logger.info("financial_stateless_executor: %s — no tool calls planned, skipping", phase_name)
