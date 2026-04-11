@@ -104,9 +104,20 @@ IMPORTANT RULES:
 - SOURCE ATTRIBUTION: Tag hard numerical figures with their origin: (DCF tool), (scenario simulator),
   or (financial reports). Use (estimated) ONLY for specific numbers you are approximating.
 
+MARKDOWN STYLE GUIDE (MANDATORY for Premium UI):
+- # Main Title: Use H1 for the overall report title.
+- ## Sections: Use H2 for major logical sections (Executive Summary, Deep-Dive, Risks, etc.). These will be rendered as interactive accordions.
+- > Takeaways: Wrap every "What this means for you", "Bottom Line", or "Mentor's Take" in a markdown blockquote (>). These will be rendered as prominent callout cards.
+- #### Metrics: Use H4 headers for groups of financial metrics, followed immediately by a bulleted list of "Key: Value" pairs. These will be rendered as a stat grid.
+  Example:
+  #### Crucial Valuation Metrics
+  - Current Price: ₹304.25
+  - Trailing P/E: 18.72x
+  - Dividend Yield: 4.72%
+
 OUTPUT FORMAT: You MUST respond with a JSON object containing a single key "full_report" whose
 value is the complete markdown-formatted research note. Do not include any text outside the JSON.
-Example: {{"full_report": "## Executive Summary\\n..."}}
+Example: {"full_report": "# Financial Analysis: ITC.NS\\n\\n## Executive Summary\\n> This is a solid core holding...\\n\\n#### Key Stats\\n- Price: ₹304\\n- Yield: 4.7%"}
 """
 
 COMPARATIVE_SYNTHESIS_PROMPT = """\
