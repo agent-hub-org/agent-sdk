@@ -311,6 +311,17 @@ class StreamResult:
                     # from the saved conversation response.
                     yield f"__PROGRESS__:{label}"
 
+            elif event["event"] == "on_tool_start":
+                tool_name = event.get("name", "unknown")
+                # Clean up tool names for better UX (e.g. resolve_indian_ticker -> Resolving ticker)
+                label = f"🛠️ Executing {tool_name.replace('_', ' ')}..."
+                yield f"__PROGRESS__:{label}"
+
+            elif event["event"] == "on_tool_end":
+                tool_name = event.get("name", "unknown")
+                label = f"✅ Completed {tool_name.replace('_', ' ')}"
+                yield f"__PROGRESS__:{label}"
+
             if event["event"] == "on_chat_model_stream":
                 # Only stream user-facing LLM nodes, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
