@@ -43,8 +43,8 @@ class AgentSDKSettings(BaseSettings):
     mongo_ttl_seconds: int = 7_776_000
 
     # ── MongoDB checkpointer ───────────────────────────────────────────────────
-    checkpoint_selection_timeout_ms: int = 5000
-    checkpoint_socket_timeout_ms: int = 30000
+    checkpoint_selection_timeout_ms: int = 2000
+    checkpoint_socket_timeout_ms: int = 5000
 
     # ── Marketplace / routing ─────────────────────────────────────────────────
     min_routing_confidence: float = 0.25

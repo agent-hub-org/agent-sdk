@@ -96,6 +96,8 @@ class BaseAgent:
         self._init_lock = None
         self._tool_catalog_cache = {}
         self._bound_llm_cache = {}
+        # Cache for financial phase tool lists — populated after MCP init, invalidated on reconnect
+        self._phase_tools_cache: dict[str, list] = {}
 
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered

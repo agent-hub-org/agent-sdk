@@ -6,25 +6,23 @@ system prompt (FINANCIAL_PIPELINE_GUIDANCE in agent-financials/agents/agent.py).
 Each phase_executor receives a short focus hint injected at runtime.
 
 Retained prompts:
-  QUERY_CLASSIFIER_PROMPT — used by financial_orchestrate to classify the query
-  FINANCIAL_ORCHESTRATOR_PROMPT — used by financial_orchestrate to build the plan
+  FINANCIAL_ORCHESTRATE_COMBINED_PROMPT — classify query + build compact phase plan
   SYNTHESIS_PROMPT — used by synthesis_node (reads running_context)
   COMPARATIVE_SYNTHESIS_PROMPT — used by synthesis_node for comparative queries
 """
 
-QUERY_CLASSIFIER_PROMPT = """\
-You are a financial query classifier. Your ONLY job is to analyze the user's query and determine:
-1. What type of analysis is needed
-2. Which entities (tickers, sectors, macro indicators) are mentioned
-3. Which reasoning phases should be activated
+FINANCIAL_ORCHESTRATE_COMBINED_PROMPT = """\
+You are a financial query classifier and analysis orchestrator.
+
+STEP 1 — Classify the query and determine which reasoning phases to activate.
 
 Query types:
-- data_retrieval: Simple data lookups ("What is Reliance's P/E?", "Show me HDFC Bank's quarterly results")
-- company_analysis: Deep single-company analysis ("Should I invest in TCS?", "Analyze Infosys fundamentals")
-- sector_analysis: Sector-level analysis ("How is the banking sector positioned?", "Best pharma stocks")
-- macro_impact: Macro event impact analysis ("What happens to Indian markets if RBI hikes rates?", "Impact of rising crude on Indian economy", "mutual funds to invest in given market conditions")
-- comparative: Peer comparison ("Compare TCS vs Infosys", "Best large-cap IT stock")
-- thematic: Cross-sector themes ("Which stocks benefit from India's capex cycle?", "PLI scheme beneficiaries")
+- data_retrieval: Simple data lookups ("What is Reliance's P/E?")
+- company_analysis: Deep single-company analysis ("Should I invest in TCS?")
+- sector_analysis: Sector-level analysis ("How is the banking sector positioned?")
+- macro_impact: Macro event impact ("What happens if RBI hikes rates?")
+- comparative: Peer comparison ("Compare TCS vs Infosys")
+- thematic: Cross-sector themes ("Stocks benefiting from India's capex cycle")
 
 Phase activation rules:
 - data_retrieval: company_analysis + synthesis only
@@ -34,40 +32,28 @@ Phase activation rules:
 - comparative: comparative_analysis + synthesis
 - thematic: regime + sector + company + synthesis
 
-Output ONLY a JSON object with exactly these fields:
+STEP 2 — For each activated phase write ONE terse line:
+  <phase_name>: <tool1(specific_args)> → <tool2>, <tool3(specific_args)>
+
+Rules: tool names + entity-specific args only; no prose; NSE suffix (.NS) for Indian stocks.
+Available tools by phase:
+- regime_assessment: get_regime_inputs → detect_market_regime, get_fii_dii_flows, tavily_quick_search
+- causal_analysis: traverse_causal_chain, get_affected_entities, get_transmission_path, run_scenario_simulation, tavily_quick_search
+- sector_analysis: get_fii_dii_flows, get_sector_norms, interpret_metric, tavily_quick_search
+- company_analysis: get_ticker_data, get_bse_nse_reports, get_price_series → calculate_technical_signals/calculate_risk_metrics, get_dcf_inputs → run_dcf, get_comparable_metrics → run_comparable_valuation, interpret_metric, tavily_quick_search
+- risk_assessment: get_price_series → calculate_risk_metrics/calculate_technical_signals, run_scenario_simulation, tavily_quick_search
+
+OUTPUT: A single JSON object with exactly these fields:
 {{
-  "query_type": "<one of the types above>",
-  "entities": ["<tickers, sectors, or macro indicators mentioned>"],
+  "query_type": "<type>",
+  "entities": ["<tickers/sectors/indicators>"],
   "requires_regime_assessment": true/false,
   "requires_causal_analysis": true/false,
   "requires_sector_analysis": true/false,
   "requires_company_analysis": true/false,
   "requires_risk_assessment": true/false,
-  "reasoning": "<brief explanation>"
+  "plan": "<one line per active phase>"
 }}
-"""
-
-FINANCIAL_ORCHESTRATOR_PROMPT = """\
-You are a financial analysis orchestrator planning an analysis for an Indian equity markets specialist.
-
-Your job: write a concrete, tool-specific execution plan that the phase executors will follow.
-Each phase executor runs a mini ReAct loop — it WILL see this plan and use it to decide which tools to call.
-
-AVAILABLE TOOLS BY PHASE:
-- regime_assessment: get_regime_inputs() → THEN detect_market_regime(<fields from get_regime_inputs>) — call get_regime_inputs first to get live values for india_vix/usd_inr/crude_brent/fii_net_30d/nifty_pe; use tavily_quick_search for repo_rate/cpi_yoy/credit_growth/gsec_10y as indicated in get_regime_inputs.needs_search; get_fii_dii_flows(days=30), tavily_quick_search(query)
-- causal_analysis: traverse_causal_chain(source, target), get_affected_entities(event_type), get_transmission_path(source, target), run_scenario_simulation(macro_changes), tavily_quick_search(query)
-- sector_analysis: get_fii_dii_flows(days=30), get_sector_norms(sector), interpret_metric(metric, value, sector), tavily_quick_search(query)
-- company_analysis: get_ticker_data(ticker), get_bse_nse_reports(ticker), get_historical_ohlcv(ticker, period) [for human-readable trend summary only], get_price_series(ticker) → use closes list for calculate_technical_signals(prices=closes) and calculate_risk_metrics(prices=closes) — NEVER extract prices manually from get_historical_ohlcv markdown, get_dcf_inputs(ticker) → THEN run_dcf(<fields from get_dcf_inputs>) — NEVER pass hardcoded or guessed values, get_comparable_metrics([target_ticker, peer1, peer2]) → THEN run_comparable_valuation(target_ticker, target_metrics, peers) — NEVER manually compose metric dicts, interpret_metric(metric, value, sector), firecrawl_deep_scrape(url), tavily_quick_search(query)
-- risk_assessment: get_price_series(ticker) → use closes for calculate_risk_metrics(prices=closes) and calculate_technical_signals(prices=closes), run_scenario_simulation(macro_changes), tavily_quick_search(query)
-
-RULES:
-- Be specific: name the exact tools and query strings (not "search for X" but tavily_quick_search(query="X 2026"))
-- For Indian stocks: default to NSE suffix (.NS) unless BSE specified (.BO)
-- For mutual funds: use tavily_quick_search for category data; no ticker_data needed
-- Reference what each phase should accomplish, not just which tools to call
-- Data-first rule: every numeric argument passed to a computational tool must come from the output of a data-fetching tool in the same session — no hardcoded or invented values
-
-Write the plan as a structured, numbered list. Start with: "FINANCIAL ANALYSIS PLAN:"
 """
 
 SYNTHESIS_PROMPT = """\

@@ -441,16 +441,17 @@ def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "ll
     ever skipping pending tool calls.
     """
     summary_text = state.summary or ""
+    est = _estimate_token_count(state.messages, summary_text)
     needs_summarization = (
         state.enable_summarization
         and (
             len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages, summary_text) > state.max_context_tokens
+            or est > state.max_context_tokens
         )
     )
     if needs_summarization:
         logger.debug("Post-tool routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), _estimate_token_count(state.messages, summary_text))
+                     len(state.messages), est)
         return "summarize_conversation"
     return "llm_call"
 
@@ -460,21 +461,22 @@ def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_
     At the start of each conversation turn, check whether the context is already
     large enough to warrant summarization before calling the LLM.
 
-    Uses a fixed 32,768-token threshold so summarization kicks in at the midpoint
-    of the 65,536-token context window regardless of max_context_tokens tuning.
+    Threshold is 80% of state.max_context_tokens so summarization is deferred as
+    long as possible and respects per-agent token budget configuration.
     """
-    _SUMMARIZE_THRESHOLD = 32768
     summary_text = state.summary or ""
+    threshold = int(state.max_context_tokens * 0.8)
+    est = _estimate_token_count(state.messages, summary_text)
     needs_summarization = (
         state.enable_summarization
         and (
             len(state.messages) > state.keep_last_n_messages
-            or _estimate_token_count(state.messages, summary_text) > _SUMMARIZE_THRESHOLD
+            or est > threshold
         )
     )
     if needs_summarization:
-        logger.debug("Pre-LLM routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), _estimate_token_count(state.messages, summary_text))
+        logger.debug("Pre-LLM routing → summarize_conversation (messages=%d, est_tokens=%d, threshold=%d)",
+                     len(state.messages), est, threshold)
         return "summarize_conversation"
     logger.debug("Pre-LLM routing → llm_call")
     return "llm_call"
@@ -625,92 +627,79 @@ async def financial_initialize(state) -> dict:
 async def financial_orchestrate(agent, state) -> dict:
     """
     Orchestrate node for financial mode: classifies the query, determines phases,
-    and writes a comprehensive tool-specific plan to scratchpad.
+    and writes a comprehensive tool-specific plan — all in a SINGLE LLM call.
 
-    One LLM call for JSON classification; plan is computed from the classification
-    (no extra LLM call for plan writing). Replaces classify_query_node.
+    Previously two sequential LLM calls (classify → plan); merged into one combined
+    call using FINANCIAL_ORCHESTRATE_COMBINED_PROMPT to eliminate +2-6s of latency.
     """
-    from agent_sdk.financial.prompts import QUERY_CLASSIFIER_PROMPT, FINANCIAL_ORCHESTRATOR_PROMPT
+    from agent_sdk.financial.prompts import FINANCIAL_ORCHESTRATE_COMBINED_PROMPT
     from agent_sdk.financial.schemas import QueryClassification, QueryType
 
-    logger.info("Classifying query for financial reasoning pipeline")
+    logger.info("Classifying query and building plan for financial reasoning pipeline")
 
     llm = _get_phase_llm(agent, state)
 
-    # Build classification prompt
+    # Build user content for combined prompt
     user_query = ""
     for msg in reversed(state.messages):
         if isinstance(msg, HumanMessage):
             user_query = msg.content
             break
 
-    # Strip [CONTEXT] wrapper so the classifier sees the raw user text
     clean_query = _strip_context_block(user_query)
 
-    # Include recent conversational context (last 4 turns before current query)
-    # so the classifier can resolve follow-ups like "Yes" or "Go ahead".
+    # Include recent conversational context so classifier can resolve follow-ups
     recent_context: list[str] = []
-    for msg in state.messages[:-1]:  # All messages except the current HumanMessage
+    for msg in state.messages[:-1]:
         if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None) and msg.content:
             recent_context.append(f"Assistant: {msg.content}")
         elif isinstance(msg, HumanMessage):
             content = _strip_context_block(msg.content)
             if content:
                 recent_context.append(f"User: {content}")
-    recent_context = recent_context[-4:]  # Keep last 4 conversational turns
+    recent_context = recent_context[-4:]
 
     if recent_context:
         context_str = "\n".join(recent_context)
-        classify_content = (
+        user_content = (
             f"Recent conversation:\n{context_str}\n\n"
-            f"Classify this query (in context of the conversation above):\n\n{clean_query}"
+            f"Query: {clean_query}"
         )
     else:
-        classify_content = f"Classify this query:\n\n{clean_query}"
+        user_content = f"Query: {clean_query}"
 
-    classification_prompt = [
-        SystemMessage(content=QUERY_CLASSIFIER_PROMPT),
-        HumanMessage(content=classify_content),
-    ]
+    _default_qc = QueryClassification(
+        query_type=QueryType.DATA_RETRIEVAL,
+        requires_regime_assessment=False,
+        requires_causal_analysis=False,
+        requires_sector_analysis=False,
+        requires_company_analysis=True,
+        requires_risk_assessment=False,
+        reasoning="Classification failed — running minimal pipeline",
+    )
 
+    qc = _default_qc
+    plan_text = ""
     try:
-        response = await llm.ainvoke(classification_prompt)
-        # Try to parse structured classification from response
-        import json
-        content = response.content
-        # Extract JSON from response
-        classification = _extract_json(content)
-        if classification:
-            qc = QueryClassification(**_normalize_classification(classification))
+        response = await llm.ainvoke([
+            SystemMessage(content=FINANCIAL_ORCHESTRATE_COMBINED_PROMPT),
+            HumanMessage(content=user_content),
+        ])
+        combined = _extract_json(response.content)
+        if combined:
+            plan_text = combined.pop("plan", "").strip()
+            try:
+                qc = QueryClassification(**_normalize_classification(combined))
+            except Exception:
+                logger.warning("Could not build QueryClassification from combined response — using default")
         else:
-            # Default to data_retrieval (minimal pipeline) if parsing fails
-            logger.warning("Could not parse query classification, defaulting to data_retrieval")
-            qc = QueryClassification(
-                query_type=QueryType.DATA_RETRIEVAL,
-                requires_regime_assessment=False,
-                requires_causal_analysis=False,
-                requires_sector_analysis=False,
-                requires_company_analysis=True,
-                requires_risk_assessment=False,
-                reasoning="Classification parsing failed — running minimal pipeline",
-            )
+            logger.warning("Combined orchestrate response missing JSON — using default classification")
     except Exception:
-        logger.exception("Query classification failed, defaulting to data_retrieval")
-        qc = QueryClassification(
-            query_type=QueryType.DATA_RETRIEVAL,
-            requires_regime_assessment=False,
-            requires_causal_analysis=False,
-            requires_sector_analysis=False,
-            requires_company_analysis=True,
-            requires_risk_assessment=False,
-            reasoning="Classification exception — running minimal pipeline",
-        )
+        logger.exception("financial_orchestrate: combined LLM call failed — using defaults")
 
-    # Determine phases to run based on classification
+    # Determine phases from classification
     phases = []
     if qc.query_type == QueryType.DATA_RETRIEVAL:
-        # Simple data retrieval — still needs tool access for fetching
-        # and synthesis to produce a user-facing response
         phases = ["company_analysis", "synthesis"]
     elif qc.query_type == QueryType.COMPARATIVE:
         phases = ["comparative_analysis", "synthesis"]
@@ -725,28 +714,12 @@ async def financial_orchestrate(agent, state) -> dict:
             phases.append("company_analysis")
         if qc.requires_risk_assessment:
             phases.append("risk_assessment")
-        # Always add synthesis if we have any analysis phases
         if phases:
             phases.append("synthesis")
 
     entities = list(qc.entities) if hasattr(qc, "entities") and qc.entities else []
-    logger.info("Query classified as %s — phases: %s, entities: %s", qc.query_type.value, phases, entities)
-
-    # Write a comprehensive tool-specific plan for all phases
-    plan_text = ""
-    try:
-        plan_response = await llm.ainvoke([
-            SystemMessage(content=FINANCIAL_ORCHESTRATOR_PROMPT),
-            HumanMessage(content=(
-                f"Query: {clean_query}\n"
-                f"Phases to execute: {', '.join(phases)}\n"
-                f"Entities: {', '.join(entities) if entities else 'none specified'}"
-            )),
-        ])
-        plan_text = (plan_response.content or "").strip()
-        logger.info("financial_orchestrate: plan written (%d chars)", len(plan_text))
-    except Exception:
-        logger.exception("financial_orchestrate: plan writing failed — proceeding without plan")
+    logger.info("financial_orchestrate: type=%s phases=%s entities=%s plan=%d chars",
+                qc.query_type.value, phases, entities, len(plan_text))
 
     return {
         "scratchpad": plan_text if plan_text else None,
@@ -820,10 +793,21 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
     plan = getattr(state, "scratchpad", None)
     running_ctx = getattr(state, "running_context", None)
 
+    def _extract_phase_plan(full_plan: str, phase: str) -> str:
+        """Return the single plan line for this phase; fall back to full plan."""
+        phase_key = phase.replace("_", " ")
+        for line in full_plan.splitlines():
+            stripped = line.strip().lower()
+            if stripped.startswith(phase + ":") or stripped.startswith(phase_key + ":"):
+                return line.strip()
+        return full_plan
+
+    phase_plan = _extract_phase_plan(plan, phase_name) if plan else None
+
     extra_sections: list[str] = []
-    if plan:
+    if phase_plan:
         extra_sections.append(
-            "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
+            "PHASE PLAN (follow this):\n" + phase_plan
         )
     if running_ctx:
         extra_sections.append(
@@ -907,9 +891,9 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
             + "\n".join(phase_running_ctx_parts)
         )
         updated_extra = []
-        if plan:
+        if phase_plan:
             updated_extra.append(
-                "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
+                "PHASE PLAN (follow this):\n" + phase_plan
             )
         updated_extra.append(
             "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + accumulated_running_ctx
@@ -1058,46 +1042,56 @@ def _get_phase_tools(agent, phase: str) -> list:
     """
     Get tools appropriate for a specific reasoning phase.
     Returns a filtered subset of agent tools plus phase-specific financial tools.
+
+    Results are cached per (phase, agent_tools_fingerprint) on the agent instance
+    to avoid re-importing financial modules and scanning all tools on every phase
+    iteration (financial mode runs 20-36 tool lookups per request).
+    Cache is invalidated on MCP reconnection by clearing agent._phase_tools_cache.
     """
+    # Cache key: phase name + frozenset of current tool names (detects MCP reconnections)
+    tool_fingerprint = frozenset(agent.tools_by_name.keys())
+    cache_key = (phase, tool_fingerprint)
+    cached = agent._phase_tools_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     from agent_sdk.financial.causal_graph import get_causal_graph_tools
     from agent_sdk.financial.ontology import get_ontology_tools
     from agent_sdk.financial.quant_tools import get_quant_tools
 
-    # Financial tools organized by phase
-    phase_financial_tools = {
-        "regime_assessment": [
-            t for t in get_quant_tools() if t.name == "detect_market_regime"
-        ],
-        "causal_analysis": get_causal_graph_tools() + [
-            t for t in get_quant_tools() if t.name == "run_scenario_simulation"
-        ],
-        "sector_analysis": get_ontology_tools(),
+    # Financial tools organized by phase (computed once per cache miss)
+    quant = get_quant_tools()
+    causal = get_causal_graph_tools()
+    ontology = get_ontology_tools()
+
+    phase_financial_tools: dict[str, list] = {
+        "regime_assessment": [t for t in quant if t.name == "detect_market_regime"],
+        "causal_analysis": causal + [t for t in quant if t.name == "run_scenario_simulation"],
+        "sector_analysis": ontology,
         "company_analysis": (
-            get_ontology_tools()
-            + [t for t in get_quant_tools() if t.name in (
+            ontology + [t for t in quant if t.name in (
                 "run_dcf", "run_comparable_valuation", "calculate_technical_signals", "calculate_risk_metrics"
             )]
         ),
-        "risk_assessment": [
-            t for t in get_quant_tools() if t.name in ("run_scenario_simulation", "calculate_risk_metrics")
-        ] + get_causal_graph_tools(),
+        "risk_assessment": (
+            [t for t in quant if t.name in ("run_scenario_simulation", "calculate_risk_metrics")]
+            + causal
+        ),
     }
 
     financial_tools = phase_financial_tools.get(phase, [])
-
-    # Also include agent's own tools (e.g., MCP data-fetching tools)
-    # so phases can retrieve live data — exclude research-only tools
     agent_tools = [t for t in agent.tools_by_name.values() if t.name not in _RESEARCH_ONLY_TOOLS]
 
-    # Combine, deduplicating by name
-    seen = set()
-    combined = []
+    seen: set[str] = set()
+    combined: list = []
     for t in financial_tools + agent_tools:
         if t.name not in seen:
             combined.append(t)
             seen.add(t.name)
 
-    return agent.get_available_tools(phase_tools=combined)
+    result = agent.get_available_tools(phase_tools=combined)
+    agent._phase_tools_cache[cache_key] = result
+    return result
 
 
 def _build_phase_prompt(state, phase_system_prompt: str) -> list:
