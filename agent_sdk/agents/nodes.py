@@ -557,6 +557,10 @@ Be specific: use exact ticker symbols (e.g. RELIANCE.NS), exact search queries (
 If the query can be answered without tools, write: "Answer directly — no tools needed."
 
 Keep the plan concise — the executor will see it at every step and use it as a checklist.
+
+CRITICAL: Do NOT include any step that asks the user for clarification, confirmation, or \
+disambiguation. If the query is ambiguous, make the most reasonable interpretation and \
+proceed directly with tool calls.
 """
 
 
