@@ -1,6 +1,3 @@
-"""
-Shared pytest fixtures for agent-sdk tests.
-"""
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
