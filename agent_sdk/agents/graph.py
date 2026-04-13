@@ -107,6 +107,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         financial_phase_executor,
         phase_router,
         phase_advance,
+        parallel_fan_in,
         comparative_analysis_node,
         synthesis_node,
     )
@@ -163,9 +164,11 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     # causal_analysis → parallel fan-out (sector + company) or sequential phase_advance
     graph.add_conditional_edges("causal_analysis", _causal_analysis_router)
 
-    # sector_analysis and company_analysis → phase_advance (fan-in via sequential execution)
-    graph.add_edge("sector_analysis", "phase_advance")
-    graph.add_edge("company_analysis", "phase_advance")
+    # sector_analysis and company_analysis → parallel_fan_in (handles both parallel and sequential cases)
+    graph.add_node("parallel_fan_in", parallel_fan_in)
+    graph.add_edge("sector_analysis", "parallel_fan_in")
+    graph.add_edge("company_analysis", "parallel_fan_in")
+    graph.add_edge("parallel_fan_in", "phase_router")
 
     # risk_assessment + comparative_analysis → phase_advance
     graph.add_edge("risk_assessment", "phase_advance")

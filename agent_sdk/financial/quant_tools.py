@@ -247,6 +247,7 @@ def run_comparable_valuation(**kwargs) -> dict:
 class ScenarioInput(BaseModel):
     scenario_name: str = Field(description="Name of the scenario")
     variable_changes: dict[str, float] = Field(
+        default_factory=dict,
         description="Dict of causal graph node IDs to percentage changes. E.g., {'crude_oil': 20, 'repo_rate': 0.5}"
     )
     target_entities: list[str] = Field(
@@ -263,6 +264,12 @@ def run_scenario_simulation(**kwargs) -> dict:
     from agent_sdk.financial.causal_graph import get_graph
 
     inp = ScenarioInput(**kwargs)
+    if not inp.variable_changes:
+        return {
+            "error": "variable_changes is required — provide a dict mapping causal graph node IDs to % changes.",
+            "example": "{'crude_oil': 20, 'repo_rate': 0.5, 'india_vix': 15}",
+            "hint": "Call traverse_causal_chain or search_causal_graph first to find valid node IDs.",
+        }
     G = get_graph()
 
     impacts: dict[str, dict] = {}

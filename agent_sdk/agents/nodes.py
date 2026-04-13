@@ -918,7 +918,6 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
 
     return {
         "running_context": phase_block,
-        "current_phase": phase_name,
         "iteration": state.iteration + 1,
         "tool_calls_log": phase_tool_calls_log,
     }
@@ -1018,6 +1017,31 @@ def phase_advance(state) -> dict:
     next_phase = remaining[0] if remaining else "done"
     logger.info("Phase advance: %s → %s (remaining: %s)", state.current_phase, next_phase, remaining)
 
+    return {
+        "phases_to_run": remaining,
+        "current_phase": next_phase,
+    }
+
+
+def parallel_fan_in(state) -> dict:
+    """
+    Fan-in node after parallel sector_analysis + company_analysis.
+
+    _causal_analysis_router fans out directly (bypassing phase_advance), so
+    phases_to_run still contains causal_analysis, sector_analysis, and company_analysis
+    when this node runs. Pop all three at once so phase_router advances correctly.
+
+    Also handles the sequential case (only one of sector/company in the plan):
+    phase_advance already popped causal_analysis, so only the completed phase is
+    removed from the set — anything absent is a no-op.
+    """
+    to_remove = {"causal_analysis", "sector_analysis", "company_analysis"}
+    remaining = [p for p in state.phases_to_run if p not in to_remove]
+    next_phase = remaining[0] if remaining else "done"
+    logger.info(
+        "parallel_fan_in: sector+company complete → next=%s, remaining=%s",
+        next_phase, remaining,
+    )
     return {
         "phases_to_run": remaining,
         "current_phase": next_phase,
