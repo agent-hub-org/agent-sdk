@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any
 
@@ -174,18 +175,25 @@ class BaseAgent:
                 self._mcp_manager = MCPConnectionManager()
 
                 max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        mcp_tools = await self._mcp_manager.connect(self._mcp_servers)
-                        break
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            logger.error("MCP initialization failed after %d attempts: %s", max_retries, e)
-                            raise
-                        backoff = 2 ** attempt
-                        logger.warning("MCP connection attempt %d failed: %s — retrying in %ds", attempt + 1, e, backoff)
-                        import asyncio
-                        await asyncio.sleep(backoff)
+
+                async def _connect_with_retries():
+                    for attempt in range(max_retries):
+                        try:
+                            return await self._mcp_manager.connect(self._mcp_servers)
+                        except Exception as e:
+                            if attempt == max_retries - 1:
+                                logger.error("MCP initialization failed after %d attempts: %s", max_retries, e)
+                                raise
+                            backoff = 2 ** attempt
+                            logger.warning("MCP connection attempt %d failed: %s — retrying in %ds", attempt + 1, e, backoff)
+                            await asyncio.sleep(backoff)
+
+                try:
+                    mcp_tools = await asyncio.wait_for(_connect_with_retries(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"MCP initialization timed out after 15 s — ensure MCP servers are reachable: {self._mcp_servers}"
+                    )
 
                 # Merge MCP tools with any local tools
                 self.tools.extend(mcp_tools)

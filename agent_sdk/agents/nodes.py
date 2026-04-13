@@ -165,10 +165,7 @@ async def llm_call(agent, state: AgentState) -> dict:
 
     try:
         _t0 = time.monotonic()
-        if hasattr(llm_with_tools, "ainvoke"):
-            response = await llm_with_tools.ainvoke(prompt)
-        else:
-            response = llm_with_tools.invoke(prompt)
+        response = await llm_with_tools.ainvoke(prompt)
         _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
         _phase = getattr(state, "current_phase", None) or "standard"
         llm_call_duration.labels(agent="sdk", model=_model_name, phase=_phase).observe(time.monotonic() - _t0)
@@ -348,17 +345,28 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
 
         return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
 
+    async def _execute_with_per_tool_timeout(tool_call: dict) -> ToolMessage:
+        """Wrap _execute with a per-tool timeout so one slow tool cannot block others."""
+        per_timeout = settings.per_tool_timeout
+        try:
+            return await asyncio.wait_for(_execute(tool_call), timeout=per_timeout)
+        except asyncio.TimeoutError:
+            name = tool_call.get("name", "unknown")
+            logger.warning("Tool '%s' timed out after %.0fs (per-tool limit)", name, per_timeout)
+            return ToolMessage(
+                content=f"Tool '{name}' timed out after {per_timeout:.0f}s.",
+                tool_call_id=tool_call["id"],
+            )
+
     async def _gather_with_timeout():
-        import asyncio
         return await asyncio.wait_for(
-            asyncio.gather(*[_execute(tc) for tc in tool_calls]),
+            asyncio.gather(*[_execute_with_per_tool_timeout(tc) for tc in tool_calls]),
             timeout=timeout,
         )
 
     try:
         results = await _gather_with_timeout()
     except Exception as e:
-        import asyncio
         if isinstance(e, asyncio.TimeoutError):
             logger.error("Tool execution timed out after %.0fs — emitting error ToolMessages", timeout)
             results = [
@@ -434,35 +442,25 @@ async def tool_node(agent, state: AgentState) -> dict:
     return {"messages": list(results), "running_context": section}
 
 
-def post_tool_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
+def post_tool_router(state: AgentState) -> Literal["llm_call"]:
     """
-    After tool execution, check if context needs summarization before
-    handing back to the LLM. This enables mid-loop summarization without
-    ever skipping pending tool calls.
+    After tool execution, route back to the LLM.
+
+    Summarization is deferred to memory_writer (runs after the LLM response is
+    fully streamed) so it never adds latency to the user-facing response.
     """
-    summary_text = state.summary or ""
-    est = _estimate_token_count(state.messages, summary_text)
-    needs_summarization = (
-        state.enable_summarization
-        and (
-            len(state.messages) > state.keep_last_n_messages
-            or est > state.max_context_tokens
-        )
-    )
-    if needs_summarization:
-        logger.debug("Post-tool routing → summarize_conversation (messages=%d, est_tokens=%d)",
-                     len(state.messages), est)
-        return "summarize_conversation"
     return "llm_call"
 
 
 def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_call"]:
     """
-    At the start of each conversation turn, check whether the context is already
-    large enough to warrant summarization before calling the LLM.
+    At the start of each conversation turn, pre-emptively summarize if the context
+    is approaching the token budget (80% threshold).
 
-    Threshold is 80% of state.max_context_tokens so summarization is deferred as
-    long as possible and respects per-agent token budget configuration.
+    This runs once per turn — before the first LLM call — so it protects against
+    hard context-limit errors from the LLM API without causing mid-loop latency spikes.
+    post_tool_router no longer triggers summarization; any remaining pruning after
+    the turn completes is handled by memory_writer.
     """
     summary_text = state.summary or ""
     threshold = int(state.max_context_tokens * 0.8)
@@ -493,7 +491,7 @@ def _estimate_token_count(messages: Sequence, extra_text: str = "") -> int:
     return (msg_chars + len(extra_text)) // 4
 
 
-def should_continue(state: AgentState) -> Literal["tool_node", "summarize_conversation", "__end__"]:
+def should_continue(state: AgentState) -> Literal["tool_node", "__end__"]:
     """
     Decide whether the autonomous agent should keep going:
     - Pending tool calls MUST always be executed first (skipping them leaves
@@ -1529,21 +1527,40 @@ async def load_user_context(agent, state: AgentState) -> dict:
 
 async def memory_writer(agent, state: AgentState) -> dict:
     """
-    Terminal node that fires the memory pipeline as a background asyncio task.
+    Terminal node: runs deferred summarization then fires the Mem0 pipeline.
 
-    Creates a snapshot memory summary of the completed query, then (if the
-    episodic threshold is reached) compiles episodic and perspective memories.
+    Summarization runs here (not inline in pre/post_tool_router) so it never
+    adds latency to the user-facing streaming response — the LLM output is
+    fully streamed before this node executes.  The state update (pruned messages
+    + new summary) is returned so LangGraph persists it for the next request.
 
-    Does NOT block: schedules work via asyncio.create_task and returns {} immediately,
-    so no latency is added to the user-facing response.
+    The Mem0 pipeline is still fire-and-forget via asyncio.create_task.
     """
+    # ── Deferred context summarization ──────────────────────────────────────
+    # Runs synchronously here because: (a) streaming is already done at this
+    # point, and (b) this node's return dict is what gets checkpointed, so the
+    # pruned-message state is correctly persisted for the next request.
+    summarization_update: dict = {}
+    if getattr(state, "enable_summarization", False):
+        summary_text = state.summary or ""
+        est = _estimate_token_count(state.messages, summary_text)
+        needs_summarization = (
+            len(state.messages) > state.keep_last_n_messages
+            or est > state.max_context_tokens
+        )
+        if needs_summarization:
+            logger.debug("memory_writer: running deferred summarization (messages=%d, est_tokens=%d)",
+                         len(state.messages), est)
+            summarization_update = await summarize_conversation(agent, state)
+
+    # ── Mem0 long-term memory pipeline ──────────────────────────────────────
     memory_manager = getattr(agent, "memory_manager", None)
     if memory_manager is None:
-        return {}
+        return summarization_update
 
     user_id = getattr(state, "user_id", None)
     if not user_id:
-        return {}
+        return summarization_update
 
     session_id = getattr(state, "session_id", "default")
 
@@ -1565,7 +1582,7 @@ async def memory_writer(agent, state: AgentState) -> dict:
 
     if not query or not response:
         logger.debug("memory_writer: no query or response found — skipping")
-        return {}
+        return summarization_update
 
     scratchpad = getattr(state, "scratchpad", None)
     logger.debug("memory_writer: scratchpad passed to snapshot (%d chars): %.500s",
@@ -1583,4 +1600,4 @@ async def memory_writer(agent, state: AgentState) -> dict:
         )
     )
     logger.debug("memory_writer: background memory task scheduled for user=%s", user_id)
-    return {}
+    return summarization_update
