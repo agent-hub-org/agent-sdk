@@ -693,7 +693,11 @@ async def financial_orchestrate(agent, state) -> dict:
         ])
         combined = _extract_json(response.content)
         if combined:
-            plan_text = combined.pop("plan", "").strip()
+            plan_obj = combined.pop("plan", "")
+            if isinstance(plan_obj, list):
+                plan_text = "\n".join(str(step) for step in plan_obj).strip()
+            else:
+                plan_text = str(plan_obj).strip()
             try:
                 qc = QueryClassification(**_normalize_classification(combined))
             except Exception:
