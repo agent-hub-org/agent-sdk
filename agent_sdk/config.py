@@ -64,6 +64,18 @@ class AgentSDKSettings(BaseSettings):
     # ── Tool result summarisation ─────────────────────────────────────────────
     large_result_threshold: int = 8000
 
+    # Per-tool timeout overrides (JSON string, e.g. '{"get_ticker_data": 10}')
+    # Any tool not listed falls back to per_tool_timeout.
+    per_tool_timeout_map_json: str = "{}"
+
+    @property
+    def per_tool_timeout_map(self) -> dict[str, float]:
+        import json
+        try:
+            return json.loads(self.per_tool_timeout_map_json)
+        except Exception:
+            return {}
+
 
 # Singleton — import this everywhere instead of hardcoding literals.
 settings = AgentSDKSettings()

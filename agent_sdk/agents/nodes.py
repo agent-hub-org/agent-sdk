@@ -334,7 +334,31 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                 )
             breaker.record_success()
             tool_call_duration.labels(agent="sdk", tool_name=name).observe(time.monotonic() - _tool_t0)
-            logger.info("Tool '%s' completed — result length: %d chars", name, len(str(observation)))
+            raw_len = len(str(observation))
+            logger.info("Tool '%s' completed — result length: %d chars", name, raw_len)
+
+            # Auto-summarize large tool results to prevent context bloat.
+            # Skip structured JSON (likely financial data) to preserve precision.
+            threshold = settings.large_result_threshold
+            if raw_len > threshold:
+                obs_str = str(observation)
+                is_structured = obs_str.lstrip().startswith(('{', '['))
+                if not is_structured:
+                    summarizer = getattr(agent, "summarizer", None) or getattr(agent, "llm", None)
+                    if summarizer and hasattr(summarizer, "ainvoke"):
+                        try:
+                            _sum_resp = await summarizer.ainvoke([
+                                SystemMessage(content=(
+                                    "Summarize the following tool output into a concise but complete summary. "
+                                    "Preserve ALL specific facts, numbers, names, dates, and URLs. "
+                                    "Do not omit key information — compress prose, not data."
+                                )),
+                                HumanMessage(content=obs_str[:32000]),
+                            ])
+                            observation = _sum_resp.content
+                            logger.info("Tool '%s' result summarized: %d → %d chars", name, raw_len, len(observation))
+                        except Exception:
+                            logger.warning("Tool result summarization failed for '%s' — using raw result", name)
         except Exception as exc:
             breaker.record_failure(name)
             logger.exception("Tool '%s' failed", name)
@@ -347,11 +371,11 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
 
     async def _execute_with_per_tool_timeout(tool_call: dict) -> ToolMessage:
         """Wrap _execute with a per-tool timeout so one slow tool cannot block others."""
-        per_timeout = settings.per_tool_timeout
+        name = tool_call.get("name", "unknown")
+        per_timeout = settings.per_tool_timeout_map.get(name, settings.per_tool_timeout)
         try:
             return await asyncio.wait_for(_execute(tool_call), timeout=per_timeout)
         except asyncio.TimeoutError:
-            name = tool_call.get("name", "unknown")
             logger.warning("Tool '%s' timed out after %.0fs (per-tool limit)", name, per_timeout)
             return ToolMessage(
                 content=f"Tool '{name}' timed out after {per_timeout:.0f}s.",

@@ -138,7 +138,7 @@ class BaseAgent:
         key = frozenset(t.name for t in tools)
         cache_key = (id(llm_instance), key)
         if cache_key not in self._bound_llm_cache:
-            self._bound_llm_cache[cache_key] = llm_instance.bind_tools(tools, parallel_tool_calls=False) if tools else llm_instance
+            self._bound_llm_cache[cache_key] = llm_instance.bind_tools(tools, parallel_tool_calls=True) if tools else llm_instance
         return self._bound_llm_cache[cache_key]
 
     def _get_breaker(self, name: str) -> CircuitBreaker:
