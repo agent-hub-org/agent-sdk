@@ -482,13 +482,17 @@ def pre_llm_router(state: AgentState) -> Literal["summarize_conversation", "llm_
 
 def _estimate_token_count(messages: Sequence, extra_text: str = "") -> int:
     """Rough token estimate: ~4 chars per token for English text.
+    Uses 3 chars/token for ToolMessages (JSON-heavy).
 
     Pass extra_text for any content injected outside the messages list
     (e.g. state.summary appended to the system prompt) so the estimate
     reflects the real token budget consumed.
     """
-    msg_chars = sum(len(getattr(m, "content", "") or "") for m in messages)
-    return (msg_chars + len(extra_text)) // 4
+    msg_chars = sum(
+        len(getattr(m, "content", "") or "") // (3 if isinstance(m, ToolMessage) else 4)
+        for m in messages
+    )
+    return msg_chars + len(extra_text) // 4
 
 
 def should_continue(state: AgentState) -> Literal["tool_node", "__end__"]:
@@ -589,13 +593,13 @@ async def orchestrate(agent, state: AgentState) -> dict:
     if not tools:
         return {}
 
-    tool_catalog = agent.get_tool_catalog()
+    tool_names = "\n".join(f"- {getattr(t, 'name', str(t))}" for t in tools)
     llm = _get_phase_llm(agent, state)
 
     try:
         _t0 = time.monotonic()
         response = await llm.ainvoke([
-            SystemMessage(content=_STANDARD_ORCHESTRATOR_PROMPT.format(tool_catalog=tool_catalog)),
+            SystemMessage(content=_STANDARD_ORCHESTRATOR_PROMPT.format(tool_catalog=tool_names)),
             HumanMessage(content=f"Query: {user_query}"),
         ])
         _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
@@ -737,9 +741,9 @@ async def financial_orchestrate(agent, state) -> dict:
 _PHASE_BUDGETS: dict[str, int] = {
     "regime_assessment": 4,
     "causal_analysis": 4,
-    "sector_analysis": 4,
-    "company_analysis": 6,
-    "risk_assessment": 4,
+    "sector_analysis": 5,
+    "company_analysis": 10,  # raised from 6 to support deep analysis (DCF+Comps+Risk)
+    "risk_assessment": 6,    # raised from 4
 }
 
 

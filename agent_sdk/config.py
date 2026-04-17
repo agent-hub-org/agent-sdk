@@ -48,7 +48,7 @@ class AgentSDKSettings(BaseSettings):
     checkpoint_socket_timeout_ms: int = 5000
 
     # ── Marketplace / routing ─────────────────────────────────────────────────
-    min_routing_confidence: float = 0.25
+    min_routing_confidence: float = 0.45
     a2a_max_retries: int = 3
 
     # ── LLM defaults ────────────────────────────────────────────────────────────
