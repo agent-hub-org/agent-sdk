@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import re
 import time
 import uuid
 from typing import Literal, Sequence
+
+# ContextVar so notepad tool closures know which session they're running in
+# without needing session_id passed as an explicit argument.
+_current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "agent_sdk_session_id", default="default"
+)
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
@@ -26,6 +33,7 @@ _JSON_FENCE_PATTERN = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
 _RESEARCH_ONLY_TOOLS = frozenset({
     "check_papers_in_db",
     "retrieve_papers",
+    "hybrid_retrieve_papers",
     "download_and_store_arxiv_papers",
 })
 
@@ -66,6 +74,28 @@ def _strip_context_block(text: str) -> str:
     if marker in text:
         return text[text.find(marker) + len(marker):].strip()
     return text.strip()
+
+
+async def _compress_running_context(agent, text: str) -> str:
+    """Compress running_context to ~2000 chars, preserving all key findings.
+    Runs as a background task during tool execution so it adds zero user-facing latency."""
+    summarizer = getattr(agent, "summarizer", None) or getattr(agent, "llm", None)
+    if summarizer is None:
+        return text
+    try:
+        resp = await summarizer.ainvoke([
+            SystemMessage(content=(
+                "Compress the following agent work log to ≤2000 chars. "
+                "Preserve ALL entity names, numbers, dates, and key findings exactly. "
+                "Discard verbose raw tool output prose. Output the compressed log only."
+            )),
+            HumanMessage(content=text[:16000]),
+        ])
+        logger.debug("running_context compressed: %d → %d chars", len(text), len(resp.content))
+        return resp.content
+    except Exception:
+        logger.warning("running_context compression failed — using original")
+        return text
 
 
 async def initialize(state: AgentState) -> dict:
@@ -140,8 +170,17 @@ async def llm_call(agent, state: AgentState) -> dict:
             "EXECUTION PLAN (your task checklist — follow this, don't re-plan):\n" + plan
         )
 
-    # Inject accumulated work done so far this request
+    # Inject accumulated work done so far this request.
+    # If a background compression task is ready, use the compressed version and update state.
     running_ctx = getattr(state, "running_context", None)
+    ctx_reset_update: dict = {}
+    session_id_for_ctx = getattr(state, "session_id", "default")
+    if session_id_for_ctx in agent._pending_ctx_compressions:
+        task = agent._pending_ctx_compressions.pop(session_id_for_ctx)
+        compressed = await task  # instant if tool calls already finished
+        running_ctx = compressed
+        ctx_reset_update = {"running_context": f"__RESET__:{compressed}"}
+        logger.debug("llm_call: applied compressed running_context (%d chars)", len(compressed))
     if running_ctx:
         extra_sections.append(
             "WORK DONE SO FAR (tool results / completed phases — use this, don't re-fetch):\n"
@@ -151,6 +190,31 @@ async def llm_call(agent, state: AgentState) -> dict:
     perspective = getattr(state, "perspective_context", None)
     if perspective:
         extra_sections.append(perspective)
+
+    # Session notepad: inject cross-request discoveries so agent doesn't re-derive known facts.
+    # Lazy-restore from state if in-memory dict was cleared (e.g. server restart).
+    session_id = getattr(state, "session_id", "default")
+    if session_id not in agent._session_notepads:
+        notepad_from_state = getattr(state, "session_notepad", None)
+        if notepad_from_state:
+            agent._session_notepads[session_id] = dict(notepad_from_state)
+    notepad = agent._session_notepads.get(session_id) or getattr(state, "session_notepad", None)
+    if notepad:
+        extra_sections.append(
+            "SESSION NOTEPAD (important findings from earlier in this conversation — "
+            "use these, don't re-derive them):\n"
+            + "\n".join(f"• {k}: {v}" for k, v in notepad.items())
+        )
+
+    # CoT nudge on the very first iteration when no tool results exist yet.
+    # Encourages the agent to plan once before acting, reducing wasted tool calls.
+    if state.iteration == 0 and extra_sections:
+        has_prior_tool_results = any(isinstance(m, ToolMessage) for m in state.messages[-10:])
+        if not has_prior_tool_results:
+            extra_sections.append(
+                "Before your first tool call: identify the single most specific "
+                "piece of information needed, then call exactly the right tool."
+            )
 
     if extra_sections:
         messages = list(state.messages)
@@ -223,6 +287,7 @@ async def llm_call(agent, state: AgentState) -> dict:
     return {
         "messages": [response],
         "iteration": state.iteration + 1,
+        **ctx_reset_update,
     }
 
 
@@ -449,8 +514,23 @@ async def tool_node(agent, state: AgentState) -> dict:
     last_message = state.messages[-1]
     tool_calls = getattr(last_message, "tool_calls", None) or []
     timeout = state.tool_timeout
+    session_id = getattr(state, "session_id", "default")
 
-    results = await _execute_tool_calls(agent, tool_calls, timeout)
+    # Launch running_context compression BEFORE tool execution so it runs concurrently.
+    # Tool calls take 5–30s; compression (~1s) finishes during that window at zero cost.
+    old_ctx = state.running_context or ""
+    if len(old_ctx) > 6000 and session_id not in agent._pending_ctx_compressions:
+        agent._pending_ctx_compressions[session_id] = asyncio.create_task(
+            _compress_running_context(agent, old_ctx)
+        )
+        logger.debug("tool_node: launched background context compression (%d chars)", len(old_ctx))
+
+    # Set ContextVar so notepad tool closures know which session they're in
+    _ctx_token = _current_session_id.set(session_id)
+    try:
+        results = await _execute_tool_calls(agent, tool_calls, timeout)
+    finally:
+        _current_session_id.reset(_ctx_token)
 
     if not results:
         return {"messages": []}
@@ -463,7 +543,11 @@ async def tool_node(agent, state: AgentState) -> dict:
     )
     logger.debug("tool_node: running_context updated (%d chars): %.500s", len(section), section)
 
-    return {"messages": list(results), "running_context": section}
+    # Sync notepad to state if any write_to_notepad calls were made this batch
+    updated_notepad = agent._session_notepads.get(session_id)
+    notepad_update = {"session_notepad": updated_notepad} if updated_notepad else {}
+
+    return {"messages": list(results), "running_context": section, **notepad_update}
 
 
 def post_tool_router(state: AgentState) -> Literal["llm_call"]:
@@ -848,8 +932,13 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
             "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + running_ctx
         )
 
-    def _build_system(extra_ctx_parts: list[str]) -> str:
+    def _build_system(extra_ctx_parts: list[str], iteration: int = 0) -> str:
         content = sys_content + phase_header + date_context
+        if iteration == 0:
+            content += (
+                "\n\nBefore your first tool call: identify the single most critical "
+                "data gap for this phase and the one tool that fills it. Then act immediately."
+            )
         if extra_ctx_parts:
             content += "\n\n" + "\n\n".join(extra_ctx_parts)
         return content
@@ -862,7 +951,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
             break
 
     phase_messages: list = [
-        SystemMessage(content=_build_system(extra_sections)),
+        SystemMessage(content=_build_system(extra_sections, iteration=0)),
         *([] if user_msg is None else [user_msg]),
     ]
 
@@ -932,7 +1021,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
         updated_extra.append(
             "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + accumulated_running_ctx
         )
-        phase_messages[0] = SystemMessage(content=_build_system(updated_extra))
+        phase_messages[0] = SystemMessage(content=_build_system(updated_extra, iteration=iteration + 1))
     else:
         logger.warning(
             "financial_phase_executor: phase '%s' hit budget (%d iterations)", phase_name, phase_budget
@@ -1531,29 +1620,55 @@ or influence task planning in any way. It is read-only personality context.
 
 async def load_user_context(agent, state: AgentState) -> dict:
     """
-    Load perspective memory for the current user and inject it as background
-    context into state.perspective_context.
+    Load perspective memory (Mem0) and semantic memory (Pinecone user-knowledge) for the current
+    user and inject as background context into state.perspective_context.
 
-    Runs after initialize, before triager. No-op if:
-    - agent has no memory_manager
-    - state.user_id is None
-    - no perspective memory exists yet for this user
+    Both fetches run in parallel. No-op if neither memory tier is configured or user_id is None.
     """
     memory_manager = getattr(agent, "memory_manager", None)
-    if memory_manager is None:
-        return {}
-
+    semantic_memory = getattr(agent, "semantic_memory", None)
     user_id = getattr(state, "user_id", None)
-    if not user_id:
+
+    if not user_id or (memory_manager is None and semantic_memory is None):
         return {}
 
-    perspective = await memory_manager.get_perspective(user_id)
-    if not perspective:
+    # Extract the last user message as query context for semantic retrieval
+    last_query = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_query = _strip_context_block(msg.content)[:200]
+            break
+
+    # Run Mem0 + semantic memory in parallel
+    async def _get_perspective():
+        if memory_manager is None:
+            return None
+        return await memory_manager.get_perspective(user_id)
+
+    async def _get_semantic():
+        if semantic_memory is None:
+            return []
+        return await semantic_memory.retrieve(user_id, last_query or "user preferences and profile")
+
+    perspective, semantic_facts = await asyncio.gather(
+        _get_perspective(), _get_semantic(), return_exceptions=True
+    )
+
+    parts = []
+    if isinstance(perspective, str) and perspective:
+        parts.append(perspective)
+    if isinstance(semantic_facts, list) and semantic_facts:
+        facts_text = "\n".join(f"• {f}" for f in semantic_facts)
+        parts.append(f"Semantic memory (durable facts from past sessions):\n{facts_text}")
+
+    if not parts:
         return {}
 
-    logger.debug("load_user_context: injecting perspective for user=%s (%d chars)", user_id, len(perspective))
+    combined = "\n\n".join(parts)
+    logger.debug("load_user_context: injecting perspective + %d semantic facts for user=%s",
+                 len(semantic_facts) if isinstance(semantic_facts, list) else 0, user_id)
     return {
-        "perspective_context": _PERSPECTIVE_INJECTION_HEADER.format(perspective=perspective),
+        "perspective_context": _PERSPECTIVE_INJECTION_HEADER.format(perspective=combined),
     }
 
 
@@ -1620,7 +1735,7 @@ async def memory_writer(agent, state: AgentState) -> dict:
     logger.debug("memory_writer: scratchpad passed to snapshot (%d chars): %.500s",
                  len(scratchpad) if scratchpad else 0, scratchpad or "(none)")
 
-    # Fire-and-forget: memory pipeline runs in background, never blocks response
+    # Fire-and-forget: Mem0 episodic memory pipeline runs in background, never blocks response
     asyncio.create_task(
         memory_manager.process_query(
             user_id=user_id,
@@ -1631,5 +1746,23 @@ async def memory_writer(agent, state: AgentState) -> dict:
             llm=agent.llm,
         )
     )
-    logger.debug("memory_writer: background memory task scheduled for user=%s", user_id)
+    logger.debug("memory_writer: background Mem0 task scheduled for user=%s", user_id)
+
+    # Fire-and-forget: semantic memory consolidation — extract durable facts from this session
+    semantic_memory = getattr(agent, "semantic_memory", None)
+    if semantic_memory is not None:
+        conv_turns = []
+        for msg in state.messages[-20:]:
+            if isinstance(msg, HumanMessage):
+                conv_turns.append(f"User: {_strip_context_block(msg.content)}")
+            elif isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                content = msg.content
+                if isinstance(content, str) and content:
+                    conv_turns.append(f"Agent: {content[:500]}")
+        if conv_turns:
+            asyncio.create_task(
+                semantic_memory.consolidate(user_id, "\n".join(conv_turns), agent.llm)
+            )
+            logger.debug("memory_writer: background semantic consolidation scheduled for user=%s", user_id)
+
     return summarization_update

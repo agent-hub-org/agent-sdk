@@ -28,9 +28,13 @@ def max_int(left: int, right: int) -> int:
 
 
 def join_strings(left: str | None, right: str | None) -> str | None:
-    """Reducer that joins strings with double newlines. Passing None clears the field."""
+    """Reducer that joins strings with double newlines. Passing None clears the field.
+    Passing a string prefixed with '__RESET__:' replaces the field entirely (used by
+    background context compression to swap the full context for a compressed version)."""
     if right is None:
         return None  # explicit clear
+    if isinstance(right, str) and right.startswith("__RESET__:"):
+        return right[len("__RESET__:"):]  # full replacement, no append
     l = left or ""
     if l and right:
         return f"{l}\n\n{right}"
@@ -113,6 +117,15 @@ class AgentState(BaseModel):
             "Financial mode: each phase executor appends its findings as prose. "
             "The LLM sees this at every ReAct iteration so it never re-fetches done work. "
             "Cleared as a background task after the response is sent."
+        ),
+    )
+
+    session_notepad: Annotated[Optional[Dict[str, Any]], merge_dicts] = Field(
+        default=None,
+        description=(
+            "Structured key-value store persisted across requests within a session. "
+            "Written via write_to_notepad tool. Never cleared by initialize(). "
+            "Injected into llm_call so the agent remembers discoveries across follow-up messages."
         ),
     )
 

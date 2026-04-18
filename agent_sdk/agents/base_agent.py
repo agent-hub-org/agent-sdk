@@ -60,7 +60,7 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
                  mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None,
-                 memory_manager=None):
+                 memory_manager=None, semantic_memory=None):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
@@ -77,6 +77,8 @@ class BaseAgent:
         if memory_manager is not None and getattr(memory_manager, "llm", None) is None:
             # Provide the agent's LLM to the memory manager if it doesn't have one
             memory_manager.llm = self.llm
+        # Semantic memory tier (optional — None disables semantic memory)
+        self.semantic_memory = semantic_memory
 
         self.tools = list(tools)
         self.tools_by_name = {tool.name: tool for tool in self.tools}
@@ -99,6 +101,11 @@ class BaseAgent:
         self._bound_llm_cache = {}
         # Cache for financial phase tool lists — populated after MCP init, invalidated on reconnect
         self._phase_tools_cache: dict[str, list] = {}
+        # Per-session notepad: session_id → {key: value}. Synced to/from state.session_notepad.
+        self._session_notepads: dict[str, dict] = {}
+        self._notepad_tools = self._build_notepad_tools()
+        # Background running_context compression tasks: session_id → asyncio.Task
+        self._pending_ctx_compressions: dict[str, asyncio.Task] = {}
 
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered
@@ -148,9 +155,41 @@ class BaseAgent:
         return self._circuit_breakers[name]
 
     def get_available_tools(self, phase_tools: list = None) -> list:
-        """Return tools that are not currently blocked by an OPEN circuit breaker."""
+        """Return tools that are not currently blocked by an OPEN circuit breaker, plus notepad tools."""
         subset = phase_tools if phase_tools is not None else self.tools
-        return [t for t in subset if not self._get_breaker(t.name).is_open]
+        available = [t for t in subset if not self._get_breaker(t.name).is_open]
+        # Always append notepad tools (always available, no circuit breaker needed)
+        notepad_names = {t.name for t in self._notepad_tools}
+        available = [t for t in available if t.name not in notepad_names] + self._notepad_tools
+        return available
+
+    def _build_notepad_tools(self) -> list:
+        """Create write_to_notepad and read_notepad tools as closures over this agent instance."""
+        from langchain_core.tools import tool as lc_tool
+        agent_ref = self
+
+        @lc_tool
+        def write_to_notepad(key: str, value: str) -> str:
+            """Persist an important discovery to the session notepad for use in follow-up messages.
+            Use for: user preferences, confirmed entities, completed sub-task results,
+            risk profile, budget constraints. Key should be concise (e.g., 'user_risk_profile',
+            'target_ticker', 'completed_dcf')."""
+            from agent_sdk.agents.nodes import _current_session_id
+            session_id = _current_session_id.get()
+            agent_ref._session_notepads.setdefault(session_id, {})[key] = value
+            return f"Noted: {key} = {value}"
+
+        @lc_tool
+        def read_notepad() -> str:
+            """Read all entries saved to the session notepad from earlier in this conversation."""
+            from agent_sdk.agents.nodes import _current_session_id
+            session_id = _current_session_id.get()
+            notepad = agent_ref._session_notepads.get(session_id, {})
+            if not notepad:
+                return "Session notepad is empty."
+            return "\n".join(f"• {k}: {v}" for k, v in notepad.items())
+
+        return [write_to_notepad, read_notepad]
 
     def _build_graph(self):
         """Build the appropriate graph based on mode."""
