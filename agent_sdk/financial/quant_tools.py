@@ -164,8 +164,14 @@ def _quick_dcf(fcf, g_high, high_years, g_fade, fade_years, g_terminal, r,
 
 class ComparableInput(BaseModel):
     target_ticker: str = Field(description="Ticker of the company being valued")
-    target_metrics: dict = Field(description="Dict with keys like 'pe', 'pb', 'ev_ebitda', 'roe', 'revenue_growth', 'ebitda_margin'")
-    peers: list[dict] = Field(description="List of peer dicts, each with 'ticker' and same metric keys as target_metrics")
+    target_metrics: dict = Field(
+        default_factory=dict,
+        description="Dict with keys like 'pe', 'pb', 'ev_ebitda', 'roe', 'revenue_growth', 'ebitda_margin'",
+    )
+    peers: list[dict] = Field(
+        default_factory=list,
+        description="List of peer dicts, each with 'ticker' and same metric keys as target_metrics",
+    )
 
 
 def run_comparable_valuation(**kwargs) -> dict:
@@ -175,6 +181,12 @@ def run_comparable_valuation(**kwargs) -> dict:
     """
     inp = ComparableInput(**kwargs)
 
+    if not inp.target_metrics:
+        return {
+            "error": "target_metrics is required — provide a dict of valuation/fundamental metrics for the target company.",
+            "hint": "Call get_ticker_data first to retrieve metrics (pe, pb, roe, etc.), then pass them here along with peer data.",
+            "example": "run_comparable_valuation(target_ticker='<TICKER>', target_metrics={'pe': <val>, 'pb': <val>, 'roe': <val>}, peers=[{'ticker': '<PEER_TICKER>', 'pe': <val>, 'pb': <val>, 'roe': <val>}])",
+        }
     if not inp.peers:
         return {"error": "At least one peer is required for comparison"}
 
