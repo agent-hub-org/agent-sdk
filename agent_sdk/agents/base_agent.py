@@ -60,7 +60,8 @@ class BaseAgent:
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
                  mode: str = "standard", streaming_nodes: set[str] | frozenset[str] | None = None,
-                 memory_manager=None, semantic_memory=None):
+                 memory_manager=None, semantic_memory=None,
+                 allowed_tools: list[str] | None = None):
 
         if mode not in self.VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}'. Must be one of: {self.VALID_MODES}")
@@ -93,6 +94,7 @@ class BaseAgent:
         )
 
         self._mcp_servers = mcp_servers
+        self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         self._mcp_manager = None
         self._initialized = False
         self._degraded = False
@@ -230,6 +232,10 @@ class BaseAgent:
 
                 try:
                     mcp_tools = await asyncio.wait_for(_connect_with_retries(), timeout=15.0)
+                    if self._allowed_tools is not None:
+                        before = len(mcp_tools)
+                        mcp_tools = [t for t in mcp_tools if t.name in self._allowed_tools]
+                        logger.info("Tool filter applied: %d → %d tools", before, len(mcp_tools))
                     # Merge MCP tools with any local tools
                     self.tools.extend(mcp_tools)
                     for t in mcp_tools:

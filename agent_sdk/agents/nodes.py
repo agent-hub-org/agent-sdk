@@ -291,6 +291,26 @@ async def llm_call(agent, state: AgentState) -> dict:
     }
 
 
+def _strip_dangling_tool_calls(messages: list) -> list:
+    """Remove AIMessages with unanswered tool_calls from a message list.
+
+    The OpenAI API rejects any prompt where an assistant message with tool_calls
+    is not immediately followed by ToolMessages for every tool_call_id. This happens
+    when the iteration limit cuts off execution before tool responses arrive.
+    """
+    responded = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    result = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            unanswered = [tc for tc in msg.tool_calls if tc["id"] not in responded]
+            if unanswered:
+                if msg.content:
+                    result.append(AIMessage(content=msg.content))
+                continue
+        result.append(msg)
+    return result
+
+
 async def summarize_conversation(agent, state: AgentState) -> dict:
     """
     Summarize older messages and prune them from state.
@@ -315,6 +335,12 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
     messages_to_prune = conversation[:-keep_n] if len(conversation) > keep_n else []
     if not messages_to_prune:
         logger.info("Not enough messages to prune, skipping summarization")
+        return {}
+
+    # Strip AIMessages with unanswered tool_calls — OpenAI rejects them in the summarizer prompt
+    messages_to_prune = _strip_dangling_tool_calls(messages_to_prune)
+    if not messages_to_prune:
+        logger.info("Nothing to prune after stripping dangling tool_calls, skipping summarization")
         return {}
 
     # Build summarization prompt from ONLY the messages being pruned
