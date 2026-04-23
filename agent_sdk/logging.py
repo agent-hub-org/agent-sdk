@@ -1,13 +1,3 @@
-"""
-Shared JSON structured logging for all agent services.
-
-Usage in app.py (replaces the identical _JsonFormatter class copy-pasted in
-every agent):
-
-    from agent_sdk.logging import configure_logging
-    configure_logging("agent_health")
-"""
-
 import json
 import logging
 import os
