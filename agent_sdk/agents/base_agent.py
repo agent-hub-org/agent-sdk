@@ -95,6 +95,7 @@ class BaseAgent:
         self._mcp_servers = mcp_servers
         self._mcp_manager = None
         self._initialized = False
+        self._degraded = False
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
         self._init_lock = None
         self._tool_catalog_cache = {}
@@ -229,17 +230,16 @@ class BaseAgent:
 
                 try:
                     mcp_tools = await asyncio.wait_for(_connect_with_retries(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    raise RuntimeError(
-                        f"MCP initialization timed out after 15 s — ensure MCP servers are reachable: {self._mcp_servers}"
+                    # Merge MCP tools with any local tools
+                    self.tools.extend(mcp_tools)
+                    for t in mcp_tools:
+                        self.tools_by_name[t.name] = t
+                    logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.error(
+                        "MCP initialization failed — agent running in DEGRADED mode (no MCP tools): %s", e
                     )
-
-                # Merge MCP tools with any local tools
-                self.tools.extend(mcp_tools)
-                for t in mcp_tools:
-                    self.tools_by_name[t.name] = t
-
-                logger.info("Merged tools — total: %d (%s)", len(self.tools), list(self.tools_by_name.keys()))
+                    self._degraded = True
 
         self.graph = self._build_graph()
         self._initialized = True
