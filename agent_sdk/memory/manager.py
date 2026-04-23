@@ -139,7 +139,7 @@ class MemoryManager:
             snapshots = await self.backend.get_snapshots(user_id, session_id)
             if len(snapshots) >= self.episodic_threshold:
                 # Use the oldest un-compiled batch of threshold-sized snapshots
-                batch = snapshots[-self.episodic_threshold:]
+                batch = snapshots[:self.episodic_threshold]
                 episodic_content = await self._compile_episodic(batch, effective_llm)
                 await self.backend.save_episodic(user_id, episodic_content)
                 logger.info("MemoryManager: episodic memory compiled for user=%s (%d snapshots)",

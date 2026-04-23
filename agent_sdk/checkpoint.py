@@ -2,8 +2,8 @@
 AsyncMongoDBSaver — a LangGraph checkpointer that uses pymongo's native
 AsyncMongoClient instead of wrapping sync calls in run_in_executor.
 
-Subclasses MongoDBSaver so sync methods (put/get_tuple/list) still work
-for any callers that need them. Only the async methods are overridden.
+Subclasses BaseCheckpointSaver. Sync methods are not supported.
+Only the async methods are implemented.
 """
 
 from __future__ import annotations
@@ -19,8 +19,6 @@ from langgraph.checkpoint.base import (
     CheckpointMetadata,
     CheckpointTuple,
 )
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from pymongo import MongoClient
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.operations import UpdateOne
@@ -30,10 +28,10 @@ from agent_sdk.config import settings
 logger = logging.getLogger("agent_sdk.checkpoint")
 
 
-class AsyncMongoDBSaver(MongoDBSaver):
+class AsyncMongoDBSaver(BaseCheckpointSaver):
     """MongoDBSaver that uses pymongo AsyncMongoClient for all async operations.
 
-    Sync methods (put, get_tuple, list) are inherited from MongoDBSaver as-is.
+    Sync methods are not supported.
     Async methods (aput, aget_tuple, alist, aput_writes, adelete_thread) use
     the native async pymongo driver — no thread-pool wrapping.
 
@@ -57,23 +55,7 @@ class AsyncMongoDBSaver(MongoDBSaver):
         ttl: Optional[int] = None,
         serde=None,
     ) -> None:
-        # Sync client passed to parent for inherited sync methods.
-        # NOTE: This doubles connection pool usage since both sync and async clients
-        # connect to the same MongoDB. If sync methods are never used, consider
-        # removing the sync client and parent class inheritance.
-        sync_client = MongoClient(
-            conn_string,
-            serverSelectionTimeoutMS=settings.checkpoint_selection_timeout_ms,
-            socketTimeoutMS=settings.checkpoint_socket_timeout_ms,
-        )
-        super().__init__(
-            client=sync_client,
-            db_name=db_name,
-            checkpoint_collection_name=checkpoint_collection_name,
-            writes_collection_name=writes_collection_name,
-            ttl=ttl,
-            serde=serde,
-        )
+        super().__init__(serde=serde)
 
         # Async client for all overridden async methods
         async_client = AsyncMongoClient(
@@ -97,7 +79,7 @@ class AsyncMongoDBSaver(MongoDBSaver):
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_conn_string(  # type: ignore[override]
+    def from_conn_string(
         cls,
         conn_string: str,
         db_name: str = "checkpointing_db",
@@ -114,6 +96,39 @@ class AsyncMongoDBSaver(MongoDBSaver):
             ttl=ttl,
             serde=serde,
         )
+
+    # ------------------------------------------------------------------
+
+    def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        raise NotImplementedError("Sync methods not supported in AsyncMongoDBSaver")
+
+    def list(
+        self,
+        config: Optional[RunnableConfig],
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        before: Optional[RunnableConfig] = None,
+        limit: Optional[int] = None,
+    ):
+        raise NotImplementedError("Sync methods not supported in AsyncMongoDBSaver")
+
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        raise NotImplementedError("Sync methods not supported in AsyncMongoDBSaver")
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        raise NotImplementedError("Sync methods not supported in AsyncMongoDBSaver")
 
     # ------------------------------------------------------------------
     # Async overrides — native AsyncMongoClient, no run_in_executor
@@ -220,6 +235,23 @@ class AsyncMongoDBSaver(MongoDBSaver):
                 if doc.get("parent_checkpoint_id")
                 else None
             )
+            write_docs = await self._async_writes.find(
+                {
+                    "thread_id": doc["thread_id"],
+                    "checkpoint_ns": doc.get("checkpoint_ns", ""),
+                    "checkpoint_id": doc["checkpoint_id"],
+                }
+            ).sort("idx", 1).to_list(None)
+
+            pending_writes = [
+                (
+                    w["task_id"],
+                    w["channel"],
+                    self.serde.loads_typed((w["type"], w["value"])),
+                )
+                for w in write_docs
+            ]
+
             yield CheckpointTuple(
                 config={
                     **(config or {}),
@@ -231,7 +263,7 @@ class AsyncMongoDBSaver(MongoDBSaver):
                 checkpoint=checkpoint,
                 metadata=doc.get("metadata", {}),
                 parent_config=parent_config,
-                pending_writes=[],
+                pending_writes=pending_writes,
             )
 
     async def aput(
