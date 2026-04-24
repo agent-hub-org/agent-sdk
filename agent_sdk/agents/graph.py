@@ -132,6 +132,7 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
         "synthesis":            "synthesis",
         "phase_advance":        "phase_advance",
         END:                    END,
+        # fallback for unknown phase names — logged as error in _route_phase
     }
     graph.add_conditional_edges("phase_router", _route_phase, _phase_route_map)
 
@@ -195,7 +196,13 @@ def _route_phase(state: FinancialAnalysisState):
         "risk_assessment":      "risk_assessment",
         "synthesis":            "synthesis",
     }
-    target = phase_to_node.get(next_phase, END)
+    target = phase_to_node.get(next_phase)
+    if target is None:
+        logger.error(
+            "_route_phase: unknown phase '%s' in phases_to_run — skipping to phase_advance",
+            next_phase,
+        )
+        return "phase_advance"
     logger.info("Routing to phase: %s (node: %s)", next_phase, target)
     return target
 

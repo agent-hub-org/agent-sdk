@@ -53,7 +53,7 @@ async def test_phase_finalize_preserves_final_prose():
     assert "Overall risk is elevated but manageable." in result["running_context"]
 
 
-def test_phase_input_from_parent_preserves_message_objects():
+def test_phase_input_from_parent_extracts_system_and_user():
     from agent_sdk.agents.state import FinancialAnalysisState
     from agent_sdk.agents.subgraphs.phase_subgraph import _phase_input_from_parent
 
@@ -68,8 +68,8 @@ def test_phase_input_from_parent_preserves_message_objects():
 
     payload = _phase_input_from_parent(state, phase_name="entity_analysis", entity_focus="MSFT")
 
-    assert payload["messages"][0] is system
-    assert payload["messages"][1] is human
+    assert payload["parent_system_text"] == "system"
+    assert payload["parent_user_message"] is human
     assert payload["current_phase"] == "entity_analysis"
     assert payload["entity_focus"] == "MSFT"
 

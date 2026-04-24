@@ -17,11 +17,12 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
+from langgraph.types import Command
 
 from agent_sdk.agents.state import AgentState, FinancialAnalysisState
 from agent_sdk.config import settings
 from agent_sdk.mcp.exceptions import MCPSessionError
-from agent_sdk.metrics import llm_call_duration, raw_fallback_total, tool_call_duration
+from agent_sdk.metrics import llm_call_duration, tool_call_duration
 
 logger = logging.getLogger("agent_sdk.nodes")
 
@@ -37,42 +38,6 @@ _RESEARCH_ONLY_TOOLS = frozenset({
     "download_and_store_arxiv_papers",
 })
 
-
-def _build_phase_return(
-    response: AIMessage,
-    state_key: str,
-    data: dict[str, Any],
-    state,
-    phase_name: str,
-    *,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build the legacy financial-phase return payload.
-
-    This remains as a compatibility helper for callers and tests that rely on
-    the extracted fallback behavior and phase-iteration accounting.
-    """
-    payload = data
-    raw_fallback_count = getattr(state, "raw_fallback_count", 0)
-    if not payload:
-        payload = {"raw_analysis": response.content}
-        raw_fallback_count += 1
-        raw_fallback_total.labels(phase=phase_name).inc()
-
-    phase_iterations = dict(getattr(state, "phase_iterations", {}) or {})
-    phase_iterations[phase_name] = phase_iterations.get(phase_name, 0) + 1
-
-    result = {
-        state_key: payload,
-        "messages": [response],
-        "raw_fallback_count": raw_fallback_count,
-        "iteration": getattr(state, "iteration", 0) + 1,
-        "phase_iterations": phase_iterations,
-    }
-    if extra:
-        result.update(extra)
-    return result
 
 
 def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
@@ -755,7 +720,7 @@ def _estimate_token_count(messages: Sequence, extra_text: str = "") -> int:
     return msg_chars + len(extra_text) // 4
 
 
-def should_continue(state: AgentState) -> Literal["tool_node", "llm_call", "__end__"]:
+def should_continue(state: AgentState) -> "Literal['tool_node', 'llm_call', '__end__'] | Command":
     """
     Decide whether the autonomous agent should keep going:
     - Pending tool calls MUST always be executed first (skipping them leaves
@@ -799,11 +764,11 @@ def should_continue(state: AgentState) -> Literal["tool_node", "llm_call", "__en
     already_retried = getattr(state, "validation_retried", False)
     if issues and not already_retried and state.iteration < state.max_iterations - 1:
         hint = build_correction_hint(issues)
-        # Patch hint into state directly — LangGraph reads state fields between nodes
-        state.validation_hint = hint
-        state.validation_retried = True
         logger.info("Response quality issues — routing back to llm_call with correction hint")
-        return "llm_call"
+        return Command(
+            goto="llm_call",
+            update={"validation_hint": hint, "validation_retried": True},
+        )
 
     if issues:
         logger.warning("Response quality issues detected (no budget for retry): %s", issues)
@@ -1012,203 +977,6 @@ async def financial_orchestrate(agent, state) -> dict:
         "query_type": qc.query_type.value,
         "entities": entities,
         "iteration": state.iteration + 1,
-    }
-
-
-# Per-phase iteration budgets (safety cap — LLM self-regulates via plan+running_context)
-_PHASE_BUDGETS: dict[str, int] = {
-    "regime_assessment": 4,
-    "causal_analysis": 4,
-    "sector_analysis": 5,
-    "company_analysis": 10,  # raised from 6 to support deep analysis (DCF+Comps+Risk)
-    "risk_assessment": 6,    # raised from 4
-}
-
-
-async def financial_phase_executor(phase_name: str, agent, state) -> dict:
-    """
-    ReAct executor for a single financial pipeline phase.
-
-    Uses native LangChain tool binding (llm.bind_tools). Every LLM iteration sees:
-    - The agent's system prompt (from state.messages[0])
-    - scratchpad: the comprehensive plan written by financial_orchestrate
-    - running_context: all prior phase results accumulated as prose
-
-    Tool results are appended to running_context after each tool call so the LLM
-    self-regulates: once it sees the plan section for this phase is satisfied it stops.
-
-    Phase findings are appended to running_context as a labeled prose block
-    so subsequent phases and synthesis can read them.
-    """
-    from datetime import datetime, timezone
-
-    logger.info("financial_phase_executor: starting phase '%s'", phase_name)
-    phase_budget = _PHASE_BUDGETS.get(phase_name, 4)
-
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, phase_name)
-    llm_with_tools = agent.get_bound_llm(llm, tools)
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.as_of_date:
-        year = state.as_of_date[:4]
-        date_context = (
-            f"\n\nTODAY'S DATE: {today}. HISTORICAL REFERENCE DATE: {state.as_of_date}\n"
-            f"Always include the historical year ({year}) in search queries."
-        )
-    else:
-        year = datetime.now(timezone.utc).year
-        date_context = (
-            f"\n\nTODAY'S DATE: {today}\n"
-            f"Always include the current year ({year}) in search queries for up-to-date results."
-        )
-
-    # Build system content: agent system prompt + phase header + date context + plan + prior results
-    sys_content = ""
-    if state.messages and isinstance(state.messages[0], SystemMessage):
-        sys_content = state.messages[0].content
-
-    phase_header = (
-        f"\n\n=== CURRENT PHASE: {phase_name.upper().replace('_', ' ')} ===\n"
-        f"Focus on the {phase_name.replace('_', ' ')} section of your EXECUTION PLAN. "
-        f"Call the tools needed for this phase. Stop when this phase section is complete."
-    )
-
-    plan = getattr(state, "scratchpad", None)
-    running_ctx = getattr(state, "running_context", None)
-
-    def _extract_phase_plan(full_plan: str, phase: str) -> str:
-        """Return the single plan line for this phase; fall back to full plan."""
-        phase_key = phase.replace("_", " ")
-        for line in full_plan.splitlines():
-            stripped = line.strip().lower()
-            if stripped.startswith(phase + ":") or stripped.startswith(phase_key + ":"):
-                return line.strip()
-        return full_plan
-
-    phase_plan = _extract_phase_plan(plan, phase_name) if plan else None
-
-    extra_sections: list[str] = []
-    if phase_plan:
-        extra_sections.append(
-            "PHASE PLAN (follow this):\n" + phase_plan
-        )
-    if running_ctx:
-        extra_sections.append(
-            "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + running_ctx
-        )
-
-    def _build_system(extra_ctx_parts: list[str], iteration: int = 0) -> str:
-        content = sys_content + phase_header + date_context
-        if iteration == 0:
-            content += (
-                "\n\nBefore your first tool call: identify the single most critical "
-                "data gap for this phase and the one tool that fills it. Then act immediately."
-            )
-        if extra_ctx_parts:
-            content += "\n\n" + "\n\n".join(extra_ctx_parts)
-        return content
-
-    # Only include the current HumanMessage — no prior AI phase outputs (avoids opinion contamination)
-    user_msg = None
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_msg = msg
-            break
-
-    phase_messages: list = [
-        SystemMessage(content=_build_system(extra_sections, iteration=0)),
-        *([] if user_msg is None else [user_msg]),
-    ]
-
-    phase_running_ctx_parts: list[str] = []
-    accumulated_running_ctx = running_ctx or ""
-    phase_tool_calls_log: list[dict] = []
-
-    for iteration in range(phase_budget):
-        try:
-            _t0 = time.monotonic()
-            response = await _invoke_with_retry(llm_with_tools, phase_messages)
-            _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
-            llm_call_duration.labels(agent="sdk", model=_model_name, phase=phase_name).observe(
-                time.monotonic() - _t0
-            )
-        except Exception:
-            logger.exception("financial_phase_executor: LLM call failed in phase '%s'", phase_name)
-            break
-
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            # LLM produced final prose — phase complete
-            if response.content:
-                phase_running_ctx_parts.append(response.content)
-            break
-
-        logger.info(
-            "financial_phase_executor [%s] iter %d: %d tool call(s): %s",
-            phase_name, iteration, len(tool_calls), [tc["name"] for tc in tool_calls],
-        )
-        phase_messages.append(response)
-
-        # Record tool calls for the execution trace
-        for tc in tool_calls:
-            phase_tool_calls_log.append({
-                "action": "tool_call",
-                "phase": phase_name,
-                "tool": tc["name"],
-                "args": tc.get("args", {}),
-            })
-
-        # Execute tools
-        tool_results = await _execute_tool_calls(agent, tool_calls, state.tool_timeout, phase_tools=tools)
-
-        for tc, tr in zip(tool_calls, tool_results):
-            phase_messages.append(tr)
-            phase_running_ctx_parts.append(f"[{tc['name']}] → {tr.content}")
-            phase_tool_calls_log.append({
-                "action": "tool_result",
-                "phase": phase_name,
-                "tool": tc["name"],
-                "result_length": len(tr.content),
-                "result_preview": tr.content[:500] if len(tr.content) > 500 else tr.content,
-            })
-
-        # Rebuild system message so next iteration sees updated context
-        accumulated_running_ctx = (
-            (running_ctx or "")
-            + ("\n" if running_ctx else "")
-            + "\n".join(phase_running_ctx_parts)
-        )
-        updated_extra = []
-        if phase_plan:
-            updated_extra.append(
-                "PHASE PLAN (follow this):\n" + phase_plan
-            )
-        updated_extra.append(
-            "PRIOR PHASE RESULTS (already done — do not re-fetch):\n" + accumulated_running_ctx
-        )
-        phase_messages[0] = SystemMessage(content=_build_system(updated_extra, iteration=iteration + 1))
-    else:
-        logger.warning(
-            "financial_phase_executor: phase '%s' hit budget (%d iterations)", phase_name, phase_budget
-        )
-
-    # Compile phase findings into a labeled block appended to running_context
-    phase_findings = "\n".join(phase_running_ctx_parts) if phase_running_ctx_parts else "(no data retrieved)"
-    phase_block = (
-        f"=== {phase_name.upper().replace('_', ' ')} ===\n"
-        f"{phase_findings}\n"
-        f"=== END {phase_name.upper().replace('_', ' ')} ==="
-    )
-    logger.info(
-        "financial_phase_executor: phase '%s' complete — %d chars added to running_context",
-        phase_name, len(phase_block),
-    )
-
-    return {
-        "running_context": phase_block,
-        "iteration": state.iteration + 1,
-        "tool_calls_log": phase_tool_calls_log,
     }
 
 
@@ -1617,123 +1385,6 @@ def _normalize_classification(raw: dict) -> dict:
     return {k: v for k, v in normalized.items() if k in valid_keys}
 
 
-
-
-async def comparative_analysis_node(agent, state) -> dict:
-    """
-    Comparative analysis phase — run isolated ReAct loops per entity in parallel
-    and append the combined results to running_context for synthesis to consume.
-    """
-    from datetime import datetime, timezone
-
-    logger.info("Running comparative analysis phase for multiple entities")
-    entities = getattr(state, "entities", []) or []
-    if not entities:
-        logger.warning("No entities found for comparative analysis, falling back to synthesis")
-        return {
-            "current_phase": "synthesis",
-            "iteration": state.iteration + 1,
-        }
-
-    llm = _get_phase_llm(agent, state)
-    tools = _get_phase_tools(agent, "company_analysis")
-    llm_with_tools = agent.get_bound_llm(llm, tools)
-
-    # Build base system content (agent prompt + prior context)
-    sys_content = ""
-    if state.messages and isinstance(state.messages[0], SystemMessage):
-        sys_content = state.messages[0].content
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_ctx = f"\n\nTODAY'S DATE: {today}. Include the current year in search queries."
-
-    running_ctx = getattr(state, "running_context", None)
-    plan = getattr(state, "scratchpad", None)
-    extra: list[str] = []
-    if plan:
-        extra.append("EXECUTION PLAN:\n" + plan)
-    if running_ctx:
-        extra.append("PRIOR PHASE RESULTS:\n" + running_ctx)
-
-    base_system = sys_content + date_ctx
-    if extra:
-        base_system += "\n\n" + "\n\n".join(extra)
-
-    async def analyze_entity(entity: str) -> str:
-        entity_system = (
-            base_system
-            + f"\n\n=== FOCUS ENTITY: {entity} ===\n"
-            f"Perform a thorough company analysis for {entity}. "
-            f"Retrieve fundamentals, valuation, recent performance, and key risks."
-        )
-        messages: list = [SystemMessage(content=entity_system)]
-
-        # Include the current user query
-        for msg in reversed(state.messages):
-            if isinstance(msg, HumanMessage):
-                messages.append(msg)
-                break
-
-        llm_timeout = state.tool_timeout
-        seen_calls: dict[tuple, str] = {}
-
-        for _ in range(5):
-            try:
-                response = await asyncio.wait_for(
-                    llm_with_tools.ainvoke(messages), timeout=llm_timeout
-                )
-            except asyncio.TimeoutError:
-                logger.warning("LLM timed out for entity '%s'", entity)
-                return f"Analysis timed out for {entity}"
-
-            if not getattr(response, "tool_calls", None):
-                return response.content or f"(no analysis produced for {entity})"
-
-            messages.append(response)
-
-            deduped_calls, cached_msgs = [], []
-            for tc in response.tool_calls:
-                key = (tc["name"], str(sorted(tc.get("args", {}).items())))
-                if key in seen_calls:
-                    logger.info("Skipping duplicate tool '%s' for entity '%s'", tc["name"], entity)
-                    cached_msgs.append(ToolMessage(content=seen_calls[key], tool_call_id=tc["id"]))
-                else:
-                    deduped_calls.append(tc)
-
-            if deduped_calls:
-                fresh = await _execute_tool_calls(agent, deduped_calls, llm_timeout, phase_tools=tools)
-                for tc, tr in zip(deduped_calls, fresh):
-                    key = (tc["name"], str(sorted(tc.get("args", {}).items())))
-                    seen_calls[key] = tr.content
-                messages.extend(fresh)
-
-            messages.extend(cached_msgs)
-
-        return "Analysis incomplete (iteration budget reached)"
-
-    _entity_budget = state.tool_timeout * 1.5
-
-    async def _bounded(e: str) -> str:
-        try:
-            return await asyncio.wait_for(analyze_entity(e), timeout=_entity_budget)
-        except asyncio.TimeoutError:
-            logger.warning("Entity '%s' hit wall-clock budget (%.0fs)", e, _entity_budget)
-            return f"Analysis budget exceeded for {e} — partial data only."
-
-    results = await asyncio.gather(*(_bounded(e) for e in entities))
-    logger.info("Comparative analysis complete — %d entities processed", len(entities))
-
-    combined = "\n".join(f"## {e}\n{r}\n---" for e, r in zip(entities, results))
-    phase_block = (
-        "=== COMPARATIVE ANALYSIS ===\n"
-        + combined
-        + "\n=== END COMPARATIVE ANALYSIS ==="
-    )
-
-    return {
-        "running_context": phase_block,
-        "iteration": state.iteration + 1,
-    }
 
 
 def _format_tool_catalog(tools: list) -> str:

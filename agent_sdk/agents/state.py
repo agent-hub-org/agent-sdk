@@ -233,9 +233,13 @@ class PhaseSubgraphState(BaseModel):
     phase branches do not contend on transient keys in the parent graph.
     """
 
-    messages: Sequence[BaseMessage] = Field(
-        default_factory=list,
-        description="Parent conversation messages used to seed the phase prompt.",
+    parent_system_text: str = Field(
+        default="",
+        description="Agent system prompt text extracted from the parent state.",
+    )
+    parent_user_message: Optional[BaseMessage] = Field(
+        default=None,
+        description="Last HumanMessage from the parent conversation, used to seed the phase prompt.",
     )
     scratchpad: Optional[str] = Field(
         default=None,

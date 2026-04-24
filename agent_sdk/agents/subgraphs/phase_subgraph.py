@@ -8,6 +8,7 @@ budgets, and tool bindings stay isolated from the parent financial graph.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from functools import partial
 from typing import Optional
@@ -22,6 +23,7 @@ from agent_sdk.agents.nodes import (
     _invoke_with_retry,
 )
 from agent_sdk.agents.state import FinancialAnalysisState, PhaseSubgraphState
+from agent_sdk.metrics import llm_call_duration
 
 logger = logging.getLogger("agent_sdk.subgraphs.phase")
 
@@ -119,9 +121,25 @@ def _phase_input_from_parent(
     phase_name: str,
     entity_focus: Optional[str] = None,
 ) -> dict:
-    """Map parent financial state into the isolated phase subgraph state."""
+    """Map parent financial state into the isolated phase subgraph state.
+
+    Extracts only the system prompt text and last HumanMessage rather than
+    copying the full parent message list, which would be O(n) per phase.
+    """
+    parent_system_text = ""
+    parent_user_message = None
+    for msg in state.messages:
+        if isinstance(msg, SystemMessage):
+            parent_system_text = msg.content
+            break
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            parent_user_message = msg
+            break
+
     return {
-        "messages": list(state.messages),
+        "parent_system_text": parent_system_text,
+        "parent_user_message": parent_user_message,
         "scratchpad": state.scratchpad,
         "running_context": state.running_context,
         "as_of_date": state.as_of_date,
@@ -137,10 +155,7 @@ async def phase_init(agent, state: PhaseSubgraphState) -> dict:
     phase_name = state.current_phase or "unknown"
     budget = _PHASE_BUDGETS.get(phase_name, 4)
 
-    base_system = ""
-    if state.messages and isinstance(state.messages[0], SystemMessage):
-        base_system = state.messages[0].content
-
+    base_system = state.parent_system_text
     phase_plan = _extract_phase_plan(state.scratchpad, phase_name)
     system_text = _build_phase_system_text(
         base_system=base_system,
@@ -152,16 +167,10 @@ async def phase_init(agent, state: PhaseSubgraphState) -> dict:
         iteration=0,
     )
 
-    user_msg = None
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_msg = msg
-            break
-
     tools = _get_phase_tools(agent, "company_analysis" if state.entity_focus else phase_name)
 
     return {
-        "phase_messages": [] if user_msg is None else [user_msg],
+        "phase_messages": [] if state.parent_user_message is None else [state.parent_user_message],
         "phase_system_text": system_text,
         "phase_base_system_text": base_system,
         "phase_iteration": 0,
@@ -179,7 +188,12 @@ async def phase_llm_call(agent, state: PhaseSubgraphState) -> dict:
     llm_with_tools = agent.get_bound_llm(llm, tools) if tools else llm
 
     prompt = [SystemMessage(content=state.phase_system_text), *list(state.phase_messages)]
+    _t0 = time.monotonic()
     response = await _invoke_with_retry(llm_with_tools, prompt)
+    _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
+    llm_call_duration.labels(agent="sdk", model=_model_name, phase=state.current_phase).observe(
+        time.monotonic() - _t0
+    )
     return {
         "phase_messages": [response],
         "phase_iteration": state.phase_iteration + 1,

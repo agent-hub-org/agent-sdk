@@ -28,7 +28,7 @@ _PHASE_PROGRESS_LABELS: dict[str, str] = {
     "orchestrate":             "Planning approach...",
     # Financial mode — orchestration
     "financial_orchestrate":  "🔎 Classifying query & building plan...",
-    # Financial mode — phases (all use financial_phase_executor)
+    # Financial mode — phases (each runs as a compiled phase subgraph)
     "regime_assessment":      "🌐 Assessing macro regime & market environment...",
     "causal_analysis":        "🔗 Mapping causal transmission chains...",
     "sector_analysis":        "📊 Evaluating sector positioning...",
