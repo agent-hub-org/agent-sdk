@@ -25,6 +25,7 @@ def test_get_llm_uses_settings_timeout(monkeypatch):
     with patch("langchain_openai.ChatOpenAI", side_effect=fake_chat_openai):
         model_registry.get_llm("azure/gpt-5-nano")
 
+    assert captured, "ChatOpenAI was never called — mock did not intercept the constructor"
     assert captured["timeout"] == 42.0, f"Expected 42.0, got {captured['timeout']}"
 
 
@@ -50,6 +51,7 @@ def test_get_llm_uses_settings_max_retries(monkeypatch):
     with patch("langchain_openai.ChatOpenAI", side_effect=fake_chat_openai):
         model_registry.get_llm("azure/gpt-5-nano")
 
+    assert captured, "ChatOpenAI was never called — mock did not intercept the constructor"
     assert captured["max_retries"] == 7, f"Expected 7, got {captured['max_retries']}"
 
 
