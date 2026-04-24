@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import random
 from contextlib import AsyncExitStack
@@ -48,9 +49,9 @@ class MCPConnectionManager:
         return await self._establish_sessions()
 
     async def _establish_sessions(self) -> list[BaseTool]:
-        """Create persistent sessions for all configured MCP servers."""
+        """Create persistent sessions for all configured MCP servers in parallel."""
         server_configs = self._server_configs
-        logger.info("Connecting to %d MCP server(s): %s", len(server_configs), list(server_configs.keys()))
+        logger.info("Connecting to %d MCP server(s) in parallel: %s", len(server_configs), list(server_configs.keys()))
 
         max_retries = settings.mcp_max_retries
         for attempt in range(1, max_retries + 1):
@@ -59,25 +60,23 @@ class MCPConnectionManager:
                 self._exit_stack = AsyncExitStack()
                 await self._exit_stack.__aenter__()
 
-                all_tools: list[BaseTool] = []
-                for server_name, config in server_configs.items():
+                async def _connect_one_server(server_name: str, config: dict[str, Any]) -> list[BaseTool]:
+                    """Connect to a single MCP server and return its tools."""
                     transport = config.get("transport", "")
-
                     if transport in _STREAMABLE_HTTP_TRANSPORTS:
-                        # Use the new streamable_http_client API directly
-                        # to avoid the deprecated streamablehttp_client in
-                        # langchain-mcp-adapters.
                         session = await self._create_streamable_http_session(config)
                     else:
-                        # Use langchain-mcp-adapters for stdio/sse/websocket
                         session = await self._exit_stack.enter_async_context(
                             self._client.session(server_name)
                         )
-
                     tools = await load_mcp_tools(session=session)
-                    all_tools.extend(tools)
-                    logger.info("Opened persistent session for '%s' — %d tool(s)",
-                                server_name, len(tools))
+                    logger.info("Opened persistent session for '%s' — %d tool(s)", server_name, len(tools))
+                    return tools
+
+                tool_lists = await asyncio.gather(
+                    *[_connect_one_server(name, cfg) for name, cfg in server_configs.items()]
+                )
+                all_tools: list[BaseTool] = list(itertools.chain.from_iterable(tool_lists))
 
                 logger.info("Discovered %d tool(s) with persistent sessions: %s",
                              len(all_tools), [t.name for t in all_tools])

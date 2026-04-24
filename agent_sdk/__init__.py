@@ -7,6 +7,9 @@ from .logging import configure_logging, JsonFormatter
 from .mcp.exceptions import MCPSessionError, MCPToolError
 from .metrics import metrics_response
 from .server.streaming import StreamingMathFixer, _fix_math_delimiters
+from .utils.env import validate_required_env_vars
+from .errors import AgentError, ErrorCode
+from .checkpoint_resilient import ResilientCheckpointer
 
 __all__ = [
     "BaseAgent",
@@ -26,5 +29,9 @@ __all__ = [
     "metrics_response",
     "StreamingMathFixer",
     "_fix_math_delimiters",
+    "validate_required_env_vars",
+    "AgentError",
+    "ErrorCode",
+    "ResilientCheckpointer",
 ]
 

@@ -67,6 +67,7 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
 
     graph.add_conditional_edges("llm_call", should_continue, {
         "tool_node": "tool_node",
+        "llm_call": "llm_call",
         "summarize_conversation": "summarize_conversation",
         END: "memory_writer",
     })

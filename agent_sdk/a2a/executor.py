@@ -1,3 +1,4 @@
+import json
 import logging
 import traceback
 from typing import Callable, Awaitable, Any
@@ -16,6 +17,8 @@ from a2a.types import (
     TextPart,
     UnsupportedOperationError,
 )
+
+from agent_sdk.errors import AgentError, ErrorCode
 
 logger = logging.getLogger("agent_sdk.a2a_executor")
 
@@ -88,6 +91,13 @@ class BaseAgentExecutor(AgentExecutor):
             )
         except Exception as e:
             logger.error("A2A execution failed: %s\n%s", e, traceback.format_exc())
+            if isinstance(e, AgentError):
+                error_text = json.dumps(e.to_dict())
+            else:
+                error_text = json.dumps(AgentError(
+                    error_code=ErrorCode.INTERNAL,
+                    message=str(e),
+                ).to_dict())
             await event_queue.enqueue_event(
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
@@ -98,7 +108,7 @@ class BaseAgentExecutor(AgentExecutor):
                         message=Message(
                             message_id=f"error-{context.task_id}",
                             role=Role.agent,
-                            parts=[Part(root=TextPart(text=str(e)))],
+                            parts=[Part(root=TextPart(text=error_text))],
                         ),
                     ),
                 )

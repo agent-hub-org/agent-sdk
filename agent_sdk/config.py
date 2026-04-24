@@ -56,6 +56,8 @@ class AgentSDKSettings(BaseSettings):
     llm_model: str = "gpt-5-nano"
     llm_timeout: float = 120.0
     llm_max_retries: int = 3
+    llm_retry_max: int = 3          # explicit retry attempts for transient LLM errors
+    llm_retry_base_delay: float = 1.0  # seconds; doubled per attempt (exponential backoff)
 
     # ── Financial pipeline confidence scoring ─────────────────────────────────
     confidence_penalty_per_warning: float = 1.0

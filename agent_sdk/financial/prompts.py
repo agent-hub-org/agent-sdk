@@ -101,9 +101,8 @@ MARKDOWN STYLE GUIDE (MANDATORY for Premium UI):
   - Trailing P/E: 18.72x
   - Dividend Yield: 4.72%
 
-OUTPUT FORMAT: You MUST respond with a JSON object containing a single key "full_report" whose
-value is the complete markdown-formatted research note. Do not include any text outside the JSON.
-Example: {"full_report": "# Financial Analysis: ITC.NS\\n\\n## Executive Summary\\n> This is a solid core holding...\\n\\n#### Key Stats\\n- Price: ₹304\\n- Yield: 4.7%"}
+OUTPUT FORMAT: Respond with the complete markdown-formatted research note directly — no JSON wrapper,
+no code fences. Start immediately with the H1 title.
 """
 
 COMPARATIVE_SYNTHESIS_PROMPT = """\
@@ -127,6 +126,6 @@ WRITING STYLE:
 - After each technical finding, add a "What this means for you:" line
 - Mentor tone: help the reader learn how to think about the comparison
 
-OUTPUT FORMAT: You MUST respond with a JSON object containing a single key "full_report" whose
-value is the complete markdown-formatted report. Example: {{"full_report": "## Comparison\\n..."}}
+OUTPUT FORMAT: Respond with the complete markdown-formatted report directly — no JSON wrapper,
+no code fences. Start immediately with the H2 comparison title.
 """

@@ -71,3 +71,14 @@ def validate_response(
         logger.warning("Response quality issues: %s", "; ".join(issues))
 
     return issues
+
+
+def build_correction_hint(issues: list[str]) -> str:
+    """Format a correction instruction for injection into the next LLM call."""
+    issue_text = "; ".join(issues)
+    return (
+        f"QUALITY CORRECTION REQUIRED: Your previous response had the following issues: "
+        f"{issue_text}. "
+        "Please revise your response. Use your available tools if you need real-time data. "
+        "Provide a complete, well-grounded answer."
+    )

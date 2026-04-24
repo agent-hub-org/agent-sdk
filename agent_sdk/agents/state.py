@@ -129,6 +129,44 @@ class AgentState(BaseModel):
         ),
     )
 
+    # --- Response validation correction loop ---
+    validation_hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Correction instruction injected into the next llm_call when the previous "
+            "response failed quality validation. Cleared after one use."
+        ),
+    )
+    _validation_retried: bool = Field(
+        default=False,
+        description="Ensures the correction loop fires at most once per request.",
+    )
+
+
+class ResearchState(AgentState):
+    """
+    Extended state for the research agent's enforced retrieve→download→retrieve workflow.
+
+    The graph uses these fields to decide routing — they are NOT set by the LLM.
+    """
+
+    papers_sufficient: bool = Field(
+        default=False,
+        description="True when check_if_sufficient determines retrieved papers can answer the query.",
+    )
+    download_attempted: bool = Field(
+        default=False,
+        description="True after download_and_store_arxiv_papers has been called once.",
+    )
+    research_query: str = Field(
+        default="",
+        description="Cleaned academic query string extracted from the user message.",
+    )
+    retrieved_papers: Annotated[list[dict], operator.add] = Field(
+        default_factory=list,
+        description="Papers retrieved from the vector DB (accumulated across retrieve calls).",
+    )
+
 
 class FinancialAnalysisState(AgentState):
     """

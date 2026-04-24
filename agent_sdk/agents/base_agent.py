@@ -55,7 +55,7 @@ class BaseAgent:
           financial reasoning (regime → causal → sector → company → risk → synthesis).
     """
 
-    VALID_MODES = ("standard", "financial_analyst")
+    VALID_MODES = ("standard", "financial_analyst", "research")
 
     def __init__(self, tools=None, system_prompt=None, provider: str = "azure",
                  mcp_servers: dict | None = None, checkpointer=None,
@@ -199,6 +199,9 @@ class BaseAgent:
         if self.mode == "financial_analyst":
             from .graph import create_financial_reasoning_graph
             return create_financial_reasoning_graph(agent=self, checkpointer=self.memory)
+        if self.mode == "research":
+            from .research_graph import create_research_graph
+            return create_research_graph(agent=self, checkpointer=self.memory)
         return create_graph(agent=self, checkpointer=self.memory)
 
     async def _ensure_initialized(self):
@@ -365,9 +368,6 @@ class StreamResult:
 
         chunks_yielded = False
         last_full_response = ""
-        # Synthesis outputs JSON-wrapped content {"full_report": "..."}. Buffer its tokens
-        # and unwrap on model-end so the client receives clean markdown, not raw JSON.
-        _synthesis_buffer: list[str] = []
 
         stream_input: dict[str, Any] = {
             "messages": [HumanMessage(content=self._query)],
@@ -421,42 +421,20 @@ class StreamResult:
                 chunk = event["data"]["chunk"]
                 content = chunk.content
 
-                if node == "synthesis":
-                    # Buffer instead of yielding — synthesis outputs JSON that must be unwrapped first
-                    if isinstance(content, str) and content:
-                        _synthesis_buffer.append(content)
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                                _synthesis_buffer.append(block["text"])
-                else:
-                    if isinstance(content, str) and content:
-                        chunks_yielded = True
-                        yield content
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                                chunks_yielded = True
-                                yield block["text"]
+                if isinstance(content, str) and content:
+                    chunks_yielded = True
+                    yield content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                            chunks_yielded = True
+                            yield block["text"]
 
             elif event["event"] == "on_chat_model_end":
                 # Only track from the main LLM, not the summarizer
                 node = event.get("metadata", {}).get("langgraph_node")
                 if node == "summarize_conversation":
                     continue
-
-                # Flush the synthesis buffer with JSON unwrapping
-                if node == "synthesis" and _synthesis_buffer:
-                    raw = "".join(_synthesis_buffer)
-                    _synthesis_buffer.clear()
-
-                    from agent_sdk.utils.output import unwrap_structured_response
-                    clean = unwrap_structured_response(raw)
-
-                    if clean:
-                        chunks_yielded = True
-                        yield clean
-
 
                 # Track tool calls from LLM responses
                 output = event["data"].get("output")

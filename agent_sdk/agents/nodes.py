@@ -76,6 +76,39 @@ def _strip_context_block(text: str) -> str:
     return text.strip()
 
 
+_RETRYABLE_HTTP_CODES = frozenset({429, 503, 504})
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True for transient LLM errors that are safe to retry."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    status = (
+        getattr(exc, "status_code", None)
+        or getattr(getattr(exc, "response", None), "status_code", None)
+    )
+    return status in _RETRYABLE_HTTP_CODES
+
+
+async def _invoke_with_retry(llm_bound, prompt, max_retries: int | None = None, base_delay: float | None = None):
+    """Invoke an LLM with exponential backoff on transient errors."""
+    import random as _random
+    max_retries = max_retries if max_retries is not None else settings.llm_retry_max
+    base_delay = base_delay if base_delay is not None else settings.llm_retry_base_delay
+    for attempt in range(max_retries):
+        try:
+            return await llm_bound.ainvoke(prompt)
+        except Exception as e:
+            if attempt == max_retries - 1 or not _is_retryable(e):
+                raise
+            delay = min(30.0, base_delay * (2 ** attempt) + _random.uniform(0, 0.5))
+            logger.warning(
+                "LLM call attempt %d/%d failed (%s) — retrying in %.2fs",
+                attempt + 1, max_retries, type(e).__name__, delay,
+            )
+            await asyncio.sleep(delay)
+
+
 async def _compress_running_context(agent, text: str) -> str:
     """Compress running_context to ~2000 chars, preserving all key findings.
     Runs as a background task during tool execution so it adds zero user-facing latency."""
@@ -206,6 +239,12 @@ async def llm_call(agent, state: AgentState) -> dict:
             + "\n".join(f"• {k}: {v}" for k, v in notepad.items())
         )
 
+    # Inject correction hint from response validator when routing back for quality fix.
+    validation_hint = getattr(state, "validation_hint", None)
+    if validation_hint:
+        extra_sections.insert(0, validation_hint)
+        # Clear the hint so it only appears once — update happens via returned state dict below
+
     # CoT nudge on the very first iteration when no tool results exist yet.
     # Encourages the agent to plan once before acting, reducing wasted tool calls.
     if state.iteration == 0 and extra_sections:
@@ -229,7 +268,7 @@ async def llm_call(agent, state: AgentState) -> dict:
 
     try:
         _t0 = time.monotonic()
-        response = await llm_with_tools.ainvoke(prompt)
+        response = await _invoke_with_retry(llm_with_tools, prompt)
         _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
         _phase = getattr(state, "current_phase", None) or "standard"
         llm_call_duration.labels(agent="sdk", model=_model_name, phase=_phase).observe(time.monotonic() - _t0)
@@ -284,11 +323,15 @@ async def llm_call(agent, state: AgentState) -> dict:
     else:
         logger.info("LLM returned final response (%d chars)", len(response.content))
 
-    return {
+    result: dict = {
         "messages": [response],
         "iteration": state.iteration + 1,
         **ctx_reset_update,
     }
+    # Clear validation_hint after consuming it so it doesn't repeat on next iteration.
+    if getattr(state, "validation_hint", None):
+        result["validation_hint"] = None
+    return result
 
 
 def _strip_dangling_tool_calls(messages: list) -> list:
@@ -388,15 +431,20 @@ async def summarize_conversation(agent, state: AgentState) -> dict:
 async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, phase_tools: list | None = None) -> list[ToolMessage]:
     _lookup = {**agent.tools_by_name, **({t.name: t for t in phase_tools} if phase_tools else {})}
 
-    async def _execute(tool_call: dict) -> ToolMessage:
+    async def _execute(tool_call: dict) -> tuple[ToolMessage, bool, str]:
+        """Execute one tool call. Returns (ToolMessage, needs_summary, raw_content)."""
         name = tool_call["name"]
         args = tool_call.get("args", {})
         logger.info("Executing tool '%s' with args: %s", name, args)
 
         if name not in _lookup:
-            return ToolMessage(
-                content=f"Error: unknown tool '{name}'. Available tools: {', '.join(sorted(_lookup.keys()))}",
-                tool_call_id=tool_call["id"],
+            return (
+                ToolMessage(
+                    content=f"Error: unknown tool '{name}'. Available tools: {', '.join(sorted(_lookup.keys()))}",
+                    tool_call_id=tool_call["id"],
+                ),
+                False,
+                "",
             )
 
         tool = _lookup[name]
@@ -404,12 +452,16 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
 
         if breaker.is_open:
             logger.warning("Circuit breaker OPEN for '%s' — returning error message", name)
-            return ToolMessage(
-                content=(
-                    f"Tool '{name}' is temporarily unavailable (circuit breaker open). "
-                    "Please try again later or rephrase your query."
+            return (
+                ToolMessage(
+                    content=(
+                        f"Tool '{name}' is temporarily unavailable (circuit breaker open). "
+                        "Please try again later or rephrase your query."
+                    ),
+                    tool_call_id=tool_call["id"],
                 ),
-                tool_call_id=tool_call["id"],
+                False,
+                "",
             )
 
         try:
@@ -425,42 +477,50 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                 )
             breaker.record_success()
             tool_call_duration.labels(agent="sdk", tool_name=name).observe(time.monotonic() - _tool_t0)
-            raw_len = len(str(observation))
+            obs_str = str(observation)
+            raw_len = len(obs_str)
             logger.info("Tool '%s' completed — result length: %d chars", name, raw_len)
 
-            # Auto-summarize large tool results to prevent context bloat.
-            # Skip structured JSON (likely financial data) to preserve precision.
+            # Flag large, unstructured results for deferred parallel summarization.
             threshold = settings.large_result_threshold
-            if raw_len > threshold:
-                obs_str = str(observation)
-                is_structured = obs_str.lstrip().startswith(('{', '['))
-                if not is_structured:
-                    summarizer = getattr(agent, "summarizer", None) or getattr(agent, "llm", None)
-                    if summarizer and hasattr(summarizer, "ainvoke"):
-                        try:
-                            _sum_resp = await summarizer.ainvoke([
-                                SystemMessage(content=(
-                                    "Summarize the following tool output into a concise but complete summary. "
-                                    "Preserve ALL specific facts, numbers, names, dates, and URLs. "
-                                    "Do not omit key information — compress prose, not data."
-                                )),
-                                HumanMessage(content=obs_str[:32000]),
-                            ])
-                            observation = _sum_resp.content
-                            logger.info("Tool '%s' result summarized: %d → %d chars", name, raw_len, len(observation))
-                        except Exception:
-                            logger.warning("Tool result summarization failed for '%s' — using raw result", name)
+            needs_summary = (
+                raw_len > threshold
+                and not obs_str.lstrip().startswith(('{', '['))
+                and bool(getattr(agent, "summarizer", None) or getattr(agent, "llm", None))
+            )
         except Exception as exc:
             breaker.record_failure(name)
             logger.exception("Tool '%s' failed", name)
-            return ToolMessage(
-                content=f"Tool '{name}' failed: {exc}. Check the tool schema and retry with correct arguments.",
-                tool_call_id=tool_call["id"],
+            return (
+                ToolMessage(
+                    content=f"Tool '{name}' failed: {exc}. Check the tool schema and retry with correct arguments.",
+                    tool_call_id=tool_call["id"],
+                ),
+                False,
+                "",
             )
 
-        return ToolMessage(content=str(observation), tool_call_id=tool_call["id"])
+        return ToolMessage(content=obs_str, tool_call_id=tool_call["id"]), needs_summary, obs_str
 
-    async def _execute_with_per_tool_timeout(tool_call: dict) -> ToolMessage:
+    async def _summarize(raw: str, tool_name: str) -> str:
+        """Summarize a single large tool result via LLM."""
+        summarizer = getattr(agent, "summarizer", None) or getattr(agent, "llm", None)
+        try:
+            resp = await summarizer.ainvoke([
+                SystemMessage(content=(
+                    "Summarize the following tool output into a concise but complete summary. "
+                    "Preserve ALL specific facts, numbers, names, dates, and URLs. "
+                    "Do not omit key information — compress prose, not data."
+                )),
+                HumanMessage(content=raw[:32000]),
+            ])
+            logger.info("Tool '%s' result summarized: %d → %d chars", tool_name, len(raw), len(resp.content))
+            return resp.content
+        except Exception:
+            logger.warning("Tool result summarization failed for '%s' — using raw result", tool_name)
+            return raw
+
+    async def _execute_with_per_tool_timeout(tool_call: dict) -> tuple[ToolMessage, bool, str]:
         """Wrap _execute with a per-tool timeout so one slow tool cannot block others."""
         name = tool_call.get("name", "unknown")
         per_timeout = settings.per_tool_timeout_map.get(name, settings.per_tool_timeout)
@@ -468,9 +528,13 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
             return await asyncio.wait_for(_execute(tool_call), timeout=per_timeout)
         except asyncio.TimeoutError:
             logger.warning("Tool '%s' timed out after %.0fs (per-tool limit)", name, per_timeout)
-            return ToolMessage(
-                content=f"Tool '{name}' timed out after {per_timeout:.0f}s.",
-                tool_call_id=tool_call["id"],
+            return (
+                ToolMessage(
+                    content=f"Tool '{name}' timed out after {per_timeout:.0f}s.",
+                    tool_call_id=tool_call["id"],
+                ),
+                False,
+                "",
             )
 
     async def _gather_with_timeout():
@@ -480,14 +544,18 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
         )
 
     try:
-        results = await _gather_with_timeout()
+        raw_results = await _gather_with_timeout()
     except Exception as e:
         if isinstance(e, asyncio.TimeoutError):
             logger.error("Tool execution timed out after %.0fs — emitting error ToolMessages", timeout)
-            results = [
-                ToolMessage(
-                    content=f"Tool execution timed out after {timeout:.0f} seconds.",
-                    tool_call_id=tc["id"],
+            raw_results = [
+                (
+                    ToolMessage(
+                        content=f"Tool execution timed out after {timeout:.0f} seconds.",
+                        tool_call_id=tc["id"],
+                    ),
+                    False,
+                    "",
                 )
                 for tc in tool_calls
             ]
@@ -507,20 +575,41 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                     if phase_tools:
                         _lookup.update({t.name: t for t in phase_tools})
                     logger.info("Reconnected — retrying %d tool call(s)", len(tool_calls))
-                    results = await _gather_with_timeout()
+                    raw_results = await _gather_with_timeout()
                 else:
                     raise
             else:
                 logger.error("Unhandled exception in tool execution — returning error messages", exc_info=True)
-                results = [
-                    ToolMessage(
-                        content=f"Tool execution failed: {e}",
-                        tool_call_id=tc["id"],
+                raw_results = [
+                    (
+                        ToolMessage(
+                            content=f"Tool execution failed: {e}",
+                            tool_call_id=tc["id"],
+                        ),
+                        False,
+                        "",
                     )
                     for tc in tool_calls
                 ]
 
-    return list(results)
+    # Parallel summarization: collect all large results and summarize concurrently.
+    messages = [msg for msg, _, _ in raw_results]
+    needs_summary_idx = [
+        (i, raw, tc["name"])
+        for i, ((_, needs, raw), tc) in enumerate(zip(raw_results, tool_calls))
+        if needs
+    ]
+    if needs_summary_idx:
+        summaries = await asyncio.gather(
+            *[_summarize(raw, name) for _, raw, name in needs_summary_idx]
+        )
+        for (i, _, _), summary in zip(needs_summary_idx, summaries):
+            messages[i] = ToolMessage(
+                content=summary,
+                tool_call_id=messages[i].tool_call_id,
+            )
+
+    return messages
 
 
 async def tool_node(agent, state: AgentState) -> dict:
@@ -629,12 +718,13 @@ def _estimate_token_count(messages: Sequence, extra_text: str = "") -> int:
     return msg_chars + len(extra_text) // 4
 
 
-def should_continue(state: AgentState) -> Literal["tool_node", "__end__"]:
+def should_continue(state: AgentState) -> Literal["tool_node", "llm_call", "__end__"]:
     """
     Decide whether the autonomous agent should keep going:
     - Pending tool calls MUST always be executed first (skipping them leaves
       orphaned tool_calls in the message history which crashes the LLM API).
     - After tool execution (no pending calls), summarize if context is large.
+    - If validation fails and budget allows, loop back once with a correction hint.
     - If we've hit the iteration limit or there are no tool calls, stop.
 
     Does not require agent dependencies — stays a plain function.
@@ -654,19 +744,32 @@ def should_continue(state: AgentState) -> Literal["tool_node", "__end__"]:
         logger.debug("Routing → tool_node")
         return "tool_node"
 
-    # No tool calls means the LLM produced a final response — run quality check then stop.
-    from agent_sdk.agents.response_validator import validate_response
+    # No tool calls — the LLM produced a final response. Run quality check.
+    from agent_sdk.agents.response_validator import validate_response, build_correction_hint
     tool_calls_made = sum(
         1 for m in state.messages
         if getattr(m, "tool_calls", None)
     )
+    response_text = last_message.content if hasattr(last_message, "content") else ""
     issues = validate_response(
-        last_message.content if hasattr(last_message, "content") else "",
+        response_text,
         tool_calls_made=tool_calls_made,
         require_citations=False,
     )
+
+    # Route back to llm_call with a correction hint if validation failed,
+    # budget allows, and we haven't already retried once.
+    already_retried = getattr(state, "_validation_retried", False)
+    if issues and not already_retried and state.iteration < state.max_iterations - 1:
+        hint = build_correction_hint(issues)
+        # Patch hint into state directly — LangGraph reads state fields between nodes
+        state.validation_hint = hint
+        state._validation_retried = True
+        logger.info("Response quality issues — routing back to llm_call with correction hint")
+        return "llm_call"
+
     if issues:
-        logger.warning("Response quality issues detected (will still END): %s", issues)
+        logger.warning("Response quality issues detected (no budget for retry): %s", issues)
 
     logger.debug("Routing → END")
     return END
@@ -732,7 +835,7 @@ async def orchestrate(agent, state: AgentState) -> dict:
 
     try:
         _t0 = time.monotonic()
-        response = await llm.ainvoke([
+        response = await _invoke_with_retry(llm, [
             SystemMessage(content=_STANDARD_ORCHESTRATOR_PROMPT.format(tool_catalog=tool_names)),
             HumanMessage(content=f"Query: {user_query}"),
         ])
@@ -821,7 +924,7 @@ async def financial_orchestrate(agent, state) -> dict:
     qc = _default_qc
     plan_text = ""
     try:
-        response = await llm.ainvoke([
+        response = await _invoke_with_retry(llm, [
             SystemMessage(content=FINANCIAL_ORCHESTRATE_COMBINED_PROMPT),
             HumanMessage(content=user_content),
         ])
@@ -988,7 +1091,7 @@ async def financial_phase_executor(phase_name: str, agent, state) -> dict:
     for iteration in range(phase_budget):
         try:
             _t0 = time.monotonic()
-            response = await llm_with_tools.ainvoke(phase_messages)
+            response = await _invoke_with_retry(llm_with_tools, phase_messages)
             _model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
             llm_call_duration.labels(agent="sdk", model=_model_name, phase=phase_name).observe(
                 time.monotonic() - _t0
@@ -1120,7 +1223,9 @@ async def synthesis_node(agent, state) -> dict:
 
     _synthesis_timeout = state.tool_timeout
     try:
-        response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=_synthesis_timeout)
+        response = await asyncio.wait_for(
+            _invoke_with_retry(llm, prompt), timeout=_synthesis_timeout
+        )
     except asyncio.TimeoutError:
         logger.error("Synthesis LLM call timed out after %.0fs", _synthesis_timeout)
         fallback_content = "Analysis timed out during synthesis. Please try a simpler or more specific query."
@@ -1129,17 +1234,7 @@ async def synthesis_node(agent, state) -> dict:
             "iteration": state.iteration + 1,
         }
 
-    synthesis_data = _extract_json(response.content) or {}
-
-    if synthesis_data and "full_report" in synthesis_data:
-        report_msg = AIMessage(content=synthesis_data["full_report"])
-    else:
-        logger.warning(
-            "Synthesis did not return structured JSON; using raw content (%d chars). First 200: %s",
-            len(response.content), response.content[:200],
-        )
-        report_msg = AIMessage(content=response.content)
-
+    report_msg = AIMessage(content=response.content)
     return {
         "messages": [report_msg],
         "iteration": state.iteration + 1,
