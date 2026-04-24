@@ -759,12 +759,12 @@ def should_continue(state: AgentState) -> Literal["tool_node", "llm_call", "__en
 
     # Route back to llm_call with a correction hint if validation failed,
     # budget allows, and we haven't already retried once.
-    already_retried = getattr(state, "_validation_retried", False)
+    already_retried = getattr(state, "validation_retried", False)
     if issues and not already_retried and state.iteration < state.max_iterations - 1:
         hint = build_correction_hint(issues)
         # Patch hint into state directly — LangGraph reads state fields between nodes
         state.validation_hint = hint
-        state._validation_retried = True
+        state.validation_retried = True
         logger.info("Response quality issues — routing back to llm_call with correction hint")
         return "llm_call"
 

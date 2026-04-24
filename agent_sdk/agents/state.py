@@ -137,7 +137,7 @@ class AgentState(BaseModel):
             "response failed quality validation. Cleared after one use."
         ),
     )
-    _validation_retried: bool = Field(
+    validation_retried: bool = Field(
         default=False,
         description="Ensures the correction loop fires at most once per request.",
     )

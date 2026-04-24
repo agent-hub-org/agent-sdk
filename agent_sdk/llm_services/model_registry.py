@@ -4,11 +4,14 @@ Centralized model catalog and factory.
 Each entry maps a stable model_id to its provider, model name, and display label.
 The `get_llm()` factory creates a LangChain chat model for any cataloged ID.
 Set `hidden: True` on entries that are internal pipeline slots and must not appear in the UI.
+Set `warning: str` on entries to surface a UI-visible caveat (e.g. known tool-call issues).
 """
 import os
 import logging
 import threading
 import httpx
+
+from agent_sdk.config import settings
 
 logger = logging.getLogger("agent_sdk.model_registry")
 
@@ -44,6 +47,7 @@ MODEL_CATALOG = {
         "provider": "Azure AI Foundry",
         "model": "gpt-oss-120b",
         "label": "GPT-OSS 120B",
+        "warning": "Tool calls may fail (Harmony format)",
     },
 
     # Fine-tuned model slots for financial reasoning pipeline phases.
@@ -97,8 +101,8 @@ def get_llm(model_id: str, temperature: float = 0.7):
                 api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
                 model=config["model"],
                 temperature=temperature,
-                timeout=float(os.getenv("AGENT_LLM_TIMEOUT", "120.0")),
-                max_retries=int(os.getenv("AGENT_LLM_MAX_RETRIES", "3")),
+                timeout=settings.llm_timeout,
+                max_retries=settings.llm_max_retries,
                 http_async_client=http_client,
             )
 
@@ -110,8 +114,12 @@ def list_models() -> list[dict]:
 
     Entries with hidden=True are internal pipeline slots and excluded from the list.
     """
-    return [
-        {"id": model_id, "label": config["label"], "provider": config["provider"]}
-        for model_id, config in MODEL_CATALOG.items()
-        if not config.get("hidden")
-    ]
+    result = []
+    for model_id, config in MODEL_CATALOG.items():
+        if config.get("hidden"):
+            continue
+        entry: dict = {"id": model_id, "label": config["label"], "provider": config["provider"]}
+        if "warning" in config:
+            entry["warning"] = config["warning"]
+        result.append(entry)
+    return result
