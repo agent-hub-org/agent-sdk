@@ -1,13 +1,13 @@
 """
 Research agent LangGraph subgraph.
 
-Enforces the mandatory retrieve → check → [download → retrieve] → synthesize
+Enforces the mandatory retrieve -> check -> [download -> retrieve] -> synthesize
 workflow at the graph level rather than relying on the system prompt.
 
 Graph topology:
-    START → research_initialize → retrieve → check_if_sufficient
-        → research_router → synthesize → memory_writer → END
-                          → download_and_retrieve → synthesize
+    START -> research_initialize -> retrieve -> check_if_sufficient
+        -> research_router -> synthesize -> memory_writer -> END
+                          -> download_and_retrieve -> synthesize
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langgraph.graph import StateGraph, START, END
 
 from agent_sdk.agents.state import ResearchState
+from agent_sdk.agents.subgraphs import create_react_subgraph
 from agent_sdk.agents.nodes import (
     initialize,
     memory_writer,
@@ -193,41 +194,35 @@ async def download_and_retrieve(agent, state: ResearchState) -> dict:
     return {"download_attempted": True}
 
 
-async def research_synthesize(agent, state: ResearchState) -> dict:
-    """
-    Final synthesis step — standard llm_call with all retrieved context.
-    Web tools remain available for supplementation.
-    """
-    from agent_sdk.agents.nodes import llm_call
-    return await llm_call(agent, state)
-
-
 def research_router(state: ResearchState) -> str:
     """Route to synthesize if papers are sufficient or download was attempted; else download."""
     if state.papers_sufficient or state.download_attempted:
-        logger.info("research_router → synthesize (sufficient=%s, downloaded=%s)",
+        logger.info("research_router -> synthesize (sufficient=%s, downloaded=%s)",
                     state.papers_sufficient, state.download_attempted)
         return "synthesize"
-    logger.info("research_router → download_and_retrieve")
+    logger.info("research_router -> download_and_retrieve")
     return "download_and_retrieve"
 
 
 def create_research_graph(agent, checkpointer: Optional[Any] = None):
     """
-    Build the research agent graph with enforced retrieve→download→retrieve workflow.
+    Build the research agent graph with enforced retrieve->download->retrieve workflow.
 
     Graph flow:
-        START → research_initialize → retrieve → check_if_sufficient
-            → research_router → synthesize → memory_writer → END
-                              → download_and_retrieve → synthesize
+        START -> research_initialize -> retrieve -> check_if_sufficient
+            -> research_router -> synthesize -> memory_writer -> END
+                              -> download_and_retrieve -> synthesize
     """
     graph = StateGraph(ResearchState)
+
+    # Reuse the standard ReAct subgraph for synthesis so it gets per-iteration checkpointing
+    react = create_react_subgraph(agent, ResearchState).compile()
 
     graph.add_node("research_initialize", partial(research_initialize, agent))
     graph.add_node("retrieve", partial(retrieve, agent))
     graph.add_node("check_if_sufficient", partial(check_if_sufficient, agent))
     graph.add_node("download_and_retrieve", partial(download_and_retrieve, agent))
-    graph.add_node("synthesize", partial(research_synthesize, agent))
+    graph.add_node("synthesize", react)
     graph.add_node("memory_writer", partial(memory_writer, agent))
 
     graph.add_edge(START, "research_initialize")

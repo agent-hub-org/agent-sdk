@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 # ContextVar so notepad tool closures know which session they're running in
 # without needing session_id passed as an explicit argument.
@@ -21,7 +21,7 @@ from langgraph.graph import END
 from agent_sdk.agents.state import AgentState, FinancialAnalysisState
 from agent_sdk.config import settings
 from agent_sdk.mcp.exceptions import MCPSessionError
-from agent_sdk.metrics import llm_call_duration, tool_call_duration
+from agent_sdk.metrics import llm_call_duration, raw_fallback_total, tool_call_duration
 
 logger = logging.getLogger("agent_sdk.nodes")
 
@@ -36,6 +36,43 @@ _RESEARCH_ONLY_TOOLS = frozenset({
     "hybrid_retrieve_papers",
     "download_and_store_arxiv_papers",
 })
+
+
+def _build_phase_return(
+    response: AIMessage,
+    state_key: str,
+    data: dict[str, Any],
+    state,
+    phase_name: str,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build the legacy financial-phase return payload.
+
+    This remains as a compatibility helper for callers and tests that rely on
+    the extracted fallback behavior and phase-iteration accounting.
+    """
+    payload = data
+    raw_fallback_count = getattr(state, "raw_fallback_count", 0)
+    if not payload:
+        payload = {"raw_analysis": response.content}
+        raw_fallback_count += 1
+        raw_fallback_total.labels(phase=phase_name).inc()
+
+    phase_iterations = dict(getattr(state, "phase_iterations", {}) or {})
+    phase_iterations[phase_name] = phase_iterations.get(phase_name, 0) + 1
+
+    result = {
+        state_key: payload,
+        "messages": [response],
+        "raw_fallback_count": raw_fallback_count,
+        "iteration": getattr(state, "iteration", 0) + 1,
+        "phase_iterations": phase_iterations,
+    }
+    if extra:
+        result.update(extra)
+    return result
 
 
 def _parse_malformed_tool_call(failed_generation: str) -> list[dict] | None:
@@ -1279,7 +1316,7 @@ def parallel_fan_in(state) -> dict:
     phase_advance already popped causal_analysis, so only the completed phase is
     removed from the set — anything absent is a no-op.
     """
-    to_remove = {"causal_analysis", "sector_analysis", "company_analysis"}
+    to_remove = {"causal_analysis", "sector_analysis", "company_analysis", "comparative_analysis", "entity_analysis"}
     remaining = [p for p in state.phases_to_run if p not in to_remove]
     next_phase = remaining[0] if remaining else "done"
     logger.info(

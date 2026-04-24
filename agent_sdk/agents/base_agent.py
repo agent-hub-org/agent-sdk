@@ -34,6 +34,7 @@ _PHASE_PROGRESS_LABELS: dict[str, str] = {
     "sector_analysis":        "📊 Evaluating sector positioning...",
     "company_analysis":       "🏢 Running fundamental company analysis...",
     "comparative_analysis":   "⚖️ Running comparative analysis...",
+    "entity_analysis":        "⚖️ Analyzing comparative entities...",
     "risk_assessment":        "⚠️ Stress-testing scenarios & risks...",
     # Financial mode — synthesis
     "synthesis":              "✍️ Synthesizing final report...",
@@ -414,9 +415,15 @@ class StreamResult:
                 yield f"__PROGRESS__:{label}"
 
             if event["event"] == "on_chat_model_stream":
-                # Only stream user-facing LLM nodes, not the summarizer
+                # Only stream user-facing LLM nodes, not the summarizer.
+                # Nested subgraph nodes may report as "parent:llm_call".
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node not in self._agent.streaming_nodes:
+                node_parts = set(node.split(":")) if isinstance(node, str) else set()
+                is_streaming = any(
+                    node == n or n in node_parts
+                    for n in self._agent.streaming_nodes
+                )
+                if not is_streaming:
                     continue
                 chunk = event["data"]["chunk"]
                 content = chunk.content
@@ -431,9 +438,11 @@ class StreamResult:
                             yield block["text"]
 
             elif event["event"] == "on_chat_model_end":
-                # Only track from the main LLM, not the summarizer
+                # Only track from the main LLM, not the summarizer.
+                # Nested subgraph nodes may report as "parent:summarize_conversation".
                 node = event.get("metadata", {}).get("langgraph_node")
-                if node == "summarize_conversation":
+                node_parts = set(node.split(":")) if isinstance(node, str) else set()
+                if "summarize_conversation" in node_parts:
                     continue
 
                 # Track tool calls from LLM responses

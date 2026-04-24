@@ -218,3 +218,87 @@ class FinancialAnalysisState(AgentState):
             "so each phase appends without overwriting prior phases."
         ),
     )
+
+    entity_focus: Optional[str] = Field(
+        default=None,
+        description="When running comparative analysis, the single entity this branch analyzes.",
+    )
+
+
+class PhaseSubgraphState(BaseModel):
+    """
+    Internal state for a single financial phase subgraph invocation.
+
+    This keeps phase-local buffers out of FinancialAnalysisState so parallel
+    phase branches do not contend on transient keys in the parent graph.
+    """
+
+    messages: Sequence[BaseMessage] = Field(
+        default_factory=list,
+        description="Parent conversation messages used to seed the phase prompt.",
+    )
+    scratchpad: Optional[str] = Field(
+        default=None,
+        description="Parent execution plan used to extract the phase-specific step.",
+    )
+    running_context: Optional[str] = Field(
+        default=None,
+        description="Completed work from earlier phases, injected into the phase prompt.",
+    )
+    as_of_date: Optional[str] = Field(
+        default=None,
+        description="Historical reference date for the analysis (YYYY-MM-DD).",
+    )
+    model_id: Optional[str] = Field(
+        default=None,
+        description="Optional model override inherited from the parent state.",
+    )
+    tool_timeout: float = Field(
+        default_factory=lambda: settings.tool_timeout,
+        description="Timeout for executing a batch of tools within the phase.",
+    )
+    current_phase: str = Field(
+        default="unknown",
+        description="Logical phase name being executed by the subgraph.",
+    )
+    entity_focus: Optional[str] = Field(
+        default=None,
+        description="Specific entity assigned to this phase branch during comparative analysis.",
+    )
+
+    phase_messages: Annotated[Sequence[BaseMessage], add_messages] = Field(
+        default_factory=list,
+        description="Phase-local conversation thread excluding the dynamic system prompt.",
+    )
+    phase_system_text: str = Field(
+        default="",
+        description="Dynamic system prompt rebuilt as findings accumulate within the phase.",
+    )
+    phase_base_system_text: str = Field(
+        default="",
+        description="Original parent system prompt prefix reused when rebuilding the phase prompt.",
+    )
+    phase_iteration: int = Field(
+        default=0,
+        description="Number of LLM turns taken within the phase.",
+    )
+    phase_budget: int = Field(
+        default=4,
+        description="Maximum number of LLM turns allowed within the phase.",
+    )
+    phase_tools: list[str] = Field(
+        default_factory=list,
+        description="Tool names bound for this phase invocation.",
+    )
+    phase_plan: Optional[str] = Field(
+        default=None,
+        description="Phase-specific plan excerpt extracted from scratchpad.",
+    )
+    phase_findings: Annotated[Optional[str], join_strings] = Field(
+        default=None,
+        description="Accumulated findings gathered across tool calls and final prose.",
+    )
+    tool_calls_log: Annotated[list[dict], operator.add] = Field(
+        default_factory=list,
+        description="Tool execution log accumulated inside the phase subgraph.",
+    )
