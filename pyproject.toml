@@ -1,6 +1,6 @@
 [project]
 name = "agent-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared SDK for agent-hub multi-agent system"
 authors = [
     {name = "Pranjal Verma",email = "pranjalv23@users.noreply.github.com"}
@@ -31,6 +31,19 @@ dependencies = [
 [project.optional-dependencies]
 memory = [
     "mem0ai (>=0.1.0,<1.0.0)",
+]
+akv = [
+    "azure-keyvault-secrets (>=4.8.0,<5)",
+    "azure-identity (>=1.17.0,<2)",
+]
+redis = ["redis[hiredis] (>=5.2.0,<6)"]
+sentry = ["sentry-sdk[fastapi] (>=2.16.0,<3)"]
+all = [
+    "mem0ai (>=0.1.0,<1.0.0)",
+    "azure-keyvault-secrets (>=4.8.0,<5)",
+    "azure-identity (>=1.17.0,<2)",
+    "redis[hiredis] (>=5.2.0,<6)",
+    "sentry-sdk[fastapi] (>=2.16.0,<3)",
 ]
 
 [tool.poetry.group.dev.dependencies]

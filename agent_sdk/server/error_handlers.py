@@ -30,6 +30,13 @@ def register_error_handlers(app: FastAPI) -> None:
     async def generic_error_handler(request: Request, exc: Exception) -> JSONResponse:
         request_id = request_id_var.get(None)
         logger.error("Unhandled exception (request_id=%s): %s", request_id, exc, exc_info=True)
+        try:
+            from agent_sdk.observability.sentry import _initialized
+            if _initialized:
+                import sentry_sdk
+                sentry_sdk.capture_exception(exc)
+        except Exception:  # noqa: BLE001
+            pass
         envelope = AgentError(
             error_code=ErrorCode.INTERNAL,
             message="An unexpected error occurred. Please try again.",

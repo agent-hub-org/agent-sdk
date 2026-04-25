@@ -17,7 +17,10 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         request.state.request_id = request_id
         tok_r = request_id_var.set(request_id)
-        tok_u = user_id_var.set(request.headers.get("X-User-Id"))
+        user_id = request.headers.get("X-User-Id")
+        tok_u = user_id_var.set(user_id)
+        from agent_sdk.observability.sentry import set_request_user
+        set_request_user(user_id)
         try:
             response = await call_next(request)
         finally:
