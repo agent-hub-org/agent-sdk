@@ -141,8 +141,8 @@ async def test_phase_subgraph_budget_exhaustion_routes_to_finalize():
             tool_calls=[{"name": "mock_tool", "args": {}, "id": f"call_{call_count}"}],
         )
 
-    # Patch the budget dict to enforce a budget of 2 for this test
-    with patch.dict("agent_sdk.agents.subgraphs.phase_subgraph._PHASE_BUDGETS", {"company_analysis": 2}), \
+    # Patch _get_phase_budget to enforce a budget of 2 for this test
+    with patch("agent_sdk.agents.subgraphs.phase_subgraph._get_phase_budget", return_value=2), \
          patch("agent_sdk.agents.subgraphs.phase_subgraph._get_phase_llm", return_value=MagicMock()), \
          patch("agent_sdk.agents.subgraphs.phase_subgraph._get_phase_tools", return_value=[tool]), \
          patch("agent_sdk.agents.subgraphs.phase_subgraph._invoke_with_retry", side_effect=controlled_invoke), \

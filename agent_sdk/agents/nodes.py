@@ -571,6 +571,9 @@ async def _execute_tool_calls(agent, tool_calls: list[dict], timeout: float, pha
                     agent.tools = list(agent.tools)  # keep non-MCP tools
                     for t in new_tools:
                         agent.tools_by_name[t.name] = t
+                    # Invalidate caches that hold stale tool object references
+                    agent._phase_tools_cache.clear()
+                    agent._bound_llm_cache.clear()
                     # Rebuild the lookup dict so the retry uses the new tool objects
                     _lookup.clear()
                     _lookup.update(agent.tools_by_name)
@@ -876,9 +879,11 @@ async def financial_orchestrate(agent, state) -> dict:
 
     Previously two sequential LLM calls (classify → plan); merged into one combined
     call using FINANCIAL_ORCHESTRATE_COMBINED_PROMPT to eliminate +2-6s of latency.
+    Prompt is built dynamically from PHASE_REGISTRY so tool hints never drift.
     """
     from agent_sdk.financial.prompts import FINANCIAL_ORCHESTRATE_COMBINED_PROMPT
     from agent_sdk.financial.schemas import QueryClassification, QueryType
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
 
     logger.info("Classifying query and building plan for financial reasoning pipeline")
 
@@ -913,13 +918,11 @@ async def financial_orchestrate(agent, state) -> dict:
     else:
         user_content = f"Query: {clean_query}"
 
+    _valid_phases = set(PHASE_REGISTRY.keys()) | {"comparative_analysis"}
+
     _default_qc = QueryClassification(
         query_type=QueryType.DATA_RETRIEVAL,
-        requires_regime_assessment=False,
-        requires_causal_analysis=False,
-        requires_sector_analysis=False,
-        requires_company_analysis=True,
-        requires_risk_assessment=False,
+        phases=["company_analysis"],
         reasoning="Classification failed — running minimal pipeline",
     )
 
@@ -938,7 +941,8 @@ async def financial_orchestrate(agent, state) -> dict:
             else:
                 plan_text = str(plan_obj).strip()
             try:
-                qc = QueryClassification(**_normalize_classification(combined))
+                normalized = _normalize_classification(combined)
+                qc = QueryClassification(**normalized)
             except Exception:
                 logger.warning("Could not build QueryClassification from combined response — using default")
         else:
@@ -946,25 +950,19 @@ async def financial_orchestrate(agent, state) -> dict:
     except Exception:
         logger.exception("financial_orchestrate: combined LLM call failed — using defaults")
 
-    # Determine phases from classification
-    phases = []
+    # Build phases list: use qc.phases if the LLM returned the new format,
+    # fall back to the legacy requires_X booleans if present, then append synthesis.
+    phases: list[str] = []
     if qc.query_type == QueryType.DATA_RETRIEVAL:
-        phases = ["company_analysis", "synthesis"]
+        phases = ["company_analysis"]
     elif qc.query_type == QueryType.COMPARATIVE:
-        phases = ["comparative_analysis", "synthesis"]
-    else:
-        if qc.requires_regime_assessment:
-            phases.append("regime_assessment")
-        if qc.requires_causal_analysis:
-            phases.append("causal_analysis")
-        if qc.requires_sector_analysis:
-            phases.append("sector_analysis")
-        if qc.requires_company_analysis:
-            phases.append("company_analysis")
-        if qc.requires_risk_assessment:
-            phases.append("risk_assessment")
-        if phases:
-            phases.append("synthesis")
+        phases = ["comparative_analysis"]
+    elif qc.phases:
+        # New format: LLM returned a validated phases list directly.
+        phases = [p for p in qc.phases if p in _valid_phases]
+    # synthesis is always the terminal phase (appended unconditionally)
+    if phases:
+        phases.append("synthesis")
 
     entities = list(qc.entities) if hasattr(qc, "entities") and qc.entities else []
     logger.info("financial_orchestrate: type=%s phases=%s entities=%s plan=%d chars",
@@ -984,17 +982,16 @@ async def synthesis_node(agent, state) -> dict:
     """
     Synthesis phase — produce the final user-facing report.
 
-    Reads from state.running_context (accumulated prose from all prior phases) and
-    state.query_type (set by financial_orchestrate) to select the right synthesis prompt.
-    No tools — pure LLM reasoning step.
+    Prefers state.phase_outputs (typed, structured) over the legacy running_context
+    string when available.  Falls back to running_context for backward compat.
     """
     from agent_sdk.financial.prompts import SYNTHESIS_PROMPT, COMPARATIVE_SYNTHESIS_PROMPT
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
     from datetime import datetime, timezone
 
     logger.info("Running synthesis phase")
     llm = _get_phase_llm(agent, state)
 
-    running_ctx = getattr(state, "running_context", None) or "(no prior phase results available)"
     query_type = getattr(state, "query_type", None)
 
     if query_type == "comparative":
@@ -1005,12 +1002,35 @@ async def synthesis_node(agent, state) -> dict:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     date_context = f"\n\nTODAY'S DATE: {today}"
 
-    # Inject running_context as a labeled block in the system prompt
+    # Build prior analysis section from typed phase_outputs (preferred) or running_context.
+    phase_outputs = getattr(state, "phase_outputs", None) or {}
+    if phase_outputs:
+        # Render each phase section in pipeline order (registry order = dependency order)
+        sections: list[str] = []
+        for phase_name in PHASE_REGISTRY:
+            po = phase_outputs.get(phase_name)
+            if po is None:
+                continue
+            label = phase_name.upper().replace("_", " ")
+            if po.confidence < 0.5:
+                sections.append(f"=== {label} ===\n(Phase failed or returned low-confidence data)\n=== END {label} ===")
+            else:
+                sections.append(f"=== {label} ===\n{po.findings}\n=== END {label} ===")
+        # Also include any entity_analysis outputs (comparative mode)
+        for key, po in phase_outputs.items():
+            if key.startswith("entity_analysis") or (key not in PHASE_REGISTRY):
+                label = key.upper().replace("_", " ")
+                sections.append(f"=== {label} ===\n{po.findings}\n=== END {label} ===")
+        prior_analysis = "\n\n".join(sections) if sections else "(no prior phase results available)"
+    else:
+        # Fallback: legacy running_context string
+        prior_analysis = getattr(state, "running_context", None) or "(no prior phase results available)"
+
     full_system = (
         synthesis_prompt
         + date_context
         + "\n\n=== PRIOR ANALYSIS ===\n"
-        + running_ctx
+        + prior_analysis
         + "\n=== END PRIOR ANALYSIS ==="
     )
 
@@ -1046,55 +1066,8 @@ async def synthesis_node(agent, state) -> dict:
     }
 
 
-def phase_router(state) -> dict:
-    """
-    Pass-through routing node for the financial reasoning pipeline.
-    Actual routing logic is handled by _route_phase conditional edges.
-    """
-    return {}
-
-
-def phase_advance(state) -> dict:
-    """
-    Advance to the next phase in the pipeline.
-    Removes the current phase from phases_to_run and sets current_phase.
-    """
-    remaining = list(state.phases_to_run)
-    if remaining:
-        remaining.pop(0)  # Remove completed phase
-
-    next_phase = remaining[0] if remaining else "done"
-    logger.info("Phase advance: %s → %s (remaining: %s)", state.current_phase, next_phase, remaining)
-
-    return {
-        "phases_to_run": remaining,
-        "current_phase": next_phase,
-    }
-
-
-def parallel_fan_in(state) -> dict:
-    """
-    Fan-in node after parallel sector_analysis + company_analysis.
-
-    _causal_analysis_router fans out directly (bypassing phase_advance), so
-    phases_to_run still contains causal_analysis, sector_analysis, and company_analysis
-    when this node runs. Pop all three at once so phase_router advances correctly.
-
-    Also handles the sequential case (only one of sector/company in the plan):
-    phase_advance already popped causal_analysis, so only the completed phase is
-    removed from the set — anything absent is a no-op.
-    """
-    to_remove = {"causal_analysis", "sector_analysis", "company_analysis", "comparative_analysis", "entity_analysis"}
-    remaining = [p for p in state.phases_to_run if p not in to_remove]
-    next_phase = remaining[0] if remaining else "done"
-    logger.info(
-        "parallel_fan_in: sector+company complete → next=%s, remaining=%s",
-        next_phase, remaining,
-    )
-    return {
-        "phases_to_run": remaining,
-        "current_phase": next_phase,
-    }
+# phase_router, phase_advance, and parallel_fan_in have been replaced by the
+# dependency-aware phase_scheduler in graph.py (Phase 4 refactor).
 
 
 
@@ -1114,14 +1087,13 @@ def _get_phase_llm(agent, state):
 def _get_phase_tools(agent, phase: str) -> list:
     """
     Get tools appropriate for a specific reasoning phase.
-    Returns a filtered subset of agent tools plus phase-specific financial tools.
 
-    Results are cached per (phase, agent_tools_fingerprint) on the agent instance
-    to avoid re-importing financial modules and scanning all tools on every phase
-    iteration (financial mode runs 20-36 tool lookups per request).
+    Phase-specific financial module tools come from PHASE_REGISTRY[phase].financial_tool_names.
+    All agent MCP tools (minus research-only ones) are always included.
+
+    Results are cached per (phase, agent_tools_fingerprint) on the agent instance.
     Cache is invalidated on MCP reconnection by clearing agent._phase_tools_cache.
     """
-    # Cache key: phase name + frozenset of current tool names (detects MCP reconnections)
     tool_fingerprint = frozenset(agent.tools_by_name.keys())
     cache_key = (phase, tool_fingerprint)
     cached = agent._phase_tools_cache.get(cache_key)
@@ -1131,28 +1103,18 @@ def _get_phase_tools(agent, phase: str) -> list:
     from agent_sdk.financial.causal_graph import get_causal_graph_tools
     from agent_sdk.financial.ontology import get_ontology_tools
     from agent_sdk.financial.quant_tools import get_quant_tools
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
 
-    # Financial tools organized by phase (computed once per cache miss)
-    quant = get_quant_tools()
-    causal = get_causal_graph_tools()
-    ontology = get_ontology_tools()
+    # Build a flat lookup of all financial module tools (computed once per cache miss)
+    all_financial: dict[str, object] = {}
+    for t in get_quant_tools() + get_causal_graph_tools() + get_ontology_tools():
+        all_financial[t.name] = t
 
-    phase_financial_tools: dict[str, list] = {
-        "regime_assessment": [t for t in quant if t.name == "detect_market_regime"],
-        "causal_analysis": causal + [t for t in quant if t.name == "run_scenario_simulation"],
-        "sector_analysis": ontology,
-        "company_analysis": (
-            ontology + [t for t in quant if t.name in (
-                "run_dcf", "run_comparable_valuation", "calculate_technical_signals", "calculate_risk_metrics"
-            )]
-        ),
-        "risk_assessment": (
-            [t for t in quant if t.name in ("run_scenario_simulation", "calculate_risk_metrics")]
-            + causal
-        ),
-    }
+    # Pick only the tools listed in the registry for this phase
+    phase_def = PHASE_REGISTRY.get(phase)
+    wanted_names = set(phase_def.financial_tool_names) if phase_def else set()
+    financial_tools = [t for name, t in all_financial.items() if name in wanted_names]
 
-    financial_tools = phase_financial_tools.get(phase, [])
     agent_tools = [t for t in agent.tools_by_name.values() if t.name not in _RESEARCH_ONLY_TOOLS]
 
     seen: set[str] = set()
@@ -1346,7 +1308,11 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _normalize_classification(raw: dict) -> dict:
-    """Remap common LLM field-name variations to QueryClassification fields."""
+    """Remap common LLM field-name variations to QueryClassification fields.
+
+    Supports both the new format (phases: list[str]) and the legacy format
+    (requires_X_assessment: bool) for backward compatibility during rollout.
+    """
     normalized = dict(raw)
 
     # Remap query_type aliases
@@ -1359,29 +1325,35 @@ def _normalize_classification(raw: dict) -> dict:
         if alias in normalized and "reasoning" not in normalized:
             normalized["reasoning"] = normalized.pop(alias)
 
-    # Convert reasoning_phases / phases list to individual booleans
-    phases_list = normalized.pop("reasoning_phases", None) or normalized.pop("phases", None)
-    if phases_list and isinstance(phases_list, list):
-        phase_mapping = {
-            "regime_assessment": "requires_regime_assessment",
-            "causal_analysis": "requires_causal_analysis",
-            "sector_analysis": "requires_sector_analysis",
-            "company_analysis": "requires_company_analysis",
-            "risk_assessment": "requires_risk_assessment",
-        }
-        for field in phase_mapping.values():
-            normalized.setdefault(field, False)
-        for phase in phases_list:
-            if phase in phase_mapping:
-                normalized[phase_mapping[phase]] = True
+    # Handle legacy requires_X fields: convert to phases list if phases not already present
+    _phase_bool_map = {
+        "requires_regime_assessment": "regime_assessment",
+        "requires_causal_analysis": "causal_analysis",
+        "requires_sector_analysis": "sector_analysis",
+        "requires_company_analysis": "company_analysis",
+        "requires_risk_assessment": "risk_assessment",
+    }
+    has_legacy_bools = any(k in normalized for k in _phase_bool_map)
+    has_phases_key = "phases" in normalized or "reasoning_phases" in normalized
+
+    if has_legacy_bools and not has_phases_key:
+        # Convert legacy boolean flags to phases list in registry order
+        _registry_order = [
+            "regime_assessment", "causal_analysis",
+            "sector_analysis", "company_analysis", "risk_assessment",
+        ]
+        phases_from_bools = [
+            phase for phase in _registry_order
+            if normalized.get(f"requires_{phase}", False)
+        ]
+        normalized["phases"] = phases_from_bools
+
+    # If phases came as "reasoning_phases" key, rename it
+    if "reasoning_phases" in normalized and "phases" not in normalized:
+        normalized["phases"] = normalized.pop("reasoning_phases")
 
     # Strip unknown keys to avoid Pydantic extra-field errors
-    valid_keys = {
-        "query_type", "entities",
-        "requires_regime_assessment", "requires_causal_analysis",
-        "requires_sector_analysis", "requires_company_analysis",
-        "requires_risk_assessment", "reasoning",
-    }
+    valid_keys = {"query_type", "entities", "phases", "reasoning"}
     return {k: v for k, v in normalized.items() if k in valid_keys}
 
 
@@ -1544,8 +1516,8 @@ async def memory_writer(agent, state: AgentState) -> dict:
     logger.debug("memory_writer: scratchpad passed to snapshot (%d chars): %.500s",
                  len(scratchpad) if scratchpad else 0, scratchpad or "(none)")
 
-    # Fire-and-forget: Mem0 episodic memory pipeline runs in background, never blocks response
-    asyncio.create_task(
+    # Schedule background tasks via _tracked_task so they're awaited on shutdown
+    agent._tracked_task(
         memory_manager.process_query(
             user_id=user_id,
             session_id=session_id,
@@ -1557,7 +1529,6 @@ async def memory_writer(agent, state: AgentState) -> dict:
     )
     logger.debug("memory_writer: background Mem0 task scheduled for user=%s", user_id)
 
-    # Fire-and-forget: semantic memory consolidation — extract durable facts from this session
     semantic_memory = getattr(agent, "semantic_memory", None)
     if semantic_memory is not None:
         conv_turns = []
@@ -1569,7 +1540,7 @@ async def memory_writer(agent, state: AgentState) -> dict:
                 if isinstance(content, str) and content:
                     conv_turns.append(f"Agent: {content[:500]}")
         if conv_turns:
-            asyncio.create_task(
+            agent._tracked_task(
                 semantic_memory.consolidate(user_id, "\n".join(conv_turns), agent.llm)
             )
             logger.debug("memory_writer: background semantic consolidation scheduled for user=%s", user_id)

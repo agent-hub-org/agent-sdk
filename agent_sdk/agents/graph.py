@@ -66,166 +66,179 @@ def create_graph(agent, checkpointer: Optional[Any] = None):
 
 def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     """
-    Financial pipeline with phase-level subgraphs.
+    Financial pipeline with dependency-aware phase scheduling.
 
-    Each tool phase is a compiled PhaseSubgraph with per-iteration checkpointing.
-    Comparative analysis fans out to parallel entity_analysis subgraphs via Send().
+    Graph flow
+    ----------
+    START -> initialize -> [load_user_context ∥ financial_orchestrate] -> merge_context
+          -> phase_scheduler -> (conditional: phase nodes, synthesis, END)
+             Phase nodes all route back to phase_scheduler (fan-in automatic).
+          -> synthesis -> memory_writer -> END
+
+    phase_scheduler replaces the old phase_router + phase_advance + parallel_fan_in
+    + _causal_analysis_router.  It reads phase_outputs (keyed by completed phase name)
+    and PHASE_REGISTRY.depends_on to compute which phases are ready to run — including
+    concurrent fan-out for phases whose deps are satisfied simultaneously.
     """
     from agent_sdk.agents.nodes import (
         financial_initialize,
         financial_orchestrate,
-        phase_router,
-        phase_advance,
-        parallel_fan_in,
         synthesis_node,
     )
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
 
     graph = StateGraph(FinancialAnalysisState)
 
-    # Compile the phase subgraph once and wrap it per phase so branch-local
-    # phase buffers never write directly into the parent graph state.
     phase_subgraph = create_phase_subgraph(agent).compile()
 
     # --- Core nodes ---
     graph.add_node("initialize", financial_initialize)
     graph.add_node("load_user_context", partial(load_user_context, agent))
     graph.add_node("financial_orchestrate", partial(financial_orchestrate, agent))
-    graph.add_node("phase_router", phase_router)
-    graph.add_node("phase_advance", phase_advance)
+    graph.add_node("merge_context", merge_context)
+    graph.add_node("phase_scheduler", _phase_scheduler_node)
+    graph.add_node("synthesis", partial(synthesis_node, agent))
     graph.add_node("memory_writer", partial(memory_writer, agent))
 
     # --- Phase subgraph nodes (one compiled subgraph, many node names) ---
+    # Derived from PHASE_REGISTRY so adding a phase only requires a registry entry.
     _tool_phases = [
-        "regime_assessment",
-        "causal_analysis",
-        "sector_analysis",
-        "company_analysis",
-        "risk_assessment",
+        name for name in PHASE_REGISTRY
+        if name not in ("synthesis", "entity_analysis")
     ]
     for ph in _tool_phases:
         graph.add_node(ph, partial(run_phase_subgraph, agent, phase_subgraph, phase_name=ph))
 
-    # Comparative analysis uses the same phase subgraph with entity_focus
+    # Comparative analysis fans out to entity_analysis (same subgraph, entity_focus set per branch)
     graph.add_node(
         "entity_analysis",
         partial(run_phase_subgraph, agent, phase_subgraph, phase_name="entity_analysis"),
     )
 
-    # --- Non-tool phases ---
-    graph.add_node("synthesis", partial(synthesis_node, agent))
-
     # --- Edges ---
-    graph.add_node("merge_context", merge_context)
     graph.add_edge(START, "initialize")
     graph.add_edge("initialize", "load_user_context")
     graph.add_edge("initialize", "financial_orchestrate")
     graph.add_edge(["load_user_context", "financial_orchestrate"], "merge_context")
-    graph.add_edge("merge_context", "phase_router")
+    graph.add_edge("merge_context", "phase_scheduler")
 
-    # Phase router -> entry node of each phase
-    _phase_route_map = {
-        "regime_assessment":    "regime_assessment",
-        "causal_analysis":      "causal_analysis",
-        "sector_analysis":      "sector_analysis",
-        "company_analysis":     "company_analysis",
-        "risk_assessment":      "risk_assessment",
-        "synthesis":            "synthesis",
-        "phase_advance":        "phase_advance",
-        END:                    END,
-        # fallback for unknown phase names — logged as error in _route_phase
-    }
-    graph.add_conditional_edges("phase_router", _route_phase, _phase_route_map)
+    # All phase nodes route back to phase_scheduler.
+    # When multiple parallel branches converge, LangGraph fans them all in before
+    # calling phase_scheduler (automatic fork/join semantics).
+    for ph in _tool_phases:
+        graph.add_edge(ph, "phase_scheduler")
+    graph.add_edge("entity_analysis", "phase_scheduler")
 
-    # Sequential phases -> phase_advance
-    graph.add_edge("regime_assessment", "phase_advance")
-    graph.add_edge("risk_assessment", "phase_advance")
+    # phase_scheduler conditional edge decides what runs next
+    graph.add_conditional_edges("phase_scheduler", _route_from_scheduler)
 
-    # Causal analysis -> parallel fan-out or sequential
-    graph.add_conditional_edges("causal_analysis", _causal_analysis_router)
-
-    # Sector + company -> parallel_fan_in
-    graph.add_node("parallel_fan_in", parallel_fan_in)
-    graph.add_edge("sector_analysis", "parallel_fan_in")
-    graph.add_edge("company_analysis", "parallel_fan_in")
-    graph.add_edge("parallel_fan_in", "phase_router")
-
-    # Entity analysis (comparative) -> parallel_fan_in -> phase_router
-    graph.add_edge("entity_analysis", "parallel_fan_in")
-
-    # phase_advance -> phase_router loop
-    graph.add_edge("phase_advance", "phase_router")
-
-    # synthesis -> memory_writer -> END
+    # Terminal edge
     graph.add_edge("synthesis", "memory_writer")
     graph.add_edge("memory_writer", END)
 
     return graph.compile(checkpointer=checkpointer)
 
 
-def _route_phase(state: FinancialAnalysisState):
-    """Route to the next phase in the pipeline, or END if all phases done."""
-    logger.info("_route_phase — phases_to_run=%s, current_phase=%s",
-                state.phases_to_run, state.current_phase)
-    if not state.phases_to_run:
-        logger.info("No phases remaining, routing to END")
+# ============================================================================
+# Scheduler logic
+# ============================================================================
+
+def _completed_phases(state: FinancialAnalysisState) -> set[str]:
+    """Return the set of phase names known to be complete."""
+    done = set((state.phase_outputs or {}).keys())
+    # entity_analysis completing implicitly marks comparative_analysis done too
+    if "entity_analysis" in done:
+        done.add("comparative_analysis")
+    return done
+
+
+def _phase_scheduler_node(state: FinancialAnalysisState) -> dict:
+    """
+    Advance phases_to_run by pruning any phases whose outputs have arrived.
+
+    Called after every phase completion (including parallel fan-in: LangGraph
+    automatically waits for all concurrent branches before calling this node).
+    """
+    completed = _completed_phases(state)
+    remaining = [p for p in state.phases_to_run if p not in completed]
+    next_phase = remaining[0] if remaining else "done"
+    logger.info(
+        "phase_scheduler: completed=%s remaining=%s → next=%s",
+        sorted(completed), remaining, next_phase,
+    )
+    return {
+        "phases_to_run": remaining,
+        "current_phase": next_phase,
+    }
+
+
+def _route_from_scheduler(state: FinancialAnalysisState):
+    """
+    Conditional edge: decide which phase(s) to run next.
+
+    Parallel fan-out: when multiple phases have all their deps satisfied,
+    return [Send(phase, state), ...] so they run concurrently.
+    """
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
+
+    remaining = state.phases_to_run
+    if not remaining:
+        logger.info("phase_scheduler: all phases complete → END")
         return END
 
-    next_phase = state.phases_to_run[0]
+    completed = _completed_phases(state)
+
+    next_p = remaining[0]
+
+    if next_p == "synthesis":
+        logger.info("phase_scheduler → synthesis")
+        return "synthesis"
 
     # Comparative analysis: fan out to parallel entity_analysis subgraphs
-    if next_phase == "comparative_analysis":
-        entities = getattr(state, "entities", []) or []
+    if next_p == "comparative_analysis":
+        entities = state.entities or []
         if len(entities) > 1:
-            logger.info("Fanning out comparative analysis for %d entities via Send()", len(entities))
+            logger.info("phase_scheduler: fanning out %d entity_analysis branches", len(entities))
             return [
                 Send("entity_analysis", _build_entity_analysis_state(state, e))
                 for e in entities
             ]
         elif entities:
-            logger.info("Single entity comparative analysis — sending one branch")
+            logger.info("phase_scheduler: single entity_analysis branch for '%s'", entities[0])
             return Send("entity_analysis", _build_entity_analysis_state(state, entities[0]))
         else:
-            logger.warning("comparative_analysis requested but no entities found, skipping")
-            return "phase_advance"
+            logger.warning("phase_scheduler: comparative_analysis but no entities — skipping to synthesis")
+            return "synthesis"
 
-    phase_to_node = {
-        "regime_assessment":    "regime_assessment",
-        "causal_analysis":      "causal_analysis",
-        "sector_analysis":      "sector_analysis",
-        "company_analysis":     "company_analysis",
-        "risk_assessment":      "risk_assessment",
-        "synthesis":            "synthesis",
-    }
-    target = phase_to_node.get(next_phase)
-    if target is None:
-        logger.error(
-            "_route_phase: unknown phase '%s' in phases_to_run — skipping to phase_advance",
-            next_phase,
+    # Find all phases ready to run simultaneously (depends_on all satisfied).
+    # A dependency is satisfied if it appears in completed or was never in the plan.
+    plan_set = set(state.phases_to_run) | completed
+    ready: list[str] = []
+    for p in remaining:
+        if p in ("synthesis", "comparative_analysis"):
+            continue
+        phase_def = PHASE_REGISTRY.get(p)
+        deps = phase_def.depends_on if phase_def else []
+        if all(d in completed or d not in plan_set for d in deps):
+            ready.append(p)
+
+    if not ready:
+        # No phase has its deps met yet — this indicates a DAG issue or a phase that
+        # should have been removed from the plan.  Route to synthesis as a safety valve.
+        logger.warning(
+            "phase_scheduler: no phases ready (deps not satisfied) — phases=%s completed=%s",
+            remaining, sorted(completed),
         )
-        return "phase_advance"
-    logger.info("Routing to phase: %s (node: %s)", next_phase, target)
-    return target
+        return "synthesis"
 
+    if len(ready) > 1:
+        logger.info("phase_scheduler: parallel fan-out → %s", ready)
+        return [Send(p, state) for p in ready]
 
-def _causal_analysis_router(state: FinancialAnalysisState):
-    """
-    After causal_analysis: if both sector_analysis and company_analysis are pending,
-    fan them out in parallel via Send(). Otherwise advance sequentially.
-    """
-    phases = state.phases_to_run
-    has_sector = "sector_analysis" in phases
-    has_company = "company_analysis" in phases
-
-    if has_sector and has_company:
-        logger.info("Fanning out sector_analysis + company_analysis in parallel")
-        return [Send("sector_analysis", state), Send("company_analysis", state)]
-
-    logger.info("causal_analysis -> phase_advance (sequential, only one of sector/company in plan)")
-    return "phase_advance"
+    logger.info("phase_scheduler → %s", ready[0])
+    return ready[0]
 
 
 def _build_entity_analysis_state(state: FinancialAnalysisState, entity: str) -> FinancialAnalysisState:
-    """Clone the parent state for one comparative-analysis branch without serializing messages."""
-    return state.model_copy(update={
-        "entity_focus": entity,
-    })
+    """Clone the parent state for one comparative-analysis branch."""
+    return state.model_copy(update={"entity_focus": entity})

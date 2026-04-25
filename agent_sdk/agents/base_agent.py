@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -11,6 +12,60 @@ from ..llm_services.agent_llm import initialize_azure as initialize_agent_azure
 from ..llm_services.summarizer_llm import initialize_azure as initialize_summarizer_azure
 from ..mcp.circuit_breaker import CircuitBreaker
 
+
+class _TTLDict:
+    """Minimal time-based eviction dict. Items expire after ttl seconds of inactivity.
+
+    Used for _session_notepads to prevent unbounded memory growth in long-running
+    agents with many distinct sessions.
+    """
+
+    def __init__(self, ttl: float = 3600.0, maxsize: int = 500) -> None:
+        self._ttl = ttl
+        self._maxsize = maxsize
+        self._data: dict[str, tuple[Any, float]] = {}  # key → (value, last_access)
+
+    def _evict(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, (_, ts) in self._data.items() if (now - ts) > self._ttl]
+        for k in stale:
+            del self._data[k]
+        # Hard cap: evict oldest entries if still over limit
+        if len(self._data) > self._maxsize:
+            by_age = sorted(self._data.items(), key=lambda x: x[1][1])
+            for k, _ in by_age[:len(self._data) - self._maxsize]:
+                del self._data[k]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        entry = self._data.get(key)
+        if entry is None:
+            return default
+        value, _ = entry
+        self._data[key] = (value, time.monotonic())
+        return value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __getitem__(self, key: str) -> Any:
+        result = self.get(key)
+        if result is None and key not in self._data:
+            raise KeyError(key)
+        return result
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._data[key] = (value, time.monotonic())
+        if len(self._data) > self._maxsize * 1.2:
+            self._evict()
+
+    def setdefault(self, key: str, default: Any) -> Any:
+        if key not in self._data:
+            self[key] = default
+        return self.get(key)
+
+    def __delitem__(self, key: str) -> None:
+        del self._data[key]
+
 logger = logging.getLogger("agent_sdk.agent")
 
 # Nodes that produce user-facing LLM output and should be streamed to the client.
@@ -20,25 +75,23 @@ DEFAULT_STREAMING_NODES = frozenset({
 })
 
 # Human-readable labels shown as progress markers while nodes run silently.
-_PHASE_PROGRESS_LABELS: dict[str, str] = {
-    # Memory nodes (both modes)
-    "load_user_context":       "Loading user context...",
-    "memory_writer":           "Saving memory...",
-    # Standard mode
-    "orchestrate":             "Planning approach...",
-    # Financial mode — orchestration
-    "financial_orchestrate":  "🔎 Classifying query & building plan...",
-    # Financial mode — phases (each runs as a compiled phase subgraph)
-    "regime_assessment":      "🌐 Assessing macro regime & market environment...",
-    "causal_analysis":        "🔗 Mapping causal transmission chains...",
-    "sector_analysis":        "📊 Evaluating sector positioning...",
-    "company_analysis":       "🏢 Running fundamental company analysis...",
-    "comparative_analysis":   "⚖️ Running comparative analysis...",
-    "entity_analysis":        "⚖️ Analyzing comparative entities...",
-    "risk_assessment":        "⚠️ Stress-testing scenarios & risks...",
-    # Financial mode — synthesis
-    "synthesis":              "✍️ Synthesizing final report...",
-}
+# Phase labels are derived from PHASE_REGISTRY so they stay in sync automatically.
+def _build_phase_progress_labels() -> dict[str, str]:
+    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
+    labels: dict[str, str] = {
+        "load_user_context":     "Loading user context...",
+        "memory_writer":         "Saving memory...",
+        "orchestrate":           "Planning approach...",
+        "financial_orchestrate": "🔎 Classifying query & building plan...",
+        "comparative_analysis":  "⚖️ Running comparative analysis...",
+    }
+    for phase_def in PHASE_REGISTRY.values():
+        if phase_def.progress_label:
+            labels[phase_def.name] = phase_def.progress_label
+    return labels
+
+
+_PHASE_PROGRESS_LABELS: dict[str, str] = _build_phase_progress_labels()
 
 
 class BaseAgent:
@@ -105,11 +158,13 @@ class BaseAgent:
         self._bound_llm_cache = {}
         # Cache for financial phase tool lists — populated after MCP init, invalidated on reconnect
         self._phase_tools_cache: dict[str, list] = {}
-        # Per-session notepad: session_id → {key: value}. Synced to/from state.session_notepad.
-        self._session_notepads: dict[str, dict] = {}
+        # Per-session notepad with TTL eviction (prevents unbounded growth)
+        self._session_notepads: _TTLDict = _TTLDict(ttl=3600.0, maxsize=500)
         self._notepad_tools = self._build_notepad_tools()
         # Background running_context compression tasks: session_id → asyncio.Task
         self._pending_ctx_compressions: dict[str, asyncio.Task] = {}
+        # Tracked background tasks for graceful shutdown
+        self._background_tasks: set[asyncio.Task] = set()
 
         if mcp_servers:
             # Defer graph creation until MCP tools are discovered
@@ -194,6 +249,28 @@ class BaseAgent:
             return "\n".join(f"• {k}: {v}" for k, v in notepad.items())
 
         return [write_to_notepad, read_notepad]
+
+    def _tracked_task(self, coro) -> asyncio.Task:
+        """Schedule a background coroutine and track it for graceful shutdown."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _wait_background_tasks(self, timeout: float = 10.0) -> None:
+        """Await all pending background tasks before shutdown (best-effort)."""
+        if not self._background_tasks:
+            return
+        logger.info("Waiting for %d background task(s) to complete (timeout=%.0fs)…",
+                    len(self._background_tasks), timeout)
+        pending = list(self._background_tasks)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Background tasks did not finish within %.0fs — proceeding with shutdown", timeout)
 
     def _build_graph(self):
         """Build the appropriate graph based on mode."""

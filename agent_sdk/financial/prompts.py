@@ -6,55 +6,15 @@ system prompt (FINANCIAL_PIPELINE_GUIDANCE in agent-financials/agents/agent.py).
 Each phase_executor receives a short focus hint injected at runtime.
 
 Retained prompts:
-  FINANCIAL_ORCHESTRATE_COMBINED_PROMPT — classify query + build compact phase plan
-  SYNTHESIS_PROMPT — used by synthesis_node (reads running_context)
+  FINANCIAL_ORCHESTRATE_COMBINED_PROMPT — built dynamically from PHASE_REGISTRY
+  SYNTHESIS_PROMPT — used by synthesis_node
   COMPARATIVE_SYNTHESIS_PROMPT — used by synthesis_node for comparative queries
 """
 
-FINANCIAL_ORCHESTRATE_COMBINED_PROMPT = """\
-You are a financial query classifier and analysis orchestrator.
+from agent_sdk.financial.phase_registry import PHASE_REGISTRY, build_orchestrate_prompt
 
-STEP 1 — Classify the query and determine which reasoning phases to activate.
-
-Query types:
-- data_retrieval: Simple data lookups ("What is Reliance's P/E?")
-- company_analysis: Deep single-company analysis ("Should I invest in TCS?")
-- sector_analysis: Sector-level analysis ("How is the banking sector positioned?")
-- macro_impact: Macro event impact ("What happens if RBI hikes rates?")
-- comparative: Peer comparison ("Compare TCS vs Infosys")
-- thematic: Cross-sector themes ("Stocks benefiting from India's capex cycle")
-
-Phase activation rules:
-- data_retrieval: company_analysis + synthesis only
-- macro_impact: FULL pipeline (regime → causal → sector → company → risk → synthesis)
-- company_analysis: company + risk + synthesis (optionally sector)
-- sector_analysis: sector + risk + synthesis (optionally regime)
-- comparative: comparative_analysis + synthesis
-- thematic: regime + sector + company + synthesis
-
-STEP 2 — For each activated phase write ONE terse line:
-  <phase_name>: <tool1(specific_args)> → <tool2>, <tool3(specific_args)>
-
-Rules: tool names + entity-specific args only; no prose; NSE suffix (.NS) for Indian stocks.
-Available tools by phase:
-- regime_assessment: get_regime_inputs → detect_market_regime, get_fii_dii_flows, tavily_quick_search
-- causal_analysis: traverse_causal_chain, get_affected_entities, get_transmission_path, run_scenario_simulation, tavily_quick_search
-- sector_analysis: get_fii_dii_flows, get_sector_norms, interpret_metric, tavily_quick_search
-- company_analysis: get_ticker_data, get_bse_nse_reports, get_price_series → calculate_technical_signals/calculate_risk_metrics, get_dcf_inputs → run_dcf, get_comparable_metrics → run_comparable_valuation, interpret_metric, tavily_quick_search
-- risk_assessment: get_price_series → calculate_risk_metrics/calculate_technical_signals, run_scenario_simulation, tavily_quick_search
-
-OUTPUT: A single JSON object with exactly these fields:
-{{
-  "query_type": "<type>",
-  "entities": ["<tickers/sectors/indicators>"],
-  "requires_regime_assessment": true/false,
-  "requires_causal_analysis": true/false,
-  "requires_sector_analysis": true/false,
-  "requires_company_analysis": true/false,
-  "requires_risk_assessment": true/false,
-  "plan": "<one line per active phase>"
-}}
-"""
+# Built once at import time from the registry so tool hints never drift.
+FINANCIAL_ORCHESTRATE_COMBINED_PROMPT = build_orchestrate_prompt(PHASE_REGISTRY)
 
 SYNTHESIS_PROMPT = """\
 You are a Lead Financial Analyst and Investing Mentor. Your audience is someone who may have

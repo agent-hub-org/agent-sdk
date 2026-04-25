@@ -168,6 +168,20 @@ class ResearchState(AgentState):
     )
 
 
+class PhaseOutput(BaseModel):
+    """Typed handoff from one financial pipeline phase to subsequent phases."""
+
+    findings: str = Field(default="", description="Full prose findings from the phase.")
+    key_facts: list[str] = Field(
+        default_factory=list,
+        description="Bullet-point key facts extracted for quick synthesis consumption.",
+    )
+    confidence: float = Field(
+        default=1.0, ge=0.0, le=1.0,
+        description="0.0 = phase failed/degraded, 1.0 = full success.",
+    )
+
+
 class FinancialAnalysisState(AgentState):
     """
     Extended state for the financial reasoning cognitive pipeline.
@@ -222,6 +236,16 @@ class FinancialAnalysisState(AgentState):
     entity_focus: Optional[str] = Field(
         default=None,
         description="When running comparative analysis, the single entity this branch analyzes.",
+    )
+
+    # Typed per-phase outputs — keyed by phase name.
+    # merge_dicts reducer allows parallel phases to write to different keys safely.
+    phase_outputs: Annotated[Dict[str, PhaseOutput], merge_dicts] = Field(
+        default_factory=dict,
+        description=(
+            "Structured findings from each completed phase. Keyed by phase name. "
+            "Used by phase_scheduler (dependency resolution) and synthesis_node."
+        ),
     )
 
 
@@ -305,4 +329,35 @@ class PhaseSubgraphState(BaseModel):
     tool_calls_log: Annotated[list[dict], operator.add] = Field(
         default_factory=list,
         description="Tool execution log accumulated inside the phase subgraph.",
+    )
+
+    # --- Context Window Management (Phase 3) ---
+    # Stable background: summary of prior phases, set once in phase_init, never mutated.
+    prior_phases_summary: str = Field(
+        default="",
+        description=(
+            "Condensed summary of prior phase key_facts, injected once at phase_init. "
+            "Kept as a separate field so phase_system_text stays at a fixed size."
+        ),
+    )
+    # Rolling window of current-phase tool results (max 5, each capped at 1600 chars).
+    local_findings_window: list[str] = Field(
+        default_factory=list,
+        description="Sliding window of the most recent tool result strings for this phase.",
+    )
+    # Rendered local context section — rebuilt after each tool batch, injected as HumanMessage prefix.
+    local_context_section: str = Field(
+        default="",
+        description="Current phase's rolling tool results formatted for LLM injection.",
+    )
+    # Whether phase_system_text has been initialised (stable) and should no longer be rebuilt.
+    phase_system_stable: bool = Field(
+        default=False,
+        description="True after phase_init sets the stable system text.",
+    )
+
+    # Propagated from parent's phase_outputs for computing prior_phases_summary
+    parent_phase_outputs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Parent phase_outputs dict, used in phase_init to compute prior_phases_summary.",
     )

@@ -26,13 +26,19 @@ _STREAMABLE_HTTP_TRANSPORTS = frozenset({"streamable_http", "streamable-http", "
 
 
 class MCPConnectionManager:
-    """Manages persistent MCP sessions with automatic reconnection on failure."""
+    """Manages persistent MCP sessions with automatic reconnection on failure.
+
+    Per-server independent retry: if one server fails to connect, tools from the
+    other servers are still available.  The failed servers are tracked so that
+    reconnect() only retries those, not already-healthy servers.
+    """
 
     def __init__(self):
         self._client: MultiServerMCPClient | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._server_configs: dict[str, dict[str, Any]] | None = None
         self._tools: list[BaseTool] = []
+        self._failed_servers: set[str] = set()
         self._reconnect_lock = asyncio.Lock()
 
     async def connect(self, server_configs: dict[str, dict[str, Any]]) -> list[BaseTool]:
@@ -49,19 +55,26 @@ class MCPConnectionManager:
         return await self._establish_sessions()
 
     async def _establish_sessions(self) -> list[BaseTool]:
-        """Create persistent sessions for all configured MCP servers in parallel."""
+        """Create persistent sessions for all configured MCP servers in parallel.
+
+        Per-server independent retry: each server is attempted independently.
+        A failure on one server does not block tools from healthy servers from being
+        returned.  Failed servers are recorded in self._failed_servers.
+        """
         server_configs = self._server_configs
         logger.info("Connecting to %d MCP server(s) in parallel: %s", len(server_configs), list(server_configs.keys()))
 
-        max_retries = settings.mcp_max_retries
-        for attempt in range(1, max_retries + 1):
-            try:
-                self._client = MultiServerMCPClient(server_configs)
-                self._exit_stack = AsyncExitStack()
-                await self._exit_stack.__aenter__()
+        self._client = MultiServerMCPClient(server_configs)
+        self._exit_stack = AsyncExitStack()
+        await self._exit_stack.__aenter__()
+        self._failed_servers = set()
 
-                async def _connect_one_server(server_name: str, config: dict[str, Any]) -> list[BaseTool]:
-                    """Connect to a single MCP server and return its tools."""
+        max_retries = settings.mcp_max_retries
+
+        async def _connect_one_server_with_retry(server_name: str, config: dict[str, Any]) -> list[BaseTool]:
+            """Connect to a single MCP server with per-server retries."""
+            for attempt in range(1, max_retries + 1):
+                try:
                     transport = config.get("transport", "")
                     if transport in _STREAMABLE_HTTP_TRANSPORTS:
                         session = await self._create_streamable_http_session(config)
@@ -72,26 +85,34 @@ class MCPConnectionManager:
                     tools = await load_mcp_tools(session=session)
                     logger.info("Opened persistent session for '%s' — %d tool(s)", server_name, len(tools))
                     return tools
+                except Exception as e:
+                    if attempt < max_retries:
+                        delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0, 1))
+                        logger.warning(
+                            "MCP server '%s' attempt %d/%d failed: %s — retrying in %.2fs",
+                            server_name, attempt, max_retries, e, delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "MCP server '%s' failed after %d attempts — running without it: %s",
+                            server_name, max_retries, e,
+                        )
+                        self._failed_servers.add(server_name)
+                        return []  # Partial degradation: return empty list, not exception
 
-                tool_lists = await asyncio.gather(
-                    *[_connect_one_server(name, cfg) for name, cfg in server_configs.items()]
-                )
-                all_tools: list[BaseTool] = list(itertools.chain.from_iterable(tool_lists))
+        results = await asyncio.gather(
+            *[_connect_one_server_with_retry(name, cfg) for name, cfg in server_configs.items()],
+            return_exceptions=False,  # exceptions already handled per-server above
+        )
+        all_tools: list[BaseTool] = list(itertools.chain.from_iterable(r for r in results if r))
 
-                logger.info("Discovered %d tool(s) with persistent sessions: %s",
-                             len(all_tools), [t.name for t in all_tools])
-                self._tools = all_tools
-                return all_tools
-            except Exception as e:
-                await self._cleanup()
-                if attempt < max_retries:
-                    delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0, 1))
-                    logger.warning("MCP connection attempt %d/%d failed: %s — retrying in %.2fs",
-                                   attempt, max_retries, e, delay)
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("MCP connection failed after %d attempts: %s", max_retries, e)
-                    raise
+        if self._failed_servers:
+            logger.warning("Running in PARTIAL-DEGRADED mode — failed servers: %s", self._failed_servers)
+        logger.info("Discovered %d tool(s) with persistent sessions: %s",
+                     len(all_tools), [t.name for t in all_tools])
+        self._tools = all_tools
+        return all_tools
 
     async def _create_streamable_http_session(self, config: dict[str, Any]) -> ClientSession:
         """Create a session using the non-deprecated streamable_http_client API."""
@@ -119,7 +140,11 @@ class MCPConnectionManager:
         return session
 
     async def reconnect(self) -> list[BaseTool]:
-        """Re-establish MCP sessions after a failure. Thread-safe via lock."""
+        """Re-establish MCP sessions after a failure. Thread-safe via lock.
+
+        Reconnects ALL servers (not just failed ones), since a session error
+        may have invalidated previously healthy sessions too.
+        """
         async with self._reconnect_lock:
             if self._server_configs is None:
                 raise RuntimeError("Cannot reconnect — no server configs stored. Call connect() first.")

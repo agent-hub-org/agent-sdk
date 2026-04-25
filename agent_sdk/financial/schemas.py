@@ -31,11 +31,9 @@ class QueryClassification(BaseModel):
     """Output of the query classifier — determines pipeline routing."""
     query_type: QueryType
     entities: list[str] = Field(default_factory=list, description="Tickers, sectors, or macro indicators mentioned")
-    requires_regime_assessment: bool = False
-    requires_causal_analysis: bool = False
-    requires_sector_analysis: bool = False
-    requires_company_analysis: bool = False
-    requires_risk_assessment: bool = True
+    # Ordered list of phases to run (synthesis always appended automatically).
+    # Replaces the individual requires_X_assessment booleans.
+    phases: list[str] = Field(default_factory=list, description="Ordered phase names to execute")
     reasoning: str = Field(default="", description="Brief explanation of classification")
 
 
