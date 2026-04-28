@@ -1,6 +1,7 @@
 """FastAPI app factory — shared CORS / middleware setup for all agents."""
 import os
-from collections.abc import AsyncContextManager, Callable
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,7 @@ from agent_sdk.server.error_handlers import register_error_handlers
 
 def create_agent_app(
     title: str,
-    lifespan: AsyncContextManager,
+    lifespan: AbstractAsyncContextManager,
     key_func: Callable | None = None,
 ) -> tuple[FastAPI, Limiter]:
     """Create a FastAPI app with all standard agent middleware pre-configured.
