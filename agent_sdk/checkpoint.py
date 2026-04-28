@@ -353,3 +353,24 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
         """Async thread deletion using native pymongo async driver."""
         await self._async_checkpoints.delete_many({"thread_id": thread_id})
         await self._async_writes.delete_many({"thread_id": thread_id})
+
+
+import os as _os
+
+_default_checkpointer: "AsyncMongoDBSaver | None" = None
+
+
+def get_default_checkpointer(db_name: str | None = None) -> "AsyncMongoDBSaver":
+    """Return (or create) the process-wide default checkpointer.
+
+    Reads MONGO_URI, MONGO_DB_NAME, and CHECKPOINT_TTL_SECONDS from env.
+    Pass db_name to override MONGO_DB_NAME for the calling agent.
+    """
+    global _default_checkpointer
+    if _default_checkpointer is None:
+        _default_checkpointer = AsyncMongoDBSaver.from_conn_string(
+            conn_string=_os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+            db_name=db_name or _os.getenv("MONGO_DB_NAME", "checkpointing_db"),
+            ttl=int(_os.getenv("CHECKPOINT_TTL_SECONDS", str(7 * 24 * 3600))),
+        )
+    return _default_checkpointer

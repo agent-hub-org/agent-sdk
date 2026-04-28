@@ -106,3 +106,8 @@ class StreamingMathFixer:
     def steps(self):
         """Delegate .steps access to the underlying stream (used by save hooks)."""
         return self._source.steps
+
+    @property
+    def plan(self):
+        """Delegate .plan access to the underlying stream (used by save hooks)."""
+        return getattr(self._source, "plan", None)

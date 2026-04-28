@@ -48,10 +48,13 @@ class _TTLDict:
         return key in self._data
 
     def __getitem__(self, key: str) -> Any:
-        result = self.get(key)
-        if result is None and key not in self._data:
+        _MISSING = object()
+        entry = self._data.get(key, _MISSING)
+        if entry is _MISSING:
             raise KeyError(key)
-        return result
+        value, _ = entry
+        self._data[key] = (value, time.monotonic())
+        return value
 
     def __setitem__(self, key: str, value: Any) -> None:
         self._data[key] = (value, time.monotonic())
@@ -174,9 +177,7 @@ class BaseAgent:
             
             # Eager MCP init via background task if an event loop is running
             try:
-                import asyncio
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._ensure_initialized())
+                asyncio.create_task(self._ensure_initialized())
             except RuntimeError:
                 pass
         else:

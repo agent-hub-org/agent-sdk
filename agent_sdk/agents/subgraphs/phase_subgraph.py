@@ -10,19 +10,16 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timezone
 from functools import partial
 from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from agent_sdk.agents.nodes import (
-    _execute_tool_calls,
-    _get_phase_llm,
-    _get_phase_tools,
-    _invoke_with_retry,
-)
+from agent_sdk.agents.nodes import _execute_tool_calls
+from agent_sdk.agents.llm_utils import invoke_with_retry as _invoke_with_retry
+from agent_sdk.financial.phase_helpers import get_phase_llm as _get_phase_llm, get_phase_tools as _get_phase_tools
+from agent_sdk.financial.utils import format_date_context as _format_date_context
 from agent_sdk.agents.state import FinancialAnalysisState, PhaseSubgraphState
 from agent_sdk.metrics import llm_call_duration
 
@@ -101,19 +98,7 @@ def _build_phase_system_text(
         f"Call the tools needed for this phase. Stop when this phase section is complete."
     )
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if as_of_date:
-        year = as_of_date[:4]
-        date_context = (
-            f"\n\nTODAY'S DATE: {today}. HISTORICAL REFERENCE DATE: {as_of_date}\n"
-            f"Always include the historical year ({year}) in search queries."
-        )
-    else:
-        year = datetime.now(timezone.utc).year
-        date_context = (
-            f"\n\nTODAY'S DATE: {today}\n"
-            f"Always include the current year ({year}) in search queries for up-to-date results."
-        )
+    date_context = _format_date_context(as_of_date)
 
     extra_sections: list[str] = []
     if phase_plan:
