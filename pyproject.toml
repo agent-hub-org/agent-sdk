@@ -10,27 +10,27 @@ requires-python = ">=3.13,<4.0"
 dependencies = [
     "langchain (>=1.2.12,<2.0.0)",
     "langgraph (>=1.0.10,<2.0.0)",
-    "fastapi (>=0.135.1,<0.136.0)",
+    "fastapi (>=0.136.0,<1.0.0)",
     "python-dotenv (>=1.2.2,<2.0.0)",
     "openai (>=2.24.0,<3.0.0)",
     "pydantic (>=2.12.5,<4.0.0)",
     "pydantic-settings (>=2.0.0,<4.0.0)",
     "langchain-openai (>=0.3.0,<1.0.0)",
-    "langchain-mcp-adapters (>=0.1.0,<0.3.0)",
+    "langchain-mcp-adapters (>=0.2.2,<0.3.0)",
     "networkx (>=3.0,<4.0.0)",
     "prometheus-client (>=0.20.0,<1.0.0)",
     "motor (>=3.6.0,<4.0.0)",
     "pymongo (>=4.10.0,<5.0.0)",
     "httpx (>=0.28.0,<1.0.0)",
     "pinecone (>=8.1.0,<9.0.0)",
-    "a2a-sdk (>=0.2.0,<0.4.0)",
-    "python-jose (>=3.3.0,<4.0.0)",
+    "a2a-sdk (>=1.0.0,<2.0.0)",
+    "PyJWT[crypto] (>=2.10.0,<3.0.0)",
     "starlette (>=0.45.0,<1.0.0)",
 ]
 
 [project.optional-dependencies]
 memory = [
-    "mem0ai (>=0.1.0,<1.0.0)",
+    "mem0ai (>=1.0.5,<2.0.0)",
 ]
 akv = [
     "azure-keyvault-secrets (>=4.8.0,<5)",
@@ -39,7 +39,7 @@ akv = [
 redis = ["redis[hiredis] (>=5.2.0,<6)"]
 sentry = ["sentry-sdk[fastapi] (>=2.16.0,<3)"]
 all = [
-    "mem0ai (>=0.1.0,<1.0.0)",
+    "mem0ai (>=1.0.5,<2.0.0)",
     "azure-keyvault-secrets (>=4.8.0,<5)",
     "azure-identity (>=1.17.0,<2)",
     "redis[hiredis] (>=5.2.0,<6)",

@@ -18,8 +18,10 @@ import os
 import time
 from typing import Optional
 
+import jwt as _jwt
+from jwt.algorithms import RSAAlgorithm
+from jwt.exceptions import PyJWTError
 import httpx
-from jose import jwt as _jwt, JWTError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
@@ -45,17 +47,35 @@ async def _get_jwks(keycloak_url: str, realm: str) -> dict:
     return _jwks_cache
 
 
+def _get_signing_key(jwks: dict, token: str):
+    """Extract the RSA public key matching the token's kid claim from a JWKS dict."""
+    try:
+        header = _jwt.get_unverified_header(token)
+        kid = header.get("kid")
+    except _jwt.exceptions.DecodeError:
+        return None
+    keys = jwks.get("keys", [])
+    # Prefer the key whose kid matches; fall back to first key if no kid in token.
+    matched = next((k for k in keys if k.get("kid") == kid), None) or (keys[0] if keys else None)
+    if matched is None:
+        return None
+    return RSAAlgorithm.from_jwk(matched)
+
+
 def _extract_user_id(token: str, jwks: dict, audience: Optional[str]) -> Optional[str]:
     try:
+        public_key = _get_signing_key(jwks, token)
+        if public_key is None:
+            return None
         payload = _jwt.decode(
             token,
-            jwks,
+            public_key,
             algorithms=["RS256"],
             audience=audience,
             options={"verify_aud": bool(audience)},
         )
         return payload.get("sub") or None
-    except JWTError:
+    except PyJWTError:
         return None
 
 

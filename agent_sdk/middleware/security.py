@@ -2,7 +2,8 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from jose import JWTError, ExpiredSignatureError, jwt as _jwt
+import jwt as _jwt
+from jwt.exceptions import DecodeError as JWTError, ExpiredSignatureError
 from fastapi import Request, HTTPException, status
 
 logger = logging.getLogger("agent_sdk.security")

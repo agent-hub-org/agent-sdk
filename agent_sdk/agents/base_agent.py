@@ -236,7 +236,11 @@ class BaseAgent:
             'target_ticker', 'completed_dcf')."""
             from agent_sdk.agents.nodes import _current_session_id
             session_id = _current_session_id.get()
-            agent_ref._session_notepads.setdefault(session_id, {})[key] = value
+            if session_id is None:
+                return "Error: session context not set — cannot write to notepad."
+            notepad = agent_ref._session_notepads.get(session_id, {})
+            notepad[key] = value
+            agent_ref._session_notepads[session_id] = notepad  # always write back to refresh TTL
             return f"Noted: {key} = {value}"
 
         @lc_tool
@@ -244,6 +248,8 @@ class BaseAgent:
             """Read all entries saved to the session notepad from earlier in this conversation."""
             from agent_sdk.agents.nodes import _current_session_id
             session_id = _current_session_id.get()
+            if session_id is None:
+                return "Session notepad is empty."
             notepad = agent_ref._session_notepads.get(session_id, {})
             if not notepad:
                 return "Session notepad is empty."
@@ -329,9 +335,9 @@ class BaseAgent:
                     )
                     self._degraded = True
 
-        self.graph = self._build_graph()
-        self._initialized = True
-        logger.info("BaseAgent graph built with %d tool(s) (mode=%s)", len(self.tools), self.mode)
+            self.graph = self._build_graph()
+            self._initialized = True
+            logger.info("BaseAgent graph built with %d tool(s) (mode=%s)", len(self.tools), self.mode)
 
     async def _disconnect_mcp(self):
         """Cleanly shut down MCP connections."""
