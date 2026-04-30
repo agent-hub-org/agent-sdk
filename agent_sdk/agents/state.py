@@ -182,6 +182,11 @@ class PhaseOutput(BaseModel):
     )
 
 
+def _union_sets(a: set | None, b: set | None) -> set:
+    """Reducer for set-typed state fields: merges two sets via union (safe for parallel fan-out)."""
+    return (a or set()) | (b or set())
+
+
 class FinancialAnalysisState(AgentState):
     """
     Extended state for the financial reasoning cognitive pipeline.
@@ -238,14 +243,30 @@ class FinancialAnalysisState(AgentState):
         description="When running comparative analysis, the single entity this branch analyzes.",
     )
 
-    # Typed per-phase outputs — keyed by phase name.
-    # merge_dicts reducer allows parallel phases to write to different keys safely.
-    phase_outputs: Annotated[Dict[str, PhaseOutput], merge_dicts] = Field(
-        default_factory=dict,
-        description=(
-            "Structured findings from each completed phase. Keyed by phase name. "
-            "Used by phase_scheduler (dependency resolution) and synthesis_node."
-        ),
+    # --- Workspace / Sub-agent routing fields ---
+    workspace_id: str = Field(
+        default="",
+        description="Unique identifier for the WorkspaceStore entry backing this request.",
+    )
+    current_template: str = Field(
+        default="",
+        description="Routing template name selected for this request (e.g. 'company_deep_dive').",
+    )
+    workspace_populated: Annotated[set[str], _union_sets] = Field(
+        default_factory=set,
+        description="Set of workspace keys already written by sub-agents (union-reduced across parallel writes).",
+    )
+    agents_completed: Annotated[set[str], _union_sets] = Field(
+        default_factory=set,
+        description="Set of sub-agent names that have finished execution (union-reduced).",
+    )
+    has_holdings: bool = Field(
+        default=False,
+        description="Routing condition: True when user has explicit portfolio/holdings context.",
+    )
+    knowledge_level: str = Field(
+        default="expert",
+        description="Routing condition: user's financial knowledge level (e.g. 'expert', 'beginner').",
     )
 
 
