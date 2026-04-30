@@ -43,7 +43,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 _DEFAULT_PUBLIC_PATHS: frozenset[str] = frozenset({
-    "/health", "/metrics", "/docs", "/openapi.json", "/a2a/.well-known/agent.json",
+    "/health", "/metrics", "/docs", "/openapi.json", "/a2a/.well-known/agent-card.json",
 })
 
 
