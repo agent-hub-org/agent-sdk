@@ -22,7 +22,7 @@ import os
 
 from starlette.applications import Starlette
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes import create_agent_card_routes, create_rest_routes
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 
 from agent_sdk.a2a.server.mongodb_task_store import AsyncMongoDBTaskStore
 
@@ -61,7 +61,7 @@ def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> _A2AApp:
         task_store=task_store,
         agent_card=agent_card,
     )
-    routes = create_agent_card_routes(agent_card) + create_rest_routes(request_handler)
+    routes = create_agent_card_routes(agent_card) + create_jsonrpc_routes(request_handler, rpc_url="/")
     app = _A2AApp(routes=routes)
     logger.info("A2A application created (db='%s')", db_name)
     return app

@@ -1,9 +1,9 @@
 import logging
-from typing import Any, Optional
 
 from a2a.server.context import ServerCallContext
 from a2a.server.tasks import TaskStore
 from a2a.types import Task
+from a2a.types.a2a_pb2 import ListTasksRequest, ListTasksResponse
 from google.protobuf.json_format import MessageToDict, ParseDict
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -38,7 +38,6 @@ class AsyncMongoDBTaskStore(TaskStore):
     async def get(
         self, task_id: str, context: ServerCallContext | None = None
     ) -> Task | None:
-        """Retrieve a task from MongoDB."""
         doc = await self._collection.find_one({"task_id": task_id})
         if doc and (task_data := doc.get("task_data")):
             return ParseDict(task_data, Task())
@@ -47,7 +46,6 @@ class AsyncMongoDBTaskStore(TaskStore):
     async def save(
         self, task: Task, context: ServerCallContext | None = None
     ) -> None:
-        """Save or update a task in MongoDB."""
         await self._collection.update_one(
             {"task_id": task.id},
             {"$set": {"task_id": task.id, "task_data": MessageToDict(task)}},
@@ -57,9 +55,25 @@ class AsyncMongoDBTaskStore(TaskStore):
     async def delete(
         self, task_id: str, context: ServerCallContext | None = None
     ) -> None:
-        """Remove a task from MongoDB."""
         await self._collection.delete_one({"task_id": task_id})
 
+    async def list(
+        self,
+        params: ListTasksRequest,
+        context: ServerCallContext | None = None,
+    ) -> ListTasksResponse:
+        query: dict = {}
+        if params.context_id:
+            query["task_data.contextId"] = params.context_id
+
+        page_size = params.page_size or 50
+        cursor = self._collection.find(query).limit(page_size)
+        tasks = []
+        async for doc in cursor:
+            if task_data := doc.get("task_data"):
+                tasks.append(ParseDict(task_data, Task()))
+
+        return ListTasksResponse(tasks=tasks)
+
     async def close(self):
-        """Close the MongoDB client connection."""
         self._client.close()
