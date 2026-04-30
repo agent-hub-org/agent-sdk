@@ -51,8 +51,7 @@ class BaseAgentExecutor(AgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
-                    status=TaskStatus(state=TaskState.failed),
+                    status=TaskStatus(state=TaskState.TASK_STATE_FAILED),
                 )
             )
             return
@@ -84,8 +83,7 @@ class BaseAgentExecutor(AgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
-                    status=TaskStatus(state=TaskState.completed),
+                    status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
                 )
             )
         except Exception as e:
@@ -101,12 +99,11 @@ class BaseAgentExecutor(AgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
                     status=TaskStatus(
-                        state=TaskState.failed,
+                        state=TaskState.TASK_STATE_FAILED,
                         message=Message(
                             message_id=f"error-{context.task_id}",
-                            role=Role.agent,
+                            role=Role.ROLE_AGENT,
                             parts=[Part(text=error_text)],
                         ),
                     ),
@@ -148,8 +145,7 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
-                    status=TaskStatus(state=TaskState.failed),
+                    status=TaskStatus(state=TaskState.TASK_STATE_FAILED),
                 )
             )
             return
@@ -193,8 +189,7 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
-                    status=TaskStatus(state=TaskState.completed),
+                    status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
                 )
             )
         except Exception as e:
@@ -203,12 +198,11 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                 TaskStatusUpdateEvent(
                     task_id=context.task_id,
                     context_id=context.context_id,
-                    final=True,
                     status=TaskStatus(
-                        state=TaskState.failed,
+                        state=TaskState.TASK_STATE_FAILED,
                         message=Message(
                             message_id=f"error-{context.task_id}",
-                            role=Role.agent,
+                            role=Role.ROLE_AGENT,
                             parts=[Part(text=str(e))],
                         ),
                     ),

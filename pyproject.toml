@@ -1,6 +1,6 @@
 [project]
 name = "agent-sdk"
-version = "0.2.0"
+version = "0.2.1"
 description = "Shared SDK for agent-hub multi-agent system"
 authors = [
     {name = "Pranjal Verma",email = "pranjalv23@users.noreply.github.com"}

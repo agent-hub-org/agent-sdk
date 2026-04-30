@@ -4,6 +4,7 @@ from typing import Any, Optional
 from a2a.server.context import ServerCallContext
 from a2a.server.tasks import TaskStore
 from a2a.types import Task
+from google.protobuf.json_format import MessageToDict, ParseDict
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger("agent_sdk.a2a.mongodb_task_store")
@@ -40,7 +41,7 @@ class AsyncMongoDBTaskStore(TaskStore):
         """Retrieve a task from MongoDB."""
         doc = await self._collection.find_one({"task_id": task_id})
         if doc and (task_data := doc.get("task_data")):
-            return Task.model_validate(task_data)
+            return ParseDict(task_data, Task())
         return None
 
     async def save(
@@ -49,7 +50,7 @@ class AsyncMongoDBTaskStore(TaskStore):
         """Save or update a task in MongoDB."""
         await self._collection.update_one(
             {"task_id": task.id},
-            {"$set": {"task_id": task.id, "task_data": task.model_dump()}},
+            {"$set": {"task_id": task.id, "task_data": MessageToDict(task)}},
             upsert=True,
         )
 

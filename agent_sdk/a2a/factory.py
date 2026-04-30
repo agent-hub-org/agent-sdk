@@ -20,15 +20,23 @@ Usage::
 import logging
 import os
 
-from a2a.server.apps import A2AStarletteApplication
+from starlette.applications import Starlette
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_rest_routes
 
 from agent_sdk.a2a.server.mongodb_task_store import AsyncMongoDBTaskStore
 
 logger = logging.getLogger("agent_sdk.a2a.factory")
 
 
-def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> A2AStarletteApplication:
+class _A2AApp(Starlette):
+    """Starlette app that exposes .build() for backward compat with agent app.py files."""
+
+    def build(self) -> Starlette:
+        return self
+
+
+def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> _A2AApp:
     """Build an A2A Starlette application for the given agent.
 
     Args:
@@ -38,7 +46,7 @@ def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> A2AStarlette
             ``MONGO_DB_NAME`` env var).
 
     Returns:
-        A configured :class:`A2AStarletteApplication` ready for mounting.
+        A configured :class:`_A2AApp` (Starlette subclass) ready for mounting.
     """
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     db_name = os.getenv("MONGO_DB_NAME", mongo_db_name)
@@ -51,10 +59,9 @@ def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> A2AStarlette
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=task_store,
-    )
-    a2a_app = A2AStarletteApplication(
         agent_card=agent_card,
-        http_handler=request_handler,
     )
+    routes = create_agent_card_routes(agent_card) + create_rest_routes(request_handler)
+    app = _A2AApp(routes=routes)
     logger.info("A2A application created (db='%s')", db_name)
-    return a2a_app
+    return app
