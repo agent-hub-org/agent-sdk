@@ -14,7 +14,6 @@ from a2a.types import (
     TaskState,
     TaskStatus,
     TaskStatusUpdateEvent,
-    TextPart,
     UnsupportedOperationError,
 )
 
@@ -76,7 +75,7 @@ class BaseAgentExecutor(AgentExecutor):
                     context_id=context.context_id,
                     artifact=Artifact(
                         artifact_id=f"artifact-{context.task_id}",
-                        parts=[Part(root=TextPart(text=response_text))],
+                        parts=[Part(text=response_text)],
                     ),
                     last_chunk=True,
                 )
@@ -108,7 +107,7 @@ class BaseAgentExecutor(AgentExecutor):
                         message=Message(
                             message_id=f"error-{context.task_id}",
                             role=Role.agent,
-                            parts=[Part(root=TextPart(text=error_text))],
+                            parts=[Part(text=error_text)],
                         ),
                     ),
                 )
@@ -172,7 +171,7 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                         context_id=context.context_id,
                         artifact=Artifact(
                             artifact_id=artifact_id,
-                            parts=[Part(root=TextPart(text=chunk))],
+                            parts=[Part(text=chunk)],
                         ),
                         last_chunk=False,
                     )
@@ -185,7 +184,7 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                     context_id=context.context_id,
                     artifact=Artifact(
                         artifact_id=artifact_id,
-                        parts=[Part(root=TextPart(text=""))],
+                        parts=[Part(text="")],
                     ),
                     last_chunk=True,
                 )
@@ -210,7 +209,7 @@ class StreamingAgentExecutor(BaseAgentExecutor):
                         message=Message(
                             message_id=f"error-{context.task_id}",
                             role=Role.agent,
-                            parts=[Part(root=TextPart(text=str(e)))],
+                            parts=[Part(text=str(e))],
                         ),
                     ),
                 )
