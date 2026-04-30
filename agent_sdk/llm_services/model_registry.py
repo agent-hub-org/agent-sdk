@@ -40,6 +40,13 @@ MODEL_CATALOG = {
         "label": "GPT-5.4 nano",
     },
 
+    # Azure AI Foundry — GPT-5.4 mini (for Orchestrator, Synthesis, Jargon Simplifier)
+    "azure/gpt-5.4-mini": {
+        "provider": "Azure AI Foundry",
+        "model": "gpt-5.4-mini",
+        "label": "GPT-5.4 mini",
+    },
+
     # Azure AI Foundry — GPT-OSS-120B (Apache 2.0, o4-mini-level claims)
     # NOTE: Tool calling may 400 due to Harmony format incompatibility with LangChain
     # (GitHub issues #32425, #32885, #34751). Works for non-tool conversational turns.

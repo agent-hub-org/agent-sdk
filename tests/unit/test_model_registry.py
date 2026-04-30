@@ -75,3 +75,9 @@ def test_list_models_no_spurious_warning():
     from agent_sdk.llm_services.model_registry import list_models
     models = {m["id"]: m for m in list_models()}
     assert "warning" not in models.get("azure/gpt-5-nano", {})
+
+
+def test_gpt_5_4_mini_in_catalog():
+    from agent_sdk.llm_services.model_registry import MODEL_CATALOG
+    assert "azure/gpt-5.4-mini" in MODEL_CATALOG
+    assert MODEL_CATALOG["azure/gpt-5.4-mini"]["model"] == "gpt-5.4-mini"
