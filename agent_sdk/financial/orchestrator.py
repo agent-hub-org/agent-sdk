@@ -1,16 +1,51 @@
-"""Financial query orchestration: combined classify-and-plan LLM call."""
+"""Financial query orchestration: template-router LLM call."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import uuid as _uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent_sdk.agents.llm_utils import invoke_with_retry
-from agent_sdk.financial.phase_helpers import get_phase_llm
 
 logger = logging.getLogger("agent_sdk.financial.orchestrator")
+
+_VALID_TEMPLATES = {
+    "educational", "company_snapshot", "price_and_charts", "news_query",
+    "fundamentals", "valuation", "general_analysis", "sector_overview",
+    "macro_query", "risk_deep_dive", "portfolio_review", "comparative",
+    "buy_decision",
+}
+
+_ORCHESTRATOR_SYSTEM = """\
+You are a financial query router. Classify the user's query into exactly one routing template.
+
+Templates:
+- educational: purely conceptual questions (what is X, how does Y work)
+- company_snapshot: simple company description questions
+- price_and_charts: price level, technical chart, 52-week range questions
+- news_query: recent news or developments for a company
+- fundamentals: financial statements, revenue, earnings data
+- valuation: fair value, DCF, overvalued/undervalued questions
+- general_analysis: ambiguous "tell me about X" questions
+- sector_overview: sector-level outlook without a specific company
+- macro_query: macro topics (interest rates, FII flows, market regime) without a company
+- risk_deep_dive: risk, downside, stress-test questions for a company
+- portfolio_review: portfolio fit, holdings analysis
+- comparative: comparing two or more companies
+- buy_decision: buy/sell/invest recommendation requests
+
+Output ONLY valid JSON (no markdown fence):
+{"template_name": "<one of the above>", "entities": ["<ticker_or_company>", ...], "as_of_date": "<YYYY-MM-DD or null>"}
+"""
+
+
+def _get_orchestrator_llm(agent):
+    from agent_sdk.llm_services.model_registry import get_llm
+    return get_llm("azure/gpt-5.4-mini")
 
 _JSON_FENCE_PATTERN = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
 
@@ -143,83 +178,40 @@ def _strip_context_block(text: str) -> str:
 
 
 async def financial_orchestrate(agent, state) -> dict:
-    """Classify the query and build a tool-specific plan in a single LLM call."""
-    from agent_sdk.financial.prompts import FINANCIAL_ORCHESTRATE_COMBINED_PROMPT
-    from agent_sdk.financial.schemas import QueryClassification, QueryType
-    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
+    """Route the query to a template and assign a workspace_id."""
+    messages = state["messages"] if isinstance(state, dict) else state.messages
+    last_human = next(
+        (m for m in reversed(messages) if hasattr(m, "type") and m.type == "human"),
+        None,
+    )
+    query = last_human.content if last_human else ""
 
-    logger.info("Classifying query and building plan for financial reasoning pipeline")
-    llm = get_phase_llm(agent, state)
-
-    user_query = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            user_query = msg.content
-            break
-
-    clean_query = _strip_context_block(user_query)
-
-    recent_context: list[str] = []
-    for msg in state.messages[:-1]:
-        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None) and msg.content:
-            recent_context.append(f"Assistant: {msg.content}")
-        elif isinstance(msg, HumanMessage):
-            content = _strip_context_block(msg.content)
-            if content:
-                recent_context.append(f"User: {content}")
-    recent_context = recent_context[-4:]
-
-    if recent_context:
-        user_content = f"Recent conversation:\n{chr(10).join(recent_context)}\n\nQuery: {clean_query}"
-    else:
-        user_content = f"Query: {clean_query}"
-
-    _valid_phases = set(PHASE_REGISTRY.keys()) | {"comparative_analysis"}
-    _default_qc = QueryClassification(
-        query_type=QueryType.DATA_RETRIEVAL,
-        phases=["company_analysis"],
-        reasoning="Classification failed — running minimal pipeline",
+    llm = _get_orchestrator_llm(agent)
+    response = await invoke_with_retry(
+        llm,
+        [SystemMessage(content=_ORCHESTRATOR_SYSTEM), HumanMessage(content=query)],
     )
 
-    qc = _default_qc
-    plan_text = ""
-    try:
-        response = await invoke_with_retry(llm, [
-            SystemMessage(content=FINANCIAL_ORCHESTRATE_COMBINED_PROMPT),
-            HumanMessage(content=user_content),
-        ])
-        combined = extract_json(response.content)
-        if combined:
-            plan_obj = combined.pop("plan", "")
-            plan_text = "\n".join(str(s) for s in plan_obj).strip() if isinstance(plan_obj, list) else str(plan_obj).strip()
-            try:
-                qc = QueryClassification(**normalize_classification(combined))
-            except Exception:
-                logger.warning("Could not build QueryClassification from combined response — using default")
-        else:
-            logger.warning("Combined orchestrate response missing JSON — using default classification")
-    except Exception:
-        logger.exception("financial_orchestrate: combined LLM call failed — using defaults")
+    raw = extract_json(response.content) or {}
+    template_name = raw.get("template_name", "general_analysis")
+    if template_name not in _VALID_TEMPLATES:
+        template_name = "general_analysis"
 
-    phases: list[str] = []
-    if qc.query_type == QueryType.DATA_RETRIEVAL:
-        phases = ["company_analysis"]
-    elif qc.query_type == QueryType.COMPARATIVE:
-        phases = ["comparative_analysis"]
-    elif qc.phases:
-        phases = [p for p in qc.phases if p in _valid_phases]
-    if phases:
-        phases.append("synthesis")
+    entities = raw.get("entities") or []
+    as_of_date = raw.get("as_of_date")
 
-    entities = list(qc.entities) if hasattr(qc, "entities") and qc.entities else []
-    logger.info("financial_orchestrate: type=%s phases=%s entities=%s plan=%d chars",
-                qc.query_type.value, phases, entities, len(plan_text))
+    workspace_id = hashlib.sha256(
+        f"{id(state)}:{_uuid.uuid4()}".encode()
+    ).hexdigest()[:32]
+
+    logger.info(
+        "financial_orchestrate: template=%s entities=%s workspace_id=%s",
+        template_name, entities, workspace_id,
+    )
 
     return {
-        "scratchpad": plan_text if plan_text else None,
-        "phases_to_run": phases,
-        "current_phase": phases[0] if phases else "done",
-        "query_type": qc.query_type.value,
+        "current_template": template_name,
         "entities": entities,
-        "iteration": state.iteration + 1,
+        "as_of_date": as_of_date,
+        "workspace_id": workspace_id,
     }
