@@ -214,3 +214,4 @@ __marimo__/
 .infisical.json
 .DS_Store
 CLAUDE.md
+.worktrees/
