@@ -30,8 +30,6 @@ class TestCosineSimilarity:
         assert abs(cosine(a, b) - (-1.0)) < 1e-9
 
     def test_zero_vector_returns_zero(self):
-        from agent_sdk.marketplace.router_agent import EmbeddingRouter  # noqa: F401
-        # Just test the formula directly
         a = [0.0, 0.0]
         b = [1.0, 0.0]
         assert cosine(a, b) == 0.0
@@ -39,8 +37,13 @@ class TestCosineSimilarity:
 
 class TestLowConfidenceError:
     def test_low_confidence_error_stores_score(self):
-        from agent_sdk.config import settings
-        from agent_marketplace.router.router_agent import LowConfidenceError
+        # LowConfidenceError lives in agent-marketplace (separate repo/package).
+        # Skip gracefully when that package is not installed in this environment.
+        agent_marketplace = pytest.importorskip(
+            "agent_marketplace",
+            reason="agent_marketplace not installed in agent-sdk dev environment",
+        )
+        LowConfidenceError = agent_marketplace.router.router_agent.LowConfidenceError
         err = LowConfidenceError(best_score=0.1, best_agent="agent-health")
         assert err.best_score == 0.1
         assert err.best_agent == "agent-health"
