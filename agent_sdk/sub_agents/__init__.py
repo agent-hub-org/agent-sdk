@@ -1,3 +1,3 @@
-from agent_sdk.sub_agents.base import SubAgentInput, SubAgentOutput, SubAgentState
+from agent_sdk.sub_agents.base import SubAgent, SubAgentInput, SubAgentOutput, SubAgentState
 
-__all__ = ["SubAgentInput", "SubAgentOutput", "SubAgentState"]
+__all__ = ["SubAgent", "SubAgentInput", "SubAgentOutput", "SubAgentState"]
