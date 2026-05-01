@@ -4,6 +4,7 @@ import logging
 from functools import partial
 from typing import Any, Optional
 
+from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
@@ -260,15 +261,18 @@ async def _build_sub_agent_input_async(sub_agent, state, workspace_store):
 
     messages = state_field(state, "messages", []) or []
     query = ""
-    if messages:
-        query = getattr(messages[-1], "content", "") or ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            query = getattr(msg, "content", "") or ""
+            break
     entities = state_field(state, "entities", []) or []
+    perspective = state_field(state, "perspective_context", "") or ""
 
     return SubAgentInput(
         query=query,
         entities=list(entities),
         workspace_context="\n\n".join(context_parts),
-        user_profile={},
+        user_profile={"profile": perspective} if perspective else {},
     )
 
 

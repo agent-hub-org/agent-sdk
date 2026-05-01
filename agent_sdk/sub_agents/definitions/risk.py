@@ -36,7 +36,7 @@ DEFINITION = SubAgent(
     ],
     system_prompt=_SYSTEM_PROMPT,
     output_schema=SubAgentOutput,
-    reads_from=["fundamental", "technical", "macro"],
+    reads_from=["fundamental", "technical"],
     writes_to="risk",
     cache_ttl=30 * 60,
 )

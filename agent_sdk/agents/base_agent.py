@@ -73,8 +73,8 @@ logger = logging.getLogger("agent_sdk.agent")
 
 # Nodes that produce user-facing LLM output and should be streamed to the client.
 DEFAULT_STREAMING_NODES = frozenset({
-    "llm_call",   # standard mode ReAct loop
-    "synthesis",  # financial_analyst mode — final user-facing output only
+    "llm_call",        # standard mode ReAct loop
+    "synthesis_node",  # financial_analyst mode — final user-facing output only
 })
 
 # Human-readable labels shown as progress markers while nodes run silently.

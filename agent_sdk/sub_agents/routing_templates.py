@@ -54,8 +54,11 @@ ROUTING_TEMPLATES: dict[str, RoutingTemplate] = {
     "valuation": RoutingTemplate(
         name="valuation",
         required_agents=[
+            AgentSpec("macro"),
             AgentSpec("company_profiling"),
             AgentSpec("fundamental"),
+            AgentSpec("technical"),
+            AgentSpec("news_sentiment"),
             AgentSpec("sector"),
             AgentSpec("bull_bear"),
         ],
@@ -75,7 +78,6 @@ ROUTING_TEMPLATES: dict[str, RoutingTemplate] = {
         required_agents=[
             AgentSpec("macro"),
             AgentSpec("sector"),
-            AgentSpec("news_sentiment"),
         ],
         post_process=[AgentSpec("synthesis"), AgentSpec("compliance")],
     ),
@@ -90,6 +92,7 @@ ROUTING_TEMPLATES: dict[str, RoutingTemplate] = {
             AgentSpec("company_profiling"),
             AgentSpec("fundamental"),
             AgentSpec("technical"),
+            AgentSpec("news_sentiment"),
             AgentSpec("macro"),
             AgentSpec("risk"),
             AgentSpec("bull_bear"),
@@ -101,6 +104,7 @@ ROUTING_TEMPLATES: dict[str, RoutingTemplate] = {
         required_agents=[
             AgentSpec("company_profiling"),
             AgentSpec("fundamental"),
+            AgentSpec("technical"),
             AgentSpec("risk"),
             AgentSpec("portfolio_fit", condition=_has_holdings),
         ],
@@ -109,9 +113,11 @@ ROUTING_TEMPLATES: dict[str, RoutingTemplate] = {
     "comparative": RoutingTemplate(
         name="comparative",
         required_agents=[
+            AgentSpec("macro"),
             AgentSpec("company_profiling"),
             AgentSpec("fundamental"),
             AgentSpec("technical"),
+            AgentSpec("news_sentiment"),
             AgentSpec("sector"),
             AgentSpec("bull_bear"),
         ],

@@ -35,7 +35,7 @@ DEFINITION = SubAgent(
     tools=[],
     system_prompt=_SYSTEM_PROMPT,
     output_schema=SubAgentOutput,
-    reads_from=["fundamental", "technical", "macro", "news_sentiment", "risk"],
+    reads_from=["fundamental", "technical", "news_sentiment"],
     writes_to="bull_bear",
     cache_ttl=None,
 )
