@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from langgraph.graph import END
 from langgraph.types import Command
 
-from agent_sdk.agents.state import AgentState, FinancialAnalysisState
+from agent_sdk.agents.state import AgentState, FinancialAnalysisState, state_field
 from agent_sdk.agents.llm_utils import invoke_with_retry, compress_running_context
 from agent_sdk.agents.tool_executor import execute_tool_calls
 from agent_sdk.financial.phase_helpers import (
@@ -462,70 +462,132 @@ async def financial_initialize(state) -> dict:
     return await initialize(state)
 
 
+
 async def synthesis_node(agent, state) -> dict:
-    from agent_sdk.financial.prompts import SYNTHESIS_PROMPT, COMPARATIVE_SYNTHESIS_PROMPT
-    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
-    from agent_sdk.financial.utils import format_date_context
+    """Synthesise the final response from every populated workspace key.
 
-    logger.info("Running synthesis phase")
-    llm = _get_phase_llm(agent, state)
-    query_type = getattr(state, "query_type", None)
-    synthesis_prompt = COMPARATIVE_SYNTHESIS_PROMPT if query_type == "comparative" else SYNTHESIS_PROMPT
-    date_context = format_date_context()
+    Replaces the legacy phase-output synthesis: instead of reading
+    `state.phase_outputs`, this reads each entry referenced by
+    `workspace_populated` from the request-scoped WorkspaceStore and hands the
+    rendered context to the registry's `synthesis` sub-agent.
+    """
+    from agent_sdk.sub_agents.registry import SUB_AGENT_REGISTRY
+    from agent_sdk.sub_agents.base import SubAgentInput
 
-    phase_outputs = getattr(state, "phase_outputs", None) or {}
-    if phase_outputs:
-        sections: list[str] = []
-        for phase_name in PHASE_REGISTRY:
-            po = phase_outputs.get(phase_name)
-            if po is None:
-                continue
-            label = phase_name.upper().replace("_", " ")
-            if po.confidence < 0.5:
-                sections.append(f"=== {label} ===\n(Phase failed or returned low-confidence data)\n=== END {label} ===")
-            else:
-                sections.append(f"=== {label} ===\n{po.findings}\n=== END {label} ===")
-        for key, po in phase_outputs.items():
-            if key.startswith("entity_analysis") or (key not in PHASE_REGISTRY):
-                label = key.upper().replace("_", " ")
-                sections.append(f"=== {label} ===\n{po.findings}\n=== END {label} ===")
-        prior_analysis = "\n\n".join(sections) if sections else "(no prior phase results available)"
-    else:
-        prior_analysis = getattr(state, "running_context", None) or "(no prior phase results available)"
+    logger.info("Running synthesis sub-agent")
+    synthesis_agent = SUB_AGENT_REGISTRY["synthesis"]
+    workspace_store = getattr(agent, "workspace_store", None)
+    sub_agent_cache = getattr(agent, "sub_agent_cache", None)
+    workspace_id = state_field(state, "workspace_id", "")
+    populated = state_field(state, "workspace_populated", set()) or set()
 
-    full_system = (
-        synthesis_prompt
-        + date_context
-        + "\n\n=== PRIOR ANALYSIS ===\n"
-        + prior_analysis
-        + "\n=== END PRIOR ANALYSIS ==="
+    context_parts: list[str] = []
+    if workspace_store is not None:
+        for key in populated:
+            val = await workspace_store.read(workspace_id, key)
+            if val:
+                context_parts.append(f"[{key.upper()}]\n{val.get('findings', '')}")
+
+    messages = state_field(state, "messages", []) or []
+    query = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            query = msg.content or ""
+            break
+    entities = state_field(state, "entities", []) or []
+
+    inp = SubAgentInput(
+        query=query,
+        entities=list(entities),
+        workspace_context="\n\n".join(context_parts),
     )
 
-    user_msg = None
-    for msg in reversed(state.messages):
+    if workspace_store is None or sub_agent_cache is None:
+        logger.warning("synthesis_node: missing workspace_store or sub_agent_cache — emitting fallback")
+        return {"messages": [AIMessage(content="(synthesis unavailable: workspace not initialised)")]}
+
+    try:
+        out = await synthesis_agent.run(inp, workspace_store, workspace_id, sub_agent_cache)
+    except Exception:
+        logger.exception("synthesis_node: synthesis sub-agent failed")
+        return {"messages": [AIMessage(content="(synthesis failed — see logs)")]}
+
+    return {"messages": [AIMessage(content=out.findings)]}
+
+
+async def compliance_node(agent, state) -> dict:
+    """Run the compliance sub-agent against the synthesis output."""
+    from agent_sdk.sub_agents.registry import SUB_AGENT_REGISTRY
+    from agent_sdk.sub_agents.base import SubAgentInput
+
+    compliance_agent = SUB_AGENT_REGISTRY["compliance"]
+    workspace_store = getattr(agent, "workspace_store", None)
+    sub_agent_cache = getattr(agent, "sub_agent_cache", None)
+    workspace_id = state_field(state, "workspace_id", "")
+
+    if workspace_store is None or sub_agent_cache is None:
+        logger.warning("compliance_node: missing workspace_store or sub_agent_cache — passing through")
+        return {}
+
+    synthesis_out = await workspace_store.read(workspace_id, "synthesis") or {}
+    messages = state_field(state, "messages", []) or []
+    query = ""
+    for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
-            user_msg = msg
+            query = msg.content or ""
             break
 
-    prompt = [
-        SystemMessage(content=full_system),
-        *([] if user_msg is None else [user_msg]),
-    ]
-
-    _synthesis_timeout = state.tool_timeout
+    inp = SubAgentInput(
+        query=query,
+        entities=[],
+        workspace_context=synthesis_out.get("findings", ""),
+    )
     try:
-        response = await asyncio.wait_for(
-            invoke_with_retry(llm, prompt), timeout=_synthesis_timeout
-        )
-    except asyncio.TimeoutError:
-        logger.error("Synthesis LLM call timed out after %.0fs", _synthesis_timeout)
-        fallback_content = "Analysis timed out during synthesis. Please try a simpler or more specific query."
-        return {
-            "messages": [AIMessage(content=fallback_content)],
-            "iteration": state.iteration + 1,
-        }
+        out = await compliance_agent.run(inp, workspace_store, workspace_id, sub_agent_cache)
+    except Exception:
+        logger.exception("compliance_node: compliance sub-agent failed")
+        return {}
 
-    return {
-        "messages": [AIMessage(content=response.content)],
-        "iteration": state.iteration + 1,
-    }
+    return {"messages": [AIMessage(content=out.findings)]}
+
+
+async def jargon_simplifier_node(agent, state) -> dict:
+    """Rewrite the compliance-cleared response for beginner/intermediate users."""
+    from agent_sdk.sub_agents.registry import SUB_AGENT_REGISTRY
+    from agent_sdk.sub_agents.base import SubAgentInput
+
+    simplifier = SUB_AGENT_REGISTRY["jargon_simplifier"]
+    workspace_store = getattr(agent, "workspace_store", None)
+    sub_agent_cache = getattr(agent, "sub_agent_cache", None)
+    workspace_id = state_field(state, "workspace_id", "")
+
+    if workspace_store is None or sub_agent_cache is None:
+        logger.warning("jargon_simplifier_node: missing workspace_store or sub_agent_cache — passing through")
+        return {}
+
+    compliance_out = await workspace_store.read(workspace_id, "compliance") or {}
+    inp = SubAgentInput(
+        query="",
+        entities=[],
+        workspace_context=compliance_out.get("findings", ""),
+    )
+    try:
+        out = await simplifier.run(inp, workspace_store, workspace_id, sub_agent_cache)
+    except Exception:
+        logger.exception("jargon_simplifier_node: simplifier sub-agent failed")
+        return {}
+
+    return {"messages": [AIMessage(content=out.findings)]}
+
+
+async def workspace_flush_node(agent, state) -> dict:
+    """Drop all workspace keys after the response has been built."""
+    workspace_store = getattr(agent, "workspace_store", None)
+    workspace_id = state_field(state, "workspace_id", "")
+    if workspace_store is None or not workspace_id:
+        return {}
+    try:
+        await workspace_store.flush(workspace_id)
+    except Exception:
+        logger.exception("workspace_flush_node: flush failed for workspace_id=%s", workspace_id)
+    return {}

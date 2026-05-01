@@ -270,6 +270,15 @@ class FinancialAnalysisState(AgentState):
     )
 
 
+def state_field(state, field: str, default=None):
+    """Dual-access helper for LangGraph state that may be dict or Pydantic model."""
+    if isinstance(state, dict):
+        val = state.get(field)
+    else:
+        val = getattr(state, field, None)
+    return val if val is not None else default
+
+
 class PhaseSubgraphState(BaseModel):
     """
     Internal state for a single financial phase subgraph invocation.
