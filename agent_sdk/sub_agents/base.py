@@ -65,8 +65,9 @@ class SubAgent:
     def cache_key(self, inp: SubAgentInput) -> str:
         if self.cache_key_fn:
             return self.cache_key_fn(inp)
-        payload = json.dumps({"q": inp.query, "e": sorted(inp.entities)}, sort_keys=True)
-        entity_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        entity_hash = hashlib.sha256(
+            json.dumps(sorted(inp.entities), sort_keys=True).encode()
+        ).hexdigest()[:16]
         now = datetime.now(UTC)
         bucket = (
             now.strftime("%Y-%m-%d-%H")

@@ -705,10 +705,16 @@ def calculate_risk_metrics(closes: list[float]) -> str:
     var_95 = float(returns.quantile(0.05))
     vol = returns.std() * (252 ** 0.5)
 
+    import math
+
+    def _safe(v: float) -> float | None:
+        f = float(v)
+        return None if (math.isnan(f) or math.isinf(f)) else round(f, 3)
+
     return json.dumps({
-        "sharpe_ratio": round(float(sharpe), 3),
-        "sortino_ratio": round(float(sortino), 3),
-        "max_drawdown_pct": round(float(max_dd) * 100, 2),
+        "sharpe_ratio": _safe(sharpe),
+        "sortino_ratio": _safe(sortino),
+        "max_drawdown_pct": round(float(max_dd) * 100, 2) if not math.isnan(float(max_dd)) else None,
         "var_95_pct": round(var_95 * 100, 2),
         "annualised_volatility_pct": round(float(vol) * 100, 2),
         "data_points": len(closes),
@@ -752,13 +758,18 @@ def calculate_portfolio_allocation(
     S = risk_models.sample_cov(prices)
     ef = EfficientFrontier(mu, S, weight_bounds=(0, 0.4))
 
-    if method == "min_volatility":
-        ef.min_volatility()
-    else:
-        ef.max_sharpe()
-
-    weights = ef.clean_weights()
-    perf = ef.portfolio_performance(verbose=False)
+    try:
+        if method == "min_volatility":
+            ef.min_volatility()
+        else:
+            ef.max_sharpe()
+        weights = ef.clean_weights()
+        perf = ef.portfolio_performance(verbose=False)
+    except Exception as exc:
+        return json.dumps({
+            "error": f"Optimisation failed: {exc}",
+            "hint": "Try method='min_volatility' or provide more price history.",
+        })
 
     return json.dumps({
         "weights": {k: round(v, 4) for k, v in weights.items()},
