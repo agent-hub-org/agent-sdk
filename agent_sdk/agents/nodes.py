@@ -20,13 +20,6 @@ from langgraph.types import Command
 from agent_sdk.agents.state import AgentState, FinancialAnalysisState, state_field
 from agent_sdk.agents.llm_utils import invoke_with_retry, compress_running_context
 from agent_sdk.agents.tool_executor import execute_tool_calls
-from agent_sdk.financial.phase_helpers import (
-    get_phase_llm as _get_phase_llm,
-    get_phase_tools as _get_phase_tools,
-    build_phase_prompt as _build_phase_prompt,
-    format_context as _format_context,
-    format_tool_catalog as _format_tool_catalog,
-)
 from agent_sdk.financial.orchestrator import financial_orchestrate, extract_json as _extract_json, normalize_classification as _normalize_classification
 from agent_sdk.agents.memory_nodes import load_user_context, memory_writer
 from agent_sdk.config import settings
@@ -435,7 +428,11 @@ async def orchestrate(agent, state: AgentState) -> dict:
         return {}
 
     tool_names = "\n".join(f"- {getattr(t, 'name', str(t))}" for t in tools)
-    llm = _get_phase_llm(agent, state)
+    if state.model_id:
+        from agent_sdk.llm_services.model_registry import get_llm
+        llm = get_llm(state.model_id)
+    else:
+        llm = agent.llm
 
     try:
         _t0 = time.monotonic()

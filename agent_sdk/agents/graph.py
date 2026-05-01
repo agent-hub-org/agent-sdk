@@ -8,8 +8,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 from agent_sdk.agents.state import AgentState, FinancialAnalysisState, state_field
-from agent_sdk.agents.subgraphs import create_react_subgraph, create_phase_subgraph
-from agent_sdk.agents.subgraphs.phase_subgraph import run_phase_subgraph
+from agent_sdk.agents.subgraphs import create_react_subgraph
 from agent_sdk.sub_agents.routing_templates import ROUTING_TEMPLATES
 from agent_sdk.sub_agents.registry import SUB_AGENT_REGISTRY
 
@@ -162,111 +161,6 @@ def create_financial_reasoning_graph(agent, checkpointer: Optional[Any] = None):
     graph.add_edge("memory_writer", END)
 
     return graph.compile(checkpointer=checkpointer)
-
-
-# ============================================================================
-# Scheduler logic
-# ============================================================================
-
-def _completed_phases(state: FinancialAnalysisState) -> set[str]:
-    """Return the set of phase names known to be complete."""
-    done = set((state.phase_outputs or {}).keys())
-    # entity_analysis completing implicitly marks comparative_analysis done too
-    if "entity_analysis" in done:
-        done.add("comparative_analysis")
-    return done
-
-
-def _phase_scheduler_node(state: FinancialAnalysisState) -> dict:
-    """
-    Advance phases_to_run by pruning any phases whose outputs have arrived.
-
-    Called after every phase completion (including parallel fan-in: LangGraph
-    automatically waits for all concurrent branches before calling this node).
-    """
-    completed = _completed_phases(state)
-    remaining = [p for p in state.phases_to_run if p not in completed]
-    next_phase = remaining[0] if remaining else "done"
-    logger.info(
-        "phase_scheduler: completed=%s remaining=%s → next=%s",
-        sorted(completed), remaining, next_phase,
-    )
-    return {
-        "phases_to_run": remaining,
-        "current_phase": next_phase,
-    }
-
-
-def _route_from_scheduler(state: FinancialAnalysisState):
-    """
-    Conditional edge: decide which phase(s) to run next.
-
-    Parallel fan-out: when multiple phases have all their deps satisfied,
-    return [Send(phase, state), ...] so they run concurrently.
-    """
-    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
-
-    remaining = state.phases_to_run
-    if not remaining:
-        logger.info("phase_scheduler: all phases complete → END")
-        return END
-
-    completed = _completed_phases(state)
-
-    next_p = remaining[0]
-
-    if next_p == "synthesis":
-        logger.info("phase_scheduler → synthesis")
-        return "synthesis"
-
-    # Comparative analysis: fan out to parallel entity_analysis subgraphs
-    if next_p == "comparative_analysis":
-        entities = state.entities or []
-        if len(entities) > 1:
-            logger.info("phase_scheduler: fanning out %d entity_analysis branches", len(entities))
-            return [
-                Send("entity_analysis", _build_entity_analysis_state(state, e))
-                for e in entities
-            ]
-        elif entities:
-            logger.info("phase_scheduler: single entity_analysis branch for '%s'", entities[0])
-            return Send("entity_analysis", _build_entity_analysis_state(state, entities[0]))
-        else:
-            logger.warning("phase_scheduler: comparative_analysis but no entities — skipping to synthesis")
-            return "synthesis"
-
-    # Find all phases ready to run simultaneously (depends_on all satisfied).
-    # A dependency is satisfied if it appears in completed or was never in the plan.
-    plan_set = set(state.phases_to_run) | completed
-    ready: list[str] = []
-    for p in remaining:
-        if p in ("synthesis", "comparative_analysis"):
-            continue
-        phase_def = PHASE_REGISTRY.get(p)
-        deps = phase_def.depends_on if phase_def else []
-        if all(d in completed or d not in plan_set for d in deps):
-            ready.append(p)
-
-    if not ready:
-        # No phase has its deps met yet — this indicates a DAG issue or a phase that
-        # should have been removed from the plan.  Route to synthesis as a safety valve.
-        logger.warning(
-            "phase_scheduler: no phases ready (deps not satisfied) — phases=%s completed=%s",
-            remaining, sorted(completed),
-        )
-        return "synthesis"
-
-    if len(ready) > 1:
-        logger.info("phase_scheduler: parallel fan-out → %s", ready)
-        return [Send(p, state) for p in ready]
-
-    logger.info("phase_scheduler → %s", ready[0])
-    return ready[0]
-
-
-def _build_entity_analysis_state(state: FinancialAnalysisState, entity: str) -> FinancialAnalysisState:
-    """Clone the parent state for one comparative-analysis branch."""
-    return state.model_copy(update={"entity_focus": entity})
 
 
 # ============================================================================

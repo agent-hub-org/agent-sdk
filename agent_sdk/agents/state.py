@@ -393,8 +393,7 @@ class PhaseSubgraphState(BaseModel):
     )
 
     # Output written by phase_finalize — keyed by phase name.
-    # run_phase_subgraph reads this to propagate the result back to the parent FinancialAnalysisState.
-    # Without this field LangGraph silently drops the key and the scheduler loops forever.
+    # Retained on PhaseSubgraphState for backward compatibility.
     phase_outputs: Dict[str, Any] = Field(
         default_factory=dict,
         description="Typed PhaseOutput written by phase_finalize, propagated back to the parent graph.",

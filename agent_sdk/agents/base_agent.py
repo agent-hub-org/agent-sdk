@@ -78,23 +78,13 @@ DEFAULT_STREAMING_NODES = frozenset({
 })
 
 # Human-readable labels shown as progress markers while nodes run silently.
-# Phase labels are derived from PHASE_REGISTRY so they stay in sync automatically.
-def _build_phase_progress_labels() -> dict[str, str]:
-    from agent_sdk.financial.phase_registry import PHASE_REGISTRY
-    labels: dict[str, str] = {
-        "load_user_context":     "Loading user context...",
-        "memory_writer":         "Saving memory...",
-        "orchestrate":           "Planning approach...",
-        "financial_orchestrate": "🔎 Classifying query & building plan...",
-        "comparative_analysis":  "⚖️ Running comparative analysis...",
-    }
-    for phase_def in PHASE_REGISTRY.values():
-        if phase_def.progress_label:
-            labels[phase_def.name] = phase_def.progress_label
-    return labels
-
-
-_PHASE_PROGRESS_LABELS: dict[str, str] = _build_phase_progress_labels()
+_PHASE_PROGRESS_LABELS: dict[str, str] = {
+    "load_user_context":     "Loading user context...",
+    "memory_writer":         "Saving memory...",
+    "orchestrate":           "Planning approach...",
+    "financial_orchestrate": "🔎 Classifying query & building plan...",
+    "sub_agent_dispatcher":  "Routing to sub-agents...",
+}
 
 
 class BaseAgent:
@@ -150,6 +140,12 @@ class BaseAgent:
             "or respond directly when tools are not needed."
         )
 
+        # Workspace store and sub-agent cache — degraded fallbacks until inject_workspace() is called
+        from agent_sdk.workspace.store import WorkspaceStore
+        from agent_sdk.cache.redis_cache import RedisCache
+        self.workspace_store: WorkspaceStore = WorkspaceStore(redis_url=None)
+        self.sub_agent_cache: RedisCache = RedisCache(prefix="sub_agent", ttl=3600)
+
         self._mcp_servers = mcp_servers
         self._allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         self._mcp_manager = None
@@ -193,6 +189,15 @@ class BaseAgent:
             import asyncio
             self._init_lock = asyncio.Lock()
         return self._init_lock
+
+    def inject_workspace(
+        self,
+        workspace_store: "WorkspaceStore",
+        sub_agent_cache: "RedisCache",
+    ) -> None:
+        """Called at agent startup to inject Redis-backed stores."""
+        self.workspace_store = workspace_store
+        self.sub_agent_cache = sub_agent_cache
 
     def get_tool_catalog(self) -> str:
         key = frozenset(t.name for t in self.tools)
@@ -336,6 +341,20 @@ class BaseAgent:
                     self._degraded = True
 
             self.graph = self._build_graph()
+
+            # Compile all sub-agent graphs with resolved tools and LLM factory
+            if self.mode == "financial_analyst":
+                from agent_sdk.sub_agents.registry import SUB_AGENT_REGISTRY
+                tools_map = {getattr(t, "name", str(t)): t for t in (self.tools or [])}
+
+                def _llm_factory(model_id: str):
+                    from agent_sdk.llm_services.model_registry import get_llm
+                    return get_llm(model_id)
+
+                for sub_agent in SUB_AGENT_REGISTRY.values():
+                    if sub_agent._graph is None:
+                        sub_agent.compile(tools_map, _llm_factory)
+
             self._initialized = True
             logger.info("BaseAgent graph built with %d tool(s) (mode=%s)", len(self.tools), self.mode)
 

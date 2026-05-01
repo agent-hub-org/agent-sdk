@@ -1,20 +1,14 @@
 """
 Prompts for the financial reasoning cognitive pipeline.
 
-Per-phase prompts have been removed. Phase guidance now lives in the agent's
-system prompt (FINANCIAL_PIPELINE_GUIDANCE in agent-financials/agents/agent.py).
-Each phase_executor receives a short focus hint injected at runtime.
+Phase-specific prompts and the orchestrate prompt have been removed along with
+the legacy phase pipeline. The orchestrator prompt now lives in
+agent_sdk/financial/orchestrator.py (_ORCHESTRATOR_SYSTEM).
 
 Retained prompts:
-  FINANCIAL_ORCHESTRATE_COMBINED_PROMPT — built dynamically from PHASE_REGISTRY
   SYNTHESIS_PROMPT — used by synthesis_node
   COMPARATIVE_SYNTHESIS_PROMPT — used by synthesis_node for comparative queries
 """
-
-from agent_sdk.financial.phase_registry import PHASE_REGISTRY, build_orchestrate_prompt
-
-# Built once at import time from the registry so tool hints never drift.
-FINANCIAL_ORCHESTRATE_COMBINED_PROMPT = build_orchestrate_prompt(PHASE_REGISTRY)
 
 SYNTHESIS_PROMPT = """\
 You are a Lead Financial Analyst and Investing Mentor. Your audience is someone who may have

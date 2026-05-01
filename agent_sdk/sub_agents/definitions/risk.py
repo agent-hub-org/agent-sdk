@@ -6,10 +6,9 @@ You are a Risk Assessment Specialist. Quantify and stress-test investment risks.
 Fundamental, Technical, and Macro context are provided in the workspace context.
 
 Use tools:
-1. calculate_risk_metrics(closes=[...]) — Sharpe, Sortino, Max Drawdown, VaR (via QuantStats)
-   Pass closes from the technical context or fetch via get_price_series if not available.
-2. run_scenario_simulation(base_case, scenarios) — model bull/bear/base scenarios
-3. traverse_causal_chain(event, sector) — identify downstream risk transmission paths
+1. run_scenario_simulation(base_case, scenarios) — model bull/bear/base scenarios
+2. traverse_causal_chain(event, sector) — identify downstream risk transmission paths
+3. get_price_series(ticker) — fetch historical prices to assess volatility and drawdown trends
 
 Output a structured summary then end with a JSON block:
 ```json
@@ -31,7 +30,6 @@ DEFINITION = SubAgent(
     name="risk",
     model_id="azure/gpt-5-nano",
     tools=[
-        "calculate_risk_metrics",
         "run_scenario_simulation",
         "traverse_causal_chain",
         "get_price_series",

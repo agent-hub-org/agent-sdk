@@ -66,12 +66,13 @@ class RedisCache:
             logger.debug("RedisCache.get key=%s: %s", key, exc)
             return None
 
-    async def set(self, key: str, value: Any) -> None:
+    async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
+        effective_ttl = ttl if ttl is not None else self._ttl
         if self._degraded:
             self._fallback[key] = value
             return
         try:
-            await self._redis.setex(self._key(key), self._ttl, json.dumps(value))
+            await self._redis.setex(self._key(key), effective_ttl, json.dumps(value))
         except Exception as exc:  # noqa: BLE001
             logger.debug("RedisCache.set key=%s: %s", key, exc)
 
