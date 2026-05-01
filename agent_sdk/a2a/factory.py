@@ -61,7 +61,7 @@ def create_a2a_app(agent_card, executor_cls, mongo_db_name: str) -> _A2AApp:
         task_store=task_store,
         agent_card=agent_card,
     )
-    routes = create_agent_card_routes(agent_card) + create_jsonrpc_routes(request_handler, rpc_url="/")
+    routes = create_agent_card_routes(agent_card) + create_jsonrpc_routes(request_handler, rpc_url="/", enable_v0_3_compat=True)
     app = _A2AApp(routes=routes)
     logger.info("A2A application created (db='%s')", db_name)
     return app
