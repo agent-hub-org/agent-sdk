@@ -696,7 +696,8 @@ def calculate_risk_metrics(closes: list[float]) -> str:
     if len(closes) < 30:
         return "Insufficient price data (need ≥30 data points)."
 
-    prices = pd.Series(closes)
+    idx = pd.date_range(end=pd.Timestamp.today(), periods=len(closes), freq="B")
+    prices = pd.Series(closes, index=idx)
     returns = prices.pct_change().dropna()
 
     sharpe = qs.stats.sharpe(returns)
