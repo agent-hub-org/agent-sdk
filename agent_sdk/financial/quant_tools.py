@@ -8,6 +8,7 @@ Exposed as LangChain StructuredTools.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from typing import Optional, Any
@@ -677,6 +678,98 @@ def detect_regime(**kwargs) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# QuantStats Risk Metrics
+# ---------------------------------------------------------------------------
+
+class RiskMetricsInput(BaseModel):
+    closes: list[float] = Field(..., description="List of daily closing prices (≥30 points)")
+
+
+def calculate_risk_metrics(closes: list[float]) -> str:
+    """Calculate risk metrics using QuantStats. Input: list of daily closing prices."""
+    import pandas as pd
+    try:
+        import quantstats as qs
+    except ImportError:
+        return "QuantStats not installed. Run: pip install quantstats"
+
+    if len(closes) < 30:
+        return "Insufficient price data (need ≥30 data points)."
+
+    prices = pd.Series(closes)
+    returns = prices.pct_change().dropna()
+
+    sharpe = qs.stats.sharpe(returns)
+    sortino = qs.stats.sortino(returns)
+    max_dd = qs.stats.max_drawdown(returns)
+    var_95 = float(returns.quantile(0.05))
+    vol = returns.std() * (252 ** 0.5)
+
+    return json.dumps({
+        "sharpe_ratio": round(float(sharpe), 3),
+        "sortino_ratio": round(float(sortino), 3),
+        "max_drawdown_pct": round(float(max_dd) * 100, 2),
+        "var_95_pct": round(var_95 * 100, 2),
+        "annualised_volatility_pct": round(float(vol) * 100, 2),
+        "data_points": len(closes),
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# PyPortfolioOpt Portfolio Allocation
+# ---------------------------------------------------------------------------
+
+class PortfolioOptInput(BaseModel):
+    tickers: list[str] = Field(..., description="List of ticker symbols")
+    closes_map: dict[str, list[float]] = Field(..., description="Mapping of ticker to daily closing prices")
+    method: str = Field(default="max_sharpe", description="'max_sharpe' or 'min_volatility'")
+
+
+def calculate_portfolio_allocation(
+    tickers: list[str],
+    closes_map: dict[str, list[float]],
+    method: str = "max_sharpe",
+) -> str:
+    """Compute optimal portfolio weights using PyPortfolioOpt."""
+    try:
+        import pandas as pd
+        import numpy as np
+        from pypfopt import EfficientFrontier, risk_models, expected_returns
+    except ImportError:
+        return "PyPortfolioOpt not installed. Run: pip install pyportfolioopt"
+
+    if len(tickers) < 2:
+        return "Need at least 2 tickers for portfolio optimisation."
+
+    min_len = min(len(v) for v in closes_map.values())
+    prices = pd.DataFrame(
+        {t: closes_map[t][-min_len:] for t in tickers if t in closes_map}
+    )
+    if prices.shape[1] < 2:
+        return "Insufficient price data for optimisation."
+
+    mu = expected_returns.mean_historical_return(prices)
+    S = risk_models.sample_cov(prices)
+    ef = EfficientFrontier(mu, S, weight_bounds=(0, 0.4))
+
+    if method == "min_volatility":
+        ef.min_volatility()
+    else:
+        ef.max_sharpe()
+
+    weights = ef.clean_weights()
+    perf = ef.portfolio_performance(verbose=False)
+
+    return json.dumps({
+        "weights": {k: round(v, 4) for k, v in weights.items()},
+        "expected_annual_return_pct": round(perf[0] * 100, 2),
+        "annual_volatility_pct": round(perf[1] * 100, 2),
+        "sharpe_ratio": round(perf[2], 3),
+        "method": method,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # LangChain StructuredTools
 # ---------------------------------------------------------------------------
 
@@ -735,5 +828,26 @@ def get_quant_tools() -> list[StructuredTool]:
                 "Example: detect_market_regime(nifty_pe=22, india_vix=14, cpi_yoy=5.2, repo_rate=6.5)"
             ),
             args_schema=RegimeDetectorInput,
+        ),
+        StructuredTool.from_function(
+            func=lambda **kwargs: calculate_risk_metrics(**kwargs),
+            name="calculate_risk_metrics",
+            description=(
+                "Calculate risk metrics (Sharpe, Sortino, max drawdown, VaR, volatility) "
+                "from a list of daily closing prices using QuantStats. "
+                "Requires ≥30 price points. "
+                "Example: calculate_risk_metrics(closes=[100.0, 101.5, 99.8, ...])"
+            ),
+            args_schema=RiskMetricsInput,
+        ),
+        StructuredTool.from_function(
+            func=lambda **kwargs: calculate_portfolio_allocation(**kwargs),
+            name="calculate_portfolio_allocation",
+            description=(
+                "Compute optimal portfolio weights using PyPortfolioOpt (max Sharpe or min volatility). "
+                "Example: calculate_portfolio_allocation(tickers=['TCS.NS', 'INFY.NS'], "
+                "closes_map={'TCS.NS': [...], 'INFY.NS': [...]}, method='max_sharpe')"
+            ),
+            args_schema=PortfolioOptInput,
         ),
     ]

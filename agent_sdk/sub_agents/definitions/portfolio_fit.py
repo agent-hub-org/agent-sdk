@@ -28,7 +28,7 @@ End with:
 DEFINITION = SubAgent(
     name="portfolio_fit",
     model_id="azure/gpt-5-nano",
-    tools=[],
+    tools=["calculate_portfolio_allocation"],
     system_prompt=_SYSTEM_PROMPT,
     output_schema=SubAgentOutput,
     reads_from=["fundamental", "risk", "user_profile"],
